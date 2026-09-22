@@ -7,6 +7,9 @@ from typing import Any
 
 class ScanMode(StrEnum):
     DEEP = "deep"
+    PULL_REQUEST = "pull_request"
+    MERGE_REQUEST = "merge_request"
+    BOOTSTRAP = "bootstrap"
 
 
 class Depth(StrEnum):
