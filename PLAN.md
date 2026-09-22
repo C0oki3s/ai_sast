@@ -258,6 +258,9 @@ cost ceilings are demonstrated in staging.
 
 ## Deferred work
 
-Only after Phase 5 is complete do we start the independent SCM Integration
-workstream. SCA, secrets, cloud/IaC, license risk, outdated software, DAST, and
-IDE plugins remain separately planned products and do not block Code Scanning.
+SCM Integration has been explicitly started as the independent
+`plaidnox_scm` package while Code Scanning continues through its remaining
+phases. The package boundary remains strict: SCM consumes immutable Code
+Scanning APIs and does not add provider or PR/MR behavior to the scanner.
+SCA, secrets, cloud/IaC, license risk, outdated software, DAST, and IDE plugins
+remain separately planned products and do not block either workstream.

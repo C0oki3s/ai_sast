@@ -7,7 +7,7 @@ Code Scanning remains an immutable-snapshot library.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .application_context import ApplicationContextBuilder
 from .assets import load_json
+from .baseline import FindingBaselineClassification, classify_against_baseline
+from .baseline_models import BaselineFinding
 from .change_relevance import ChangeRelevance, classify
 from .context_store import ApplicationContext, unit_of_work
 from .diffing import Diff, compute_diff
@@ -38,6 +40,11 @@ class ReviewCounters:
     verified: int = 0
     rejected: int = 0
     unresolved: int = 0
+    introduced: int = 0
+    regressed: int = 0
+    modified_existing: int = 0
+    existing: int = 0
+    resolved: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +60,7 @@ class ReviewResult:
     counters: ReviewCounters
     coverage_complete: bool
     coverage_gaps: tuple[str, ...]
+    baseline_classifications: tuple[FindingBaselineClassification, ...]
     detail: str
 
 
@@ -79,6 +87,16 @@ def review_pull_request(
     if is_fast_exit:
         with unit_of_work(session_factory, tenant_id) as repository:
             application_context = repository.get_context(codebase_id, base_revision)
+            baseline_findings = repository.list_baseline_findings(codebase_id, base_revision)
+        baseline_classifications = classify_against_baseline(
+            codebase_id,
+            diff,
+            (),
+            (),
+            baseline_findings,
+            application_context.security_controls if application_context is not None else (),
+            coverage_complete=True,
+        )
         return ReviewResult(
             outcome="pass_fast_exit",
             relevance=relevance,
@@ -88,9 +106,10 @@ def review_pull_request(
             application_context=application_context,
             candidates=(),
             verifications=(),
-            counters=ReviewCounters(),
+            counters=_counters(L1ReviewBatch((), (), True, (), 0), (), baseline_classifications),
             coverage_complete=True,
             coverage_gaps=(),
+            baseline_classifications=baseline_classifications,
             detail="Documentation/generated-only change; AI review skipped.",
         )
 
@@ -104,6 +123,17 @@ def review_pull_request(
         if value is None
     ]
     if missing:
+        with unit_of_work(session_factory, tenant_id) as repository:
+            baseline_findings = repository.list_baseline_findings(codebase_id, base_revision)
+        baseline_classifications = classify_against_baseline(
+            codebase_id,
+            diff,
+            (),
+            (),
+            baseline_findings,
+            (),
+            coverage_complete=False,
+        )
         gaps = tuple(f"Missing review dependency: {name}" for name in missing)
         return ReviewResult(
             outcome="configuration_required",
@@ -114,9 +144,13 @@ def review_pull_request(
             application_context=None,
             candidates=(),
             verifications=(),
-            counters=ReviewCounters(unresolved=1),
+            counters=replace(
+                _counters(L1ReviewBatch((), (), False, gaps, 0), (), baseline_classifications),
+                unresolved=1,
+            ),
             coverage_complete=False,
             coverage_gaps=gaps,
+            baseline_classifications=baseline_classifications,
             detail=f"Security-relevant change requires configured review dependencies: {', '.join(missing)}.",
         )
 
@@ -129,6 +163,22 @@ def review_pull_request(
             lambda: context_builder.build(repo_path, base_revision, codebase_id, tenant_id),
             builder_version=str(runtime["context_builder_version"]),
             context_version=str(runtime["context_version"]),
+        )
+        baseline_findings: tuple[BaselineFinding, ...] = repository.list_baseline_findings(
+            codebase_id,
+            base_revision,
+        )
+    if baseline_findings:
+        application_context = replace(
+            application_context,
+            prior_finding_refs=tuple(
+                dict.fromkeys(
+                    (
+                        *application_context.prior_finding_refs,
+                        *(item.finding_fingerprint for item in baseline_findings),
+                    )
+                )
+            ),
         )
 
     batch: L1ReviewBatch = l1_reviewer.review(repo_path, diff, relevance, application_context)
@@ -144,7 +194,19 @@ def review_pull_request(
         if batch.candidates
         else ()
     )
-    counters = _counters(batch, verifications)
+    provisional_coverage_complete = batch.coverage_complete and not any(
+        item.state == "unresolved" for item in verifications
+    )
+    baseline_classifications = classify_against_baseline(
+        codebase_id,
+        diff,
+        batch.candidates,
+        verifications,
+        baseline_findings,
+        application_context.security_controls,
+        coverage_complete=provisional_coverage_complete,
+    )
+    counters = _counters(batch, verifications, baseline_classifications)
     coverage_gaps = tuple(batch.coverage_gaps) + tuple(
         gap for result in verifications if result.state == "unresolved" for gap in result.evidence_gaps
     )
@@ -171,6 +233,7 @@ def review_pull_request(
         counters=counters,
         coverage_complete=coverage_complete,
         coverage_gaps=coverage_gaps,
+        baseline_classifications=baseline_classifications,
         detail=detail,
     )
 
@@ -178,6 +241,7 @@ def review_pull_request(
 def _counters(
     batch: L1ReviewBatch,
     verifications: tuple[CandidateVerification, ...],
+    baseline_classifications: tuple[FindingBaselineClassification, ...],
 ) -> ReviewCounters:
     return ReviewCounters(
         candidates_generated=len(batch.candidates),
@@ -185,4 +249,11 @@ def _counters(
         verified=sum(item.state == "verified" for item in verifications),
         rejected=sum(item.state == "rejected" for item in verifications),
         unresolved=sum(item.state == "unresolved" for item in verifications),
+        introduced=sum(item.relationship == "INTRODUCED" for item in baseline_classifications),
+        regressed=sum(item.relationship == "REGRESSED" for item in baseline_classifications),
+        modified_existing=sum(
+            item.relationship == "MODIFIED_EXISTING" for item in baseline_classifications
+        ),
+        existing=sum(item.relationship == "EXISTING" for item in baseline_classifications),
+        resolved=sum(item.relationship == "RESOLVED" for item in baseline_classifications),
     )

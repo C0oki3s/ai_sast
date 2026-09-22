@@ -244,6 +244,8 @@ def test_jwt_verification_removal_runs_l1_and_independent_verification(tmp_path:
     assert result.counters.candidates_generated == 1
     assert result.counters.evaluated == 1
     assert result.counters.verified == 1
+    assert result.counters.regressed == 1
+    assert result.baseline_classifications[0].relationship == "REGRESSED"
     assert builder.calls == reviewer.calls == verifier.calls == 1
 
 

@@ -45,3 +45,26 @@ class ApplicationContextRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class FindingBaselineRecord(Base):
+    """Immutable verified-finding state for one exact base revision."""
+
+    __tablename__ = "scm_finding_baselines"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    codebase_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    baseline_revision: Mapped[str] = mapped_column(String(64), primary_key=True)
+    root_cause_fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    finding_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    root_cause_path: Mapped[str] = mapped_column(String, nullable=False)
+    root_cause_symbol: Mapped[str] = mapped_column(String, nullable=False)
+    vulnerability_class: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

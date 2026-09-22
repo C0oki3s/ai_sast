@@ -1,6 +1,7 @@
 {
   "schema": "scm",
   "migrations": [
-    "0001_scm_application_context.sql"
+    "0001_scm_application_context.sql",
+    "0002_scm_finding_baselines.sql"
   ]
 }

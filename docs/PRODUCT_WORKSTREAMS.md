@@ -658,11 +658,44 @@ missing cross-file proof, request/path boundaries, secret redaction, evidence
 role mapping, and the supported-but-unresolved verifier case. No live model or
 research call is made by the test suite.
 
-The next implementation phase begins at priority item (8): baseline-relative
-classification (`INTRODUCED`, `REGRESSED`, `MODIFIED_EXISTING`, `EXISTING`,
-`RESOLVED`), followed by deterministic merge policy. Provider webhook/check
-publication, triage/remediation, timeline, and dashboard work remain later SCM
-phases.
+#### Implementation status (Wave 4)
+
+Wave 4 implements priority item (8), baseline-relative classification, without
+turning baseline comparison into another vulnerability verdict:
+
+- **Exact-revision baseline records.** SCM owns the tenant-scoped
+  `scm_finding_baselines` table and ordered PostgreSQL migration. Records are
+  keyed by codebase, immutable base revision, and stable root-cause
+  fingerprint; no Code Scanning foreign key or provider identifier crosses the
+  package boundary.
+- **Five conservative relationships.** Independently verified head findings
+  are classified as `INTRODUCED`, `REGRESSED`, `MODIFIED_EXISTING`, or
+  `EXISTING`; an affected baseline finding becomes `RESOLVED` only when a
+  matching changed-root hypothesis is independently rejected with complete
+  evidence. Missing candidates, partial coverage, and unresolved verification
+  never close existing debt.
+- **Baseline security-control awareness.** A verified change to a control
+  already present in cached `ApplicationContext` is `REGRESSED` even when no
+  prior vulnerability record exists. Reopened resolved findings are also
+  `REGRESSED`. New verified changed roots without either relationship are
+  `INTRODUCED`.
+- **Existing debt stays visible.** Open baseline findings outside the PR remain
+  `EXISTING`, are counted separately, and do not become introduced/regressed
+  risk. Baseline finding fingerprints are added to the compact context supplied
+  to L1 review.
+- **Provider-neutral output.** `ReviewResult`, counters, and CLI JSON expose the
+  baseline classifications. No GitHub/GitLab publication or merge decision is
+  embedded in this phase.
+
+Tests cover all five relationships, exact-revision and tenant isolation,
+idempotent persistence, the JWT control regression, incomplete resolution
+protection, and **Fixture D** (an unrelated existing finding is visible while
+the reviewed change still completes without new verified risk).
+
+The next implementation phase begins at priority item (9): deterministic merge
+policy over verification completeness, baseline relationship, severity, and
+configured thresholds. Provider webhook/check publication, triage/remediation,
+timeline, and dashboard work remain later SCM phases.
 
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 

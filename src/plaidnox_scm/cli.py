@@ -51,6 +51,7 @@ def _result_to_json(result: ReviewResult) -> dict[str, Any]:
         "counters": asdict(result.counters),
         "candidates": [asdict(item) for item in result.candidates],
         "verifications": [asdict(item) for item in result.verifications],
+        "baseline_classifications": [asdict(item) for item in result.baseline_classifications],
         "relevance": {
             "runtime_changed": result.relevance.runtime_changed,
             "security_control_changed": result.relevance.security_control_changed,

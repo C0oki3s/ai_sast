@@ -740,7 +740,9 @@ local snapshot, resume interruption, and emit complete reports without SCM.
 Exit condition: isolation, auditability, replay safety, recovery, performance,
 and cost limits are demonstrated in staging.
 
-## After completion
+## Parallel SCM workstream
 
-Begin SCM Integration as a separate service and package. Code Scanning remains
-an immutable-snapshot analysis API with no provider-specific orchestration.
+SCM Integration is active in the separate `plaidnox_scm` package. Code
+Scanning remains an immutable-snapshot analysis API with no provider-specific
+orchestration. SCM implementation status and delivery order are maintained in
+`docs/PRODUCT_WORKSTREAMS.md`.

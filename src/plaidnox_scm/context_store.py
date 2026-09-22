@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import ApplicationContextRecord
+from .baseline_models import BaselineFinding
+from .models import ApplicationContextRecord, FindingBaselineRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,55 @@ class ApplicationContextRepository:
             return cached
         return self.upsert_context(compute())
 
+    def list_baseline_findings(
+        self,
+        codebase_id: str,
+        baseline_revision: str,
+    ) -> tuple[BaselineFinding, ...]:
+        rows = self._session.scalars(
+            select(FindingBaselineRecord)
+            .where(
+                FindingBaselineRecord.tenant_id == self._tenant_id,
+                FindingBaselineRecord.codebase_id == codebase_id,
+                FindingBaselineRecord.baseline_revision == baseline_revision,
+            )
+            .order_by(
+                FindingBaselineRecord.root_cause_path,
+                FindingBaselineRecord.root_cause_symbol,
+                FindingBaselineRecord.root_cause_fingerprint,
+            )
+        ).all()
+        return tuple(_to_baseline_value(row) for row in rows)
+
+    def upsert_baseline_finding(self, finding: BaselineFinding) -> BaselineFinding:
+        if finding.codebase_id == "" or finding.baseline_revision == "":
+            raise ValueError("baseline finding requires codebase and revision identities")
+        key = (
+            self._tenant_id,
+            finding.codebase_id,
+            finding.baseline_revision,
+            finding.root_cause_fingerprint,
+        )
+        record = self._session.get(FindingBaselineRecord, key)
+        if record is None:
+            record = FindingBaselineRecord(
+                tenant_id=self._tenant_id,
+                codebase_id=finding.codebase_id,
+                baseline_revision=finding.baseline_revision,
+                root_cause_fingerprint=finding.root_cause_fingerprint,
+            )
+            self._session.add(record)
+        record.finding_fingerprint = finding.finding_fingerprint
+        record.lifecycle_state = finding.lifecycle_state
+        record.root_cause_path = finding.root_cause_path
+        record.root_cause_symbol = finding.root_cause_symbol
+        record.vulnerability_class = finding.vulnerability_class
+        record.title = finding.title
+        record.severity = finding.severity
+        record.confidence = finding.confidence
+        self._session.flush()
+        return _to_baseline_value(record)
+
 
 def _to_value(record: ApplicationContextRecord) -> ApplicationContext:
     return ApplicationContext(
@@ -130,6 +181,22 @@ def _to_value(record: ApplicationContextRecord) -> ApplicationContext:
         confidence=record.confidence,
         context_version=record.context_version,
         computed_at=record.computed_at,
+    )
+
+
+def _to_baseline_value(record: FindingBaselineRecord) -> BaselineFinding:
+    return BaselineFinding(
+        codebase_id=record.codebase_id,
+        baseline_revision=record.baseline_revision,
+        root_cause_fingerprint=record.root_cause_fingerprint,
+        finding_fingerprint=record.finding_fingerprint,
+        lifecycle_state=record.lifecycle_state,
+        root_cause_path=record.root_cause_path,
+        root_cause_symbol=record.root_cause_symbol,
+        vulnerability_class=record.vulnerability_class,
+        title=record.title,
+        severity=record.severity,
+        confidence=record.confidence,
     )
 
 
