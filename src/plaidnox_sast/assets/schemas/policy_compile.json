@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "policy_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "version": {"type": "integer", "minimum": 1},
+    "source_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "default_action": {
+      "type": "string",
+      "enum": ["allow", "warn", "block", "require_security_approval", "require_owner_approval", "require_manual_review", "notify"]
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rule_id": {"type": "string", "minLength": 1, "maxLength": 120},
+          "description": {"type": "string", "minLength": 1, "maxLength": 1200},
+          "match": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "target_branches": {"type": "array", "items": {"type": "string", "maxLength": 300}},
+              "change_states": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["introduced", "regressed", "modified_existing", "existing", "resolved"]}
+              },
+              "severities": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]}
+              },
+              "minimum_confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "verification_states": {"type": "array", "items": {"type": "string", "maxLength": 80}},
+              "security_boundaries": {"type": "array", "items": {"type": "string", "maxLength": 160}},
+              "capabilities": {"type": "array", "items": {"type": "string", "maxLength": 160}},
+              "environments": {"type": "array", "items": {"type": "string", "maxLength": 160}},
+              "finding_types": {"type": "array", "items": {"type": "string", "maxLength": 160}},
+              "credential_states": {"type": "array", "items": {"type": "string", "maxLength": 160}}
+            },
+            "required": [
+              "target_branches",
+              "change_states",
+              "severities",
+              "minimum_confidence",
+              "verification_states",
+              "security_boundaries",
+              "capabilities",
+              "environments",
+              "finding_types",
+              "credential_states"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "enum": ["allow", "warn", "block", "require_security_approval", "require_owner_approval", "require_manual_review", "notify"]
+          }
+        },
+        "required": ["rule_id", "description", "match", "action"]
+      }
+    },
+    "ambiguities": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"type": "string", "maxLength": 1200}
+    }
+  },
+  "required": ["policy_id", "version", "source_text", "default_action", "rules", "ambiguities"]
+}
