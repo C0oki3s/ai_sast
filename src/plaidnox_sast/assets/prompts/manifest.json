@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-22.4",
+  "version": "2026-09-22.5",
   "operations": {
     "recon_search_plan": {
       "system": "operations/recon_search_plan/system.md",
@@ -48,6 +48,10 @@
     "patch_proposal": {
       "system": "operations/patch_proposal/system.md",
       "user": "operations/patch_proposal/user.md"
+    },
+    "policy_compile": {
+      "system": "operations/policy_compile/system.md",
+      "user": "operations/policy_compile/user.md"
     }
   }
 }
