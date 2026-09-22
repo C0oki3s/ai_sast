@@ -75,7 +75,7 @@ def test_existing_high_does_not_match_new_only_policy() -> None:
                         "target_branches": ["main"],
                         "change_states": ["introduced"],
                         "severities": ["high"],
-                        "minimum_confidence": null,
+                        "minimum_confidence": None,
                         "verification_states": [],
                         "security_boundaries": [],
                         "capabilities": [],
