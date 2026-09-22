@@ -65,6 +65,21 @@ class SnapshotRecord(TimestampMixin, Base):
     context_version: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
+class RepositoryContextRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_repository_contexts"
+    __table_args__ = (Index("ix_code_scanning_repository_context", "tenant_id", "codebase_id", "created_at"),)
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), primary_key=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    codebase_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+    )
+    context_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
 class SourceFileRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_source_files"
     __table_args__ = (
@@ -186,6 +201,7 @@ class SecurityKnowledgeRecord(TimestampMixin, Base):
     provenance: Mapped[str] = mapped_column(String(128), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claims: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
 
 

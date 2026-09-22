@@ -7,6 +7,8 @@
 
 Create repository-specific navigation searches from the supplied source tree, languages, imports, symbols, calls, configuration filenames, and business context. Derive every expression from observed project evidence. Do not use a built-in framework, route, source, sink, control, or weakness pattern list.
 
+For an incremental context packet, plan searches for the changed and dependency-affected scope and for any prior architecture claim that those changes may invalidate. Reuse the supplied previous repository context for unchanged areas. Do not request a repository-wide rediscovery merely because unchanged source was intentionally omitted.
+
 The plan must gather enough evidence to build these linked inventories:
 
 1. every production area and runtime/bootstrap path;

@@ -16,9 +16,15 @@
           "source_url": {"type": "string", "maxLength": 2000},
           "source_title": {"type": "string", "maxLength": 500},
           "source_updated_at": {"type": "string", "maxLength": 100},
-          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "claims": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 240},
+            "minItems": 1,
+            "maxItems": 6
+          }
         },
-        "required": ["topic", "content", "vulnerability_class", "ecosystem", "framework", "source_url", "source_title", "source_updated_at", "confidence"]
+        "required": ["topic", "content", "vulnerability_class", "ecosystem", "framework", "source_url", "source_title", "source_updated_at", "confidence", "claims"]
       }
     }
   },

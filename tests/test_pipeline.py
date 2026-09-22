@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -45,7 +47,7 @@ def test_pipeline_deep_hunt_vertical_slice(sample_repo):
 
 
 class FakeAIValidator:
-    def review(self, root, candidate, finding, security_context, model_tier=None):
+    def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
         from plaidnox_sast.ai import AIReview
 
         return AIReview(True, 0.9, "supported", "source -> sink", "escape output")
@@ -115,8 +117,36 @@ class FakeContextualAI(FakeAIValidator):
         ], 0
 
 
+class FakeManyHighSeverityCandidatesAI(FakeContextualAI):
+    def discover_candidates(self, root, context, plan=None):
+        from plaidnox_sast.models import Candidate, Evidence, Severity
+
+        candidates = []
+        for index, confidence in enumerate((0.95, 0.85, 0.75)):
+            candidates.append(
+                Candidate(
+                    rule_id=f"plaidnox.ai.authorization.{index}",
+                    title=f"Missing object ownership check {index}",
+                    vulnerability_class="CWE-639",
+                    severity=Severity.HIGH,
+                    confidence=confidence,
+                    message="A request parameter selects an object without an ownership constraint.",
+                    evidence=Evidence(
+                        f"app{index}.js", 1, 1, "const app = express();", "GET /", f"authorization{index}", ["request", "object"]
+                    ),
+                    metadata={
+                        "category": "authorization",
+                        "engine": "plaidnox-litellm-discovery",
+                        "ai_discovery": True,
+                        "ai_remediation": "Check ownership before returning the object.",
+                    },
+                )
+            )
+        return candidates, 0
+
+
 class FakeFailingDiscoveryAI(FakeContextualAI):
-    discovery_error_types = ["AIResponseError"]
+    discovery_error_types: ClassVar[list[str]] = ["AIResponseError"]
     discovery_unexpected_failures = 0
 
     def discover_candidates(self, root, context, plan=None):
@@ -124,7 +154,7 @@ class FakeFailingDiscoveryAI(FakeContextualAI):
 
 
 class FakeUnexpectedFailingDiscoveryAI(FakeContextualAI):
-    discovery_error_types = ["ValueError"]
+    discovery_error_types: ClassVar[list[str]] = ["ValueError"]
     discovery_unexpected_failures = 1
 
     def discover_candidates(self, root, context, plan=None):
@@ -158,13 +188,45 @@ class FakeVariantAI(FakeContextualAI):
         ], 0
 
 
+class FakeCapabilityChainAI(FakeContextualAI):
+    def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
+        from plaidnox_sast.ai import AIReview
+
+        gained_capability = "SERVER_SIDE_REQUEST" if not candidate.metadata.get("capability_pivot_of") else ""
+        return AIReview(True, 0.9, "supported", "source -> sink", "escape output", gained_capability=gained_capability)
+
+    def chain_capability_pivots(self, root, context, plan, verified):
+        capable = [
+            (candidate, finding)
+            for candidate, finding in verified
+            if finding.metadata.get("deep_hunt", {}).get("gained_capability")
+        ]
+        if not capable:
+            return [], 0
+        _candidate, finding = capable[0]
+        from plaidnox_sast.models import Candidate, Evidence, Severity
+
+        return [
+            Candidate(
+                rule_id="plaidnox.ai.pivot.identity-token-reuse",
+                title="Gained server-side request reach mints a trusted identity token",
+                vulnerability_class="CWE-441",
+                severity=Severity.HIGH,
+                confidence=0.8,
+                message="The capability gained from the verified root reaches a token-minting boundary.",
+                evidence=Evidence("app.js", 3, 3, "app.post(\"/signin\", async (req, res) => {"),
+                metadata={"category": "identity", "capability_pivot_of": [finding.fingerprint]},
+            )
+        ], 0
+
+
 class FakeFailedVerdictAI(FakeContextualAI):
-    def review(self, root, candidate, finding, security_context, model_tier=None):
+    def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
         raise RuntimeError("model unavailable")
 
 
 class FakeRecognizedFailedVerdictAI(FakeContextualAI):
-    def review(self, root, candidate, finding, security_context, model_tier=None):
+    def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
         from plaidnox_sast.ai import AIResponseError
 
         raise AIResponseError("model returned a malformed verdict")
@@ -232,6 +294,45 @@ app.post("/reports", async (req, res) => {
     assert result.metrics["ai_review_failures"] == 0
 
 
+def test_pipeline_demotes_the_lowest_priority_excess_deep_routes_to_respect_the_scan_budget(sample_repo, monkeypatch):
+    import plaidnox_sast.pipeline as pipeline_module
+    from plaidnox_sast.assets import load_json as real_load_json
+
+    def patched_load_json(name):
+        data = real_load_json(name)
+        if name == "runtime/agent.json":
+            data = dict(data)
+            data["deep_hunt_budget_max"] = 1
+        return data
+
+    monkeypatch.setattr(pipeline_module, "load_json", patched_load_json)
+
+    result = SastPipeline().scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeManyHighSeverityCandidatesAI(),
+    )
+
+    tiers_by_title = {finding.title: finding.metadata["jev_model_tier"] for finding in result.findings}
+    assert tiers_by_title["Missing object ownership check 0"] == "deep"
+    assert tiers_by_title["Missing object ownership check 1"] == "standard"
+    assert tiers_by_title["Missing object ownership check 2"] == "standard"
+    assert result.metrics["jev_deep_budget_demotions"] == 2
+    # Demotion never blocks disposition: every candidate still gets a Deep Hunt verdict.
+    assert len(result.findings) == 3
+
+
+def test_pipeline_does_not_demote_deep_routes_within_the_configured_budget(sample_repo):
+    result = SastPipeline().scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeManyHighSeverityCandidatesAI(),
+    )
+
+    assert result.metrics["jev_deep_budget_demotions"] == 0
+    assert all(finding.metadata["jev_model_tier"] == "deep" for finding in result.findings)
+
+
 def test_pipeline_keeps_ai_repository_context_and_discovered_candidates(sample_repo):
     result = SastPipeline().scan_snapshot(
         sample_repo,
@@ -292,6 +393,24 @@ def test_pipeline_deep_hunts_root_cause_variants_before_reporting(sample_repo):
     assert result.metrics["ai_variant_candidates"] == 1
     assert result.metrics["ai_variant_rounds"] == 2
     assert result.metrics["ai_variant_unexpected_failures"] == 0
+
+
+def test_pipeline_chains_a_gained_capability_into_a_new_independently_verified_finding(sample_repo):
+    result = SastPipeline().scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeCapabilityChainAI(),
+    )
+
+    pivots = [finding for finding in result.findings if finding.metadata.get("capability_pivot_of")]
+    assert len(pivots) == 1
+    assert pivots[0].validator == "plaidnox-deep-hunt"
+    assert pivots[0].rule_id == "plaidnox.ai.pivot.identity-token-reuse"
+    assert result.metrics["ai_capability_chain_candidates"] == 1
+    assert result.metrics["ai_capability_chain_failures"] == 0
+    # Round 1 chains the gained capability into the pivot; round 2 reviews the pivot itself
+    # (no further gained_capability), finds nothing to chain, and the loop ends.
+    assert result.metrics["ai_capability_chain_rounds"] == 2
 
 
 def test_pipeline_never_reports_a_candidate_without_an_ai_verdict(sample_repo):
@@ -454,3 +573,45 @@ def test_pipeline_tolerates_a_persistence_failure_without_failing_the_scan(sampl
     assert result.metrics["persistence_error_type"] == "RuntimeError"
     assert result.metrics["persistence_findings_saved"] == 0
     assert result.metrics["ai_scan_incomplete"] is False
+
+
+def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_on_rescan(sample_repo):
+    """End-to-end mutation test for the Phase 2 exit condition: editing the code a
+    finding depends on flags that finding for revalidation on the next scan, while
+    a second, untouched finding elsewhere in the codebase is left alone."""
+
+    (sample_repo / "util.js").write_text("function formatDate(value) { return value; }\n")
+    factory = _sqlite_session_factory()
+    pipeline = SastPipeline(session_factory=factory, tenant_id="tenant-a")
+
+    first = pipeline.scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        revision="revision-1",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+    assert first.metrics["persistence_indexed"] is True
+    assert first.metrics["persistence_findings_flagged_for_revalidation"] == 0
+
+    codebase_id = _stable_id("codebase", "tenant-a", "plaidnox/test-fixture")
+    with unit_of_work(factory, "tenant-a") as repository:
+        stored_states = {
+            finding.fingerprint: repository.get_finding(_stable_id("finding", codebase_id, finding.fingerprint)).state
+            for finding in first.findings
+        }
+    assert stored_states and all(state == "validated" for state in stored_states.values())
+
+    # Only app.js -- what the fixture's findings actually depend on -- changes;
+    # util.js, an unrelated file, is left untouched.
+    (sample_repo / "app.js").write_text(
+        (sample_repo / "app.js").read_text() + "\n// a trailing comment mutates app.js's content hash\n"
+    )
+
+    second = pipeline.scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        revision="revision-2",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+    assert second.metrics["persistence_indexed"] is True
+    assert second.metrics["persistence_findings_flagged_for_revalidation"] >= 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from .models import (
     HuntPlanRecord,
     HuntTaskRecord,
     KnowledgeUsageRecord,
+    RepositoryContextRecord,
     ScanRunRecord,
     SecurityKnowledgeRecord,
     SecurityMemoryRecord,
@@ -121,6 +123,13 @@ class SymbolInput:
     content_hash: str
     content: str
     signature: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolIdentity:
+    symbol_id: str
+    stable_key: str
+    content_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +240,7 @@ class KnowledgeInput:
     provenance: str
     confidence: float
     content_hash: str
+    claims: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +327,74 @@ class CodeScanningRepository:
             )
         )
         return _snapshot_value(record) if record else None
+
+    def latest_snapshot(
+        self,
+        codebase_id: str,
+        exclude_snapshot_id: str = "",
+    ) -> SnapshotValue | None:
+        statement = select(SnapshotRecord).where(
+            SnapshotRecord.tenant_id == self.tenant_id,
+            SnapshotRecord.codebase_id == codebase_id,
+        )
+        if exclude_snapshot_id:
+            statement = statement.where(SnapshotRecord.snapshot_id != exclude_snapshot_id)
+        record = self.session.scalar(
+            statement.order_by(SnapshotRecord.created_at.desc(), SnapshotRecord.snapshot_id.desc()).limit(1)
+        )
+        return _snapshot_value(record) if record else None
+
+    def list_source_files(self, snapshot_id: str) -> list[SourceFileInput]:
+        records = self.session.scalars(
+            select(SourceFileRecord)
+            .where(SourceFileRecord.snapshot_id == snapshot_id)
+            .order_by(SourceFileRecord.path)
+        ).all()
+        return [
+            SourceFileInput(item.path, item.language, item.content_hash, item.size_bytes)
+            for item in records
+        ]
+
+    def get_repository_context(self, snapshot_id: str) -> dict[str, object] | None:
+        record = self.session.scalar(
+            select(RepositoryContextRecord).where(
+                RepositoryContextRecord.snapshot_id == snapshot_id,
+                RepositoryContextRecord.tenant_id == self.tenant_id,
+            )
+        )
+        return dict(record.context_data) if record is not None else None
+
+    def save_repository_context(
+        self,
+        snapshot_id: str,
+        codebase_id: str,
+        context_data: dict[str, object],
+    ) -> None:
+        snapshot = self.get_snapshot(snapshot_id)
+        if snapshot is None or snapshot.codebase_id != codebase_id:
+            raise PersistenceConflictError("repository context snapshot does not exist in the tenant scope")
+        serialized = json.dumps(context_data, sort_keys=True, ensure_ascii=False)
+        context_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        record = self.session.scalar(
+            select(RepositoryContextRecord).where(
+                RepositoryContextRecord.snapshot_id == snapshot_id,
+                RepositoryContextRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            self.session.add(
+                RepositoryContextRecord(
+                    snapshot_id=snapshot_id,
+                    tenant_id=self.tenant_id,
+                    codebase_id=codebase_id,
+                    context_hash=context_hash,
+                    context_data=context_data,
+                )
+            )
+        else:
+            record.context_hash = context_hash
+            record.context_data = context_data
+        self.session.flush()
 
     def add_snapshot(
         self,
@@ -455,6 +533,97 @@ class CodeScanningRepository:
             )
         self.session.flush()
         return True
+
+    def list_symbol_identities(self, snapshot_id: str) -> list[SymbolIdentity]:
+        rows = self.session.execute(
+            select(SymbolRecord.symbol_id, SymbolRecord.stable_key, SymbolRecord.content_hash).where(
+                SymbolRecord.snapshot_id == snapshot_id
+            )
+        ).all()
+        return [SymbolIdentity(row.symbol_id, row.stable_key, row.content_hash) for row in rows]
+
+    def findings_by_dependency_keys(self, codebase_id: str, dependency_keys: Iterable[str]) -> list[str]:
+        keys = set(dependency_keys)
+        if not keys:
+            return []
+        rows = (
+            self.session.execute(
+                select(FindingDependencyRecord.finding_id)
+                .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+                .where(
+                    FindingRecord.tenant_id == self.tenant_id,
+                    FindingRecord.codebase_id == codebase_id,
+                    FindingDependencyRecord.dependency_key.in_(keys),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return sorted(set(rows))
+
+    def findings_requiring_revalidation(self, codebase_id: str, snapshot_id: str, hops: int = 3) -> list[str]:
+        """A finding needs re-verification once a symbol it depends on -- directly, or
+        transitively through a changed callee -- has a different `content_hash` than
+        the one recorded the last time the finding was saved.
+
+        Dependencies are addressed by `stable_key` (Rule 5: identity excludes content),
+        so this compares each dependency's recorded `dependency_hash` against the
+        current snapshot's `content_hash` for that same stable key, then walks the
+        call graph backwards from every changed symbol via `reverse_dependencies` so a
+        changed callee also revalidates its callers. Findings whose dependencies are
+        untouched are left alone.
+        """
+
+        symbols = self.list_symbol_identities(snapshot_id)
+        content_hash_by_stable_key = {item.stable_key: item.content_hash for item in symbols}
+        symbol_id_by_stable_key = {item.stable_key: item.symbol_id for item in symbols}
+        stable_key_by_symbol_id = {item.symbol_id: item.stable_key for item in symbols}
+
+        recorded = self.session.execute(
+            select(FindingDependencyRecord.dependency_key, FindingDependencyRecord.dependency_hash)
+            .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+            .where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingDependencyRecord.dependency_type == "symbol",
+            )
+        ).all()
+
+        changed_symbol_ids = {
+            symbol_id_by_stable_key[dependency_key]
+            for dependency_key, dependency_hash in recorded
+            if dependency_key in content_hash_by_stable_key
+            and content_hash_by_stable_key[dependency_key] != dependency_hash
+        }
+        if not changed_symbol_ids:
+            return []
+
+        affected_symbol_ids = self.reverse_dependencies(snapshot_id, changed_symbol_ids, hops)
+        affected_stable_keys = {
+            stable_key_by_symbol_id[symbol_id]
+            for symbol_id in affected_symbol_ids
+            if symbol_id in stable_key_by_symbol_id
+        }
+        return self.findings_by_dependency_keys(codebase_id, affected_stable_keys)
+
+    def flag_findings_for_revalidation(self, finding_ids: Iterable[str]) -> int:
+        """Demote findings back to their pre-Deep-Hunt state so they are reviewed again.
+
+        Mirrors `models.FindingState.DISCOVERED` as a plain string rather than
+        importing the domain enum, matching how `state` is already handled as a
+        plain `str` throughout this repository layer.
+        """
+
+        ids = list(finding_ids)
+        if not ids:
+            return 0
+        result = self.session.execute(
+            update(FindingRecord)
+            .where(FindingRecord.finding_id.in_(ids), FindingRecord.tenant_id == self.tenant_id)
+            .values(state="discovered")
+        )
+        self.session.flush()
+        return int(result.rowcount)
 
     def count_symbols(self, snapshot_id: str) -> int:
         return int(
@@ -1055,6 +1224,7 @@ class CodeScanningRepository:
             provenance=item.provenance,
             confidence=item.confidence,
             content_hash=item.content_hash,
+            claims=item.claims,
             status="active",
         )
         self.session.add(record)
@@ -1204,16 +1374,36 @@ def security_ir_inputs(
                 stable_keys_by_name.setdefault(alias, []).append(stable_key)
 
     edge_inputs: list[EdgeInput] = []
-    seen_edges: set[tuple[str, str]] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
     for call in graph.calls:
         source_keys = stable_keys_by_path_name.get((call.path, call.caller), [])
         callee_name = call.callee.rsplit(".", 1)[-1]
         for source_key in source_keys:
             for target_key in stable_keys_by_name.get(callee_name, []):
-                if source_key == target_key or (source_key, target_key) in seen_edges:
+                edge_key = (source_key, target_key, "calls")
+                if source_key == target_key or edge_key in seen_edges:
                     continue
-                seen_edges.add((source_key, target_key))
+                seen_edges.add(edge_key)
                 edge_inputs.append(EdgeInput(source_key, target_key, "calls", "tree_sitter"))
+
+    for reference in graph.references:
+        source_keys = stable_keys_by_path_name.get((reference.path, reference.source), [])
+        target_name = reference.target.rsplit(".", 1)[-1]
+        for source_key in source_keys:
+            for target_key in stable_keys_by_name.get(target_name, []):
+                edge_key = (source_key, target_key, "references")
+                if source_key == target_key or edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edge_inputs.append(
+                    EdgeInput(
+                        source_key,
+                        target_key,
+                        "references",
+                        "tree_sitter",
+                        0.9,
+                    )
+                )
 
     return source_files, symbol_inputs, edge_inputs
 
@@ -1291,6 +1481,7 @@ def _knowledge_value(record: SecurityKnowledgeRecord) -> KnowledgeValue:
         provenance=record.provenance,
         confidence=record.confidence,
         content_hash=record.content_hash,
+        claims=list(record.claims),
         tenant_id=record.tenant_id,
         status=record.status,
     )

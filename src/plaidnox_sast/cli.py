@@ -10,7 +10,7 @@ from .assets import load_json
 from .config import load_local_project_config
 from .context_fabric import ContextFabric, ContextFabricStore
 from .graph import build_structural_graph
-from .jev import JevClient
+from .jev import JevClient, JevFrontierRouter, JevRetryRouter
 from .knowledge import (
     JevKnowledgeRouter,
     KnowledgeCoordinator,
@@ -92,6 +92,12 @@ def _add_engine_arguments(parser: argparse.ArgumentParser) -> None:
         help="tenant scope for PostgreSQL persistence; only meaningful when "
         "PLAIDNOX_DATABASE_URL is configured",
     )
+    parser.add_argument(
+        "--tenant-id",
+        default="default",
+        help="tenant scope for PostgreSQL persistence; only meaningful when "
+        "PLAIDNOX_DATABASE_URL is configured",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -111,8 +117,9 @@ def main(argv: list[str] | None = None) -> int:
     except DatabaseConfigurationError:
         persistence_session_factory = None
 
-    # PostgreSQL owns production context/knowledge whenever configured;
-    # --context-store is used only by the explicit local adapter.
+    # A PostgreSQL context/knowledge backend replaces the transitional SQLite
+    # one whenever PLAIDNOX_DATABASE_URL is configured; --context-store then
+    # only matters as a fallback path.
     context_database = args.context_store or output / "context-fabric.sqlite"
     context_store = (
         PostgresContextFabricStore(persistence_session_factory, args.tenant_id)
@@ -125,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.jev
         else None
     )
+    deep_hunt_agent.configure_capability_frontier(JevFrontierRouter(jev_client))
+    deep_hunt_agent.configure_retry_route(JevRetryRouter(jev_client))
     if jev_client is not None:
         knowledge_store = (
             PostgresKnowledgeStore(persistence_session_factory, args.tenant_id)

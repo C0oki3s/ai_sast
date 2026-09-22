@@ -98,13 +98,27 @@ class Finding:
 
 @dataclass(slots=True)
 class RouteDecision:
+    """JEV's routing verdict: how deep, and along which independent evidence axes.
+
+    ``needs_*`` fields are NOUL choices (no/unlikely/likely/yes) rather than one
+    mutually exclusive profile, since more than one axis is routinely relevant
+    at once. ``analysis_complexity`` is a 1-5 score used to scale execution
+    budget (context-expansion round size, reasoning effort) independently of
+    ``depth``, which only selects the model tier.
+    """
+
     depth: Depth
-    profile: str
     reason: str
     task_class: str = "generic"
     model_tier: ModelTier = ModelTier.STANDARD
     needs_validation: bool = True
     needs_deep_hunt: bool = True
+    needs_cross_file: str = "unlikely"
+    needs_state_reconstruction: str = "unlikely"
+    needs_external_semantics: str = "unlikely"
+    needs_environment_context: str = "unlikely"
+    needs_deep_falsification: str = "unlikely"
+    analysis_complexity: int = 2
 
 
 @dataclass(slots=True)

@@ -5,9 +5,9 @@ instance (see docker/postgres-test/docker-compose.yml) -- deliberately a
 different variable from the production PLAIDNOX_DATABASE_URL so these tests
 can never accidentally target a real database.
 
-The target schema is created by the actual checked-in migration DDL
-(assets/migrations/postgresql/0001_code_scanning_core.sql, applied via the
-compose file's init script), not SQLAlchemy's `create_all`, so these tests
+The target schema is created by the actual checked-in PostgreSQL migration DDL
+(applied in order via the compose file's init scripts), not SQLAlchemy's
+`create_all`, so these tests
 also verify the ORM matches the deployable migration.
 
 All row identifiers are suffixed with a fresh run id so the suite tolerates
@@ -32,7 +32,11 @@ from plaidnox_sast.persistence import (
     HuntTaskInput,
     unit_of_work,
 )
-from plaidnox_sast.persistence.adapters import PostgresContextFabricStore, PostgresKnowledgeStore, _derive_ids
+from plaidnox_sast.persistence.adapters import (
+    PostgresContextFabricStore,
+    PostgresKnowledgeStore,
+    _derive_ids,
+)
 
 TEST_DATABASE_URL = os.environ.get("PLAIDNOX_TEST_DATABASE_URL", "")
 

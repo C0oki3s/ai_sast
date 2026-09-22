@@ -17,6 +17,7 @@ OPERATIONS = (
     "security_review",
     "metadata_exposure_review",
     "variant_sweep",
+    "capability_chain",
     "finding_consolidation",
     "finding_group_narratives",
     "knowledge_research",

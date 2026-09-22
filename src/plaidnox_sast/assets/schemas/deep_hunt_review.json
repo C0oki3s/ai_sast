@@ -217,10 +217,13 @@
               "definition",
               "callers",
               "callees",
-              "flow",
               "imports",
               "route",
-              "window"
+              "window",
+              "sibling_handlers",
+              "search",
+              "knowledge",
+              "flow"
             ]
           },
           "path": {
@@ -238,6 +241,18 @@
           "end_line": {
             "type": "integer",
             "minimum": 1
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pattern": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "query": {
+            "type": "string",
+            "maxLength": 300
           }
         },
         "required": [
@@ -245,9 +260,16 @@
           "path",
           "symbol",
           "start_line",
-          "end_line"
+          "end_line",
+          "offset",
+          "pattern",
+          "query"
         ]
       }
+    },
+    "gained_capability": {
+      "type": "string",
+      "maxLength": 60
     }
   },
   "required": [
@@ -266,6 +288,7 @@
     "required_preconditions",
     "evidence_gaps",
     "security_invariant",
+    "gained_capability",
     "rejection_reason",
     "gate_results",
     "evidence_locations",

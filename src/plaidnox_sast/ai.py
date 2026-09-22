@@ -16,7 +16,7 @@ from typing import Any, Protocol
 
 from .assets import load_json
 from .cache_telemetry import LiteLLMCacheTelemetry
-from .context_fabric import ContextFabric
+from .context_fabric import ContextFabric, PreparedContext
 from .errors import AIStageError
 from .graph import (
     RipgrepDiscovery,
@@ -27,9 +27,15 @@ from .graph import (
     source_file_is_admitted,
     source_files,
 )
-from .knowledge import KnowledgeCoordinator, KnowledgeEntry, LiteLLMKnowledgeProvider
+from .jev import FRONTIER_PRIORITY_WEIGHT, JevFrontierRouter, JevRetryRouter
+from .knowledge import (
+    KnowledgeCoordinator,
+    KnowledgeEntry,
+    KnowledgeStore,
+    LiteLLMKnowledgeProvider,
+)
 from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
-from .models import Candidate, Evidence, Finding, ModelTier, Severity
+from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
 from .prompts import render_operation
 from .redaction import redact as _redact
 from .redaction import redact_payload
@@ -66,6 +72,7 @@ class DeepHuntResult:
     required_preconditions: list[str] | None = None
     evidence_gaps: list[str] | None = None
     security_invariant: str = ""
+    gained_capability: str = ""
     rejection_reason: str = ""
     gate_results: list[dict[str, Any]] = field(default_factory=list)
     evidence_locations: list[dict[str, Any]] = field(default_factory=list)
@@ -137,6 +144,7 @@ class AIRepositoryContext:
     indirect_dispatch: list[dict[str, Any]] = field(default_factory=list)
     build_time_variants: list[dict[str, Any]] = field(default_factory=list)
     coverage_ledger: list[dict[str, Any]] = field(default_factory=list)
+    analysis_scope_paths: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -166,6 +174,7 @@ class AIRepositoryContext:
             "indirect_dispatch": self.indirect_dispatch,
             "build_time_variants": self.build_time_variants,
             "coverage_ledger": self.coverage_ledger,
+            "analysis_scope_paths": self.analysis_scope_paths,
         }
 
 
@@ -219,6 +228,8 @@ class PlaidNoxDeepHuntAgent:
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         cache_telemetry: LiteLLMCacheTelemetry | None = None,
         context_store: ContextFabric | None = None,
+        frontier_router: JevFrontierRouter | None = None,
+        retry_router: JevRetryRouter | None = None,
     ) -> None:
         self.client = client
         model_runtime = load_json("runtime/models.json")
@@ -231,6 +242,8 @@ class PlaidNoxDeepHuntAgent:
         self.event_sink = event_sink
         self.cache_telemetry = cache_telemetry or LiteLLMCacheTelemetry()
         self.context_store = context_store
+        self.frontier_router = frontier_router or JevFrontierRouter()
+        self.retry_router = retry_router or JevRetryRouter()
         self.discovery_error_types: list[str] = []
         self.discovery_errors: list[str] = []
         self.security_graph: StructuralGraph | None = None
@@ -268,9 +281,20 @@ class PlaidNoxDeepHuntAgent:
     def configure_context_fabric(self, store: ContextFabric) -> None:
         self.context_store = store
 
+    def configure_capability_frontier(self, router: JevFrontierRouter) -> None:
+        self.frontier_router = router
+
+    def configure_retry_route(self, router: JevRetryRouter) -> None:
+        self.retry_router = router
+
     def configure_source_policy(self, exclude: list[str], max_file_bytes: int) -> None:
         self.source_excludes = list(exclude)
         self.max_file_bytes = max_file_bytes
+
+    def configure_security_graph(self, graph: StructuralGraph) -> None:
+        """Provide a snapshot-local Security IR for targeted context expansion."""
+
+        self.security_graph = graph
 
     def prompt_cache_metrics(self) -> dict[str, int | float]:
         return self.cache_telemetry.snapshot().to_metrics()
@@ -307,6 +331,7 @@ class PlaidNoxDeepHuntAgent:
         finding: Finding,
         security_context: str = "",
         model_tier: ModelTier | None = None,
+        route: RouteDecision | None = None,
     ) -> DeepHuntResult:
         self._emit(
             "candidate_verification_started",
@@ -317,48 +342,24 @@ class PlaidNoxDeepHuntAgent:
         metadata_only = bool(candidate.metadata.get("sensitive_evidence") or candidate.metadata.get("content_read") is False)
         runtime = load_json("runtime/agent.json")
         max_rounds = int(runtime["context_expansion_max_rounds"])
-        max_requests = int(runtime["context_expansion_max_requests_per_round"])
+        max_requests = _context_expansion_max_requests(runtime, route)
+        reasoning_effort_override = _hunt_effort_override(route)
         context_expansions: list[dict[str, Any]] = []
+        confidence_history: list[float] = []
         review: DeepHuntResult | None = None
         for round_index in range(max_rounds + 1):
-            code_window = "[contents intentionally unavailable]" if metadata_only else _source_window(
+            review = self._run_hunt_round(
                 root,
-                candidate.evidence.path,
-                candidate.evidence.start_line,
-                candidate.evidence.end_line,
-                exclude=self.source_excludes,
-                max_file_bytes=self.max_file_bytes,
+                candidate,
+                finding,
+                security_context,
+                metadata_only,
+                runtime,
+                context_expansions,
+                model_tier,
+                reasoning_effort_override,
             )
-            evidence = {
-                "rule_id": candidate.rule_id,
-                "title": candidate.title,
-                "vulnerability_class": candidate.vulnerability_class,
-                "message": candidate.message,
-                "candidate_confidence": candidate.confidence,
-                "finding_impact": finding.impact,
-                "graph_path": candidate.evidence.graph_path,
-                "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
-                "security_ir_context": {} if metadata_only else _security_ir_context(
-                    self.security_graph,
-                    candidate.evidence.path,
-                    candidate.evidence.start_line,
-                ),
-                "source_window": code_window,
-                "context_expansions": context_expansions,
-                "protected_security_context": _redact(
-                    security_context[: int(runtime["security_context_characters"])]
-                ),
-                "metadata_only": metadata_only,
-            }
-            response = self._structured_response(
-                "plaidnox_security_review",
-                load_json("schemas/deep_hunt_review.json"),
-                "metadata_exposure_review" if metadata_only else "security_review",
-                evidence,
-                model_tier=model_tier,
-            )
-            review = _deep_hunt_result_from_response(response)
-            _validate_deep_hunt_result(root, candidate, review, metadata_only=metadata_only)
+            confidence_history.append(review.confidence)
             if metadata_only and review.context_requests:
                 raise AIResponseError("Metadata-only review requested on-demand source or Security IR expansion")
             if round_index >= max_rounds or not review.context_requests:
@@ -375,10 +376,25 @@ class PlaidNoxDeepHuntAgent:
                         root,
                         self.security_graph,
                         request,
-                        exclude=self.source_excludes,
+                        source_excludes=self.source_excludes,
                         max_file_bytes=self.max_file_bytes,
+                        knowledge_store=self.knowledge_coordinator.store if self.knowledge_coordinator else None,
                     )
                 )
+        if not metadata_only and review.context_requests:
+            review = self._apply_retry_route(
+                root,
+                candidate,
+                finding,
+                security_context,
+                runtime,
+                context_expansions,
+                model_tier,
+                reasoning_effort_override,
+                review,
+                confidence_history,
+                max_requests,
+            )
         self._emit(
             "candidate_verification_completed",
             rule_id=candidate.rule_id,
@@ -388,6 +404,110 @@ class PlaidNoxDeepHuntAgent:
         )
         return review
 
+    def _run_hunt_round(
+        self,
+        root: Path,
+        candidate: Candidate,
+        finding: Finding,
+        security_context: str,
+        metadata_only: bool,
+        runtime: dict[str, Any],
+        context_expansions: list[dict[str, Any]],
+        model_tier: ModelTier | None,
+        reasoning_effort_override: str | None,
+    ) -> DeepHuntResult:
+        code_window = "[contents intentionally unavailable]" if metadata_only else _source_window(
+            root,
+            candidate.evidence.path,
+            candidate.evidence.start_line,
+            candidate.evidence.end_line,
+            exclude=self.source_excludes,
+            max_file_bytes=self.max_file_bytes,
+        )
+        evidence = {
+            "rule_id": candidate.rule_id,
+            "title": candidate.title,
+            "vulnerability_class": candidate.vulnerability_class,
+            "message": candidate.message,
+            "candidate_confidence": candidate.confidence,
+            "finding_impact": finding.impact,
+            "graph_path": candidate.evidence.graph_path,
+            "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
+            "security_ir_context": {} if metadata_only else _security_ir_context(
+                self.security_graph,
+                candidate.evidence.path,
+                candidate.evidence.start_line,
+            ),
+            "source_window": code_window,
+            "context_expansions": context_expansions,
+            "protected_security_context": _redact(
+                security_context[: int(runtime["security_context_characters"])]
+            ),
+            "metadata_only": metadata_only,
+        }
+        response = self._structured_response(
+            "plaidnox_security_review",
+            load_json("schemas/deep_hunt_review.json"),
+            "metadata_exposure_review" if metadata_only else "security_review",
+            evidence,
+            model_tier=model_tier,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+        review = _deep_hunt_result_from_response(response)
+        _validate_deep_hunt_result(root, candidate, review, metadata_only=metadata_only)
+        return review
+
+    def _apply_retry_route(
+        self,
+        root: Path,
+        candidate: Candidate,
+        finding: Finding,
+        security_context: str,
+        runtime: dict[str, Any],
+        context_expansions: list[dict[str, Any]],
+        model_tier: ModelTier | None,
+        reasoning_effort_override: str | None,
+        review: DeepHuntResult,
+        confidence_history: list[float],
+        max_requests: int,
+    ) -> DeepHuntResult:
+        """Consult JEV exactly once for a single bounded extra round after the normal
+        context-expansion budget is exhausted and a genuine evidence gap remains."""
+        decision = self.retry_router.decide(_retry_facts(review, model_tier, context_expansions, confidence_history))
+        self._emit(
+            "candidate_retry_routed",
+            rule_id=candidate.rule_id,
+            action=decision.action,
+            reason=decision.reason,
+        )
+        if decision.action == "mark_unresolved":
+            return review
+        retry_model_tier = ModelTier.DEEP if decision.action == "escalate_model" else model_tier
+        retry_effort_override = "high" if decision.action == "escalate_model" else reasoning_effort_override
+        if decision.action == "expand_context":
+            for request in review.context_requests[:max_requests]:
+                context_expansions.append(
+                    _resolve_context_request(
+                        root,
+                        self.security_graph,
+                        request,
+                        source_excludes=self.source_excludes,
+                        max_file_bytes=self.max_file_bytes,
+                        knowledge_store=self.knowledge_coordinator.store if self.knowledge_coordinator else None,
+                    )
+                )
+        return self._run_hunt_round(
+            root,
+            candidate,
+            finding,
+            security_context,
+            False,
+            runtime,
+            context_expansions,
+            retry_model_tier,
+            retry_effort_override,
+        )
+
     # Compatibility with integrations built before the dedicated Deep Hunt name.
     def review(
         self,
@@ -396,8 +516,9 @@ class PlaidNoxDeepHuntAgent:
         finding: Finding,
         security_context: str = "",
         model_tier: ModelTier | None = None,
+        route: RouteDecision | None = None,
     ) -> AIReview:
-        return self.hunt(root, candidate, finding, security_context, model_tier=model_tier)
+        return self.hunt(root, candidate, finding, security_context, model_tier=model_tier, route=route)
 
     def propose_patch(
         self,
@@ -516,7 +637,7 @@ class PlaidNoxDeepHuntAgent:
             self.security_graph = patched_graph
             try:
                 rescan = self.hunt(tmp_root, candidate, finding, security_context, model_tier=model_tier)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 unexpected = not isinstance(exc, AIStageError)
                 self._emit(
                     "patch_verification_rescan_failed",
@@ -560,26 +681,91 @@ class PlaidNoxDeepHuntAgent:
         self._emit("repository_context_started", codebase=codebase, source_files=len(inventory))
         runtime = load_json("runtime/agent.json")
         context_fabric: dict[str, Any] = {}
+        preparation = None
         if self.context_store is not None:
-            base = self.context_store.create_base(codebase, revision, root, graph)
+            preparation = self.context_store.prepare_snapshot(
+                codebase,
+                revision,
+                root,
+                graph,
+            )
+            scope_paths = _analysis_scope_paths(preparation, source_tree)
             context_fabric = {
-                "context_id": base.context_id,
-                "revision": base.commit,
-                "symbol_count": base.symbol_count,
-                "reused": base.reused,
+                "context_id": preparation.current.context_id,
+                "revision": preparation.current.commit,
+                "symbol_count": preparation.current.symbol_count,
+                "base_context_id": preparation.previous.context_id if preparation.previous else "",
+                "overlay_id": preparation.overlay.overlay_id if preparation.overlay else "",
+                "changed_paths": preparation.changed_paths,
+                "affected_symbols": preparation.overlay.affected_symbols if preparation.overlay else [],
+                "analysis_scope_paths": scope_paths,
+                "context_reused_percent": (
+                    preparation.overlay.context_reused_percent
+                    if preparation.overlay
+                    else (100 if preparation.reused else 0)
+                ),
+                "reused": preparation.reused,
             }
+            if preparation.reused and preparation.previous_repository_context is not None:
+                context = _repository_context_from_saved(
+                    preparation.previous_repository_context,
+                    codebase,
+                    revision,
+                    inventory,
+                    source_tree,
+                    graph,
+                    context_fabric,
+                )
+                self.context_store.save_repository_context(
+                    preparation.current.context_id,
+                    codebase,
+                    context.to_dict(),
+                )
+                self._emit(
+                    "repository_context_reused",
+                    codebase=codebase,
+                    context_id=preparation.current.context_id,
+                )
+                return context
+
+        full_security_ir = _repository_security_ir(graph, runtime)
+        incremental = bool(
+            preparation is not None
+            and preparation.overlay is not None
+            and preparation.previous_repository_context is not None
+        )
+        scope_paths = set(context_fabric.get("analysis_scope_paths", source_tree))
+        route_pool = [item for item in graph.routes if not incremental or item.path in scope_paths]
+        symbol_pool = [item for item in graph.symbols if not incremental or item.path in scope_paths]
+        file_pool = [item for item in graph.files if not incremental or item.path in scope_paths]
+        sampled_routes, truncated_route_areas = _balanced_area_sample(
+            route_pool, int(runtime["repository_route_limit"]), lambda item: item.path
+        )
+        sampled_symbols, truncated_symbol_areas = _balanced_area_sample(
+            symbol_pool, int(runtime["repository_symbol_limit"]), lambda item: item.path
+        )
+        sampled_files, truncated_file_areas = _balanced_area_sample(
+            file_pool, int(runtime["repository_ir_file_limit"]), lambda item: item.path
+        )
+        manifest_inventory = (
+            [item for item in inventory if str(item["path"]) in scope_paths]
+            if incremental
+            else inventory
+        )
+        manifest_tree = [path for path in source_tree if path in scope_paths] if incremental else source_tree
+        manifest_ir = (
+            [item for item in full_security_ir if str(item["path"]) in scope_paths]
+            if incremental
+            else full_security_ir
+        )
         manifest = {
             "codebase": codebase,
             "revision": revision,
-            "source_inventory": inventory,
-            "source_tree": source_tree,
             "routes": [
-                {"name": item.name, "path": item.path, "line": item.line}
-                for item in graph.routes[: int(runtime["repository_route_limit"])]
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_routes
             ],
             "symbols": [
-                {"name": item.name, "path": item.path, "line": item.line}
-                for item in graph.symbols[: int(runtime["repository_symbol_limit"])]
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_symbols
             ],
             "security_ir": [
                 {
@@ -601,19 +787,55 @@ class PlaidNoxDeepHuntAgent:
                         for call in item.calls
                     ],
                 }
-                for item in graph.files[: int(runtime["repository_ir_file_limit"])]
+                for item in sampled_files
             ],
             "business_context": _redact(
                 business_context[: int(runtime["business_context_characters"])]
             ),
             "context_fabric": context_fabric,
+            "repository_context_coverage": {
+                "routes": {
+                    "included": len(sampled_routes),
+                    "total": len(graph.routes),
+                    "truncated": len(sampled_routes) < len(graph.routes),
+                    "areas_with_omitted_context": truncated_route_areas,
+                },
+                "symbols": {
+                    "included": len(sampled_symbols),
+                    "total": len(graph.symbols),
+                    "truncated": len(sampled_symbols) < len(graph.symbols),
+                    "areas_with_omitted_context": truncated_symbol_areas,
+                },
+                "security_ir_files": {
+                    "included": len(sampled_files),
+                    "total": len(graph.files),
+                    "truncated": len(sampled_files) < len(graph.files),
+                    "areas_with_omitted_context": truncated_file_areas,
+                },
+            },
         }
+        if incremental and preparation is not None:
+            manifest.pop("security_ir", None)
+            manifest["changed_source_inventory"] = manifest_inventory
+            manifest["analysis_scope_tree"] = manifest_tree
+            manifest["security_ir_slice"] = manifest_ir
+            manifest["previous_repository_context"] = _compact_repository_context_value(
+                preparation.previous_repository_context or {},
+                "",
+            )
+            manifest["incremental_context_packet"] = (
+                preparation.packet.to_dict() if preparation.packet is not None else {}
+            )
+        else:
+            manifest["source_inventory"] = manifest_inventory
+            manifest["source_tree"] = manifest_tree
         recon_queries = self._create_recon_search_plan(manifest)
         recon_evidence, recon_hits = _execute_recon_search_plan(
             root,
             recon_queries,
             self.source_excludes,
             self.max_file_bytes,
+            include_paths=scope_paths if incremental else None,
         )
         graph.search_hits.extend(recon_hits)
         graph.rg_queries += len(recon_queries)
@@ -647,7 +869,7 @@ class PlaidNoxDeepHuntAgent:
             source_tree=source_tree,
             graph_symbols=len(graph.symbols),
             graph_routes=len(graph.routes),
-            security_ir=manifest["security_ir"],
+            security_ir=full_security_ir,
             business_context=_redact(
                 business_context[: int(runtime["business_context_characters"])]
             ),
@@ -666,7 +888,14 @@ class PlaidNoxDeepHuntAgent:
             indirect_dispatch=[dict(item) for item in payload.get("indirect_dispatch", [])],
             build_time_variants=[dict(item) for item in payload.get("build_time_variants", [])],
             coverage_ledger=[dict(item) for item in payload.get("coverage_ledger", [])],
+            analysis_scope_paths=sorted(scope_paths) if scope_paths else source_tree,
         )
+        if self.context_store is not None and preparation is not None:
+            self.context_store.save_repository_context(
+                preparation.current.context_id,
+                codebase,
+                context.to_dict(),
+            )
         self._emit("repository_context_completed", codebase=codebase, applications=len(applications))
         return context
 
@@ -705,7 +934,7 @@ class PlaidNoxDeepHuntAgent:
 
         runtime = load_json("runtime/agent.json")
         request = {
-            "repository_context": context.to_dict(),
+            "repository_context": _compact_repository_context(context, ""),
             "protected_security_context": _redact(
                 security_context[: int(runtime["security_context_characters"])]
             ),
@@ -738,7 +967,7 @@ class PlaidNoxDeepHuntAgent:
                     context.revision,
                     task.to_dict(),
                     task.knowledge_queries,
-                    context.to_dict(),
+                    _compact_repository_context(context, ""),
                 ):
                     task.knowledge_context.extend(_knowledge_excerpts(entries, decision.action))
                 task.knowledge_context = list(
@@ -753,6 +982,7 @@ class PlaidNoxDeepHuntAgent:
 
         if not tasks:
             raise AIResponseError("AI hunt plan contained no investigation tasks")
+        _validate_hunt_plan_references(context, tasks)
         plan_id = ""
         if self.knowledge_coordinator is not None:
             plan_id = self.knowledge_coordinator.store.save_plan(
@@ -785,6 +1015,7 @@ class PlaidNoxDeepHuntAgent:
             self.security_graph,
             self.source_excludes,
             self.max_file_bytes,
+            include_paths=set(context.analysis_scope_paths) or None,
         )
         if not segments:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
@@ -826,7 +1057,7 @@ class PlaidNoxDeepHuntAgent:
                     next_focus = str(payload["next_focus"])
                     if not next_focus:
                         raise AIResponseError("AI marked coverage incomplete without a continuation focus")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append(exc)
                     break
             self._emit(
@@ -942,7 +1173,7 @@ class PlaidNoxDeepHuntAgent:
                     next_focus = str(payload["next_focus"])
                     if not next_focus:
                         raise AIResponseError("AI variant sweep was incomplete without a continuation focus")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     segment_failures += 1
                     if not isinstance(exc, AIStageError):
                         segment_unexpected += 1
@@ -958,7 +1189,7 @@ class PlaidNoxDeepHuntAgent:
 
         try:
             queries = self._create_search_plan(context, plan, verified_payload)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._emit("variant_search_plan_failed", error_type=type(exc).__name__)
             self.variant_unexpected_failures += int(not isinstance(exc, AIStageError))
             return [], 1
@@ -969,6 +1200,7 @@ class PlaidNoxDeepHuntAgent:
             self.security_graph,
             self.source_excludes,
             self.max_file_bytes,
+            include_paths=set(context.analysis_scope_paths) or None,
         )
         if not segments:
             raise AIResponseError("AI variant-search plan produced no reviewable context")
@@ -979,6 +1211,170 @@ class PlaidNoxDeepHuntAgent:
                 self.variant_unexpected_failures += segment_unexpected
         self._emit("variant_sweep_completed", candidates=len(variants), errors=failures)
         return variants, failures
+
+    def _frontier_priority(self, finding: Finding) -> str:
+        facts = {
+            "fingerprint": finding.fingerprint,
+            "capability": finding.metadata.get("deep_hunt", {}).get("gained_capability", ""),
+            "title": finding.title,
+            "vulnerability_class": finding.vulnerability_class,
+            "severity": finding.severity.value,
+            "attack_path": finding.metadata.get("deep_hunt", {}).get("attack_path", ""),
+        }
+        return self.frontier_router.prioritize(facts).priority
+
+    def chain_capability_pivots(
+        self,
+        root: Path,
+        context: AIRepositoryContext,
+        plan: HuntPlan,
+        verified: list[tuple[Candidate, Finding]],
+    ) -> tuple[list[Candidate], int]:
+        """Search for a further security-boundary crossing enabled by each verified finding's gained capability.
+
+        A confirmed finding's `gained_capability` (set by `hunt`'s verification gate 5) is not
+        an endpoint -- it is new attacker-controlled reach. This stage asks whether that reach
+        crosses another boundary elsewhere in the repository and, when it does, returns pivot
+        candidates that re-enter the same discovery-then-verify pipeline as any other candidate,
+        so a chained hypothesis is never asserted without its own independent Deep Hunt review.
+        """
+        runtime = load_json("runtime/agent.json")
+        pivots: list[Candidate] = []
+        failures = 0
+        self.capability_chain_unexpected_failures = 0
+        capable = [
+            (candidate, finding)
+            for candidate, finding in verified
+            if str(finding.metadata.get("deep_hunt", {}).get("gained_capability", ""))
+        ]
+        if not capable:
+            return [], 0
+
+        max_frontier = int(runtime["capability_chain_max_frontier"])
+        if len(capable) > max_frontier:
+            ranked = [
+                (self._frontier_priority(finding), candidate, finding)
+                for candidate, finding in capable
+            ]
+            ranked.sort(key=lambda item: FRONTIER_PRIORITY_WEIGHT[item[0]], reverse=True)
+            self._emit(
+                "capability_chain_frontier_selected",
+                candidates=len(capable),
+                selected=max_frontier,
+            )
+            capable = [(candidate, finding) for _priority, candidate, finding in ranked[:max_frontier]]
+
+        self._emit("capability_chain_started", verified_roots=len(capable))
+
+        capability_payload = [
+            {
+                "fingerprint": finding.fingerprint,
+                "capability": finding.metadata.get("deep_hunt", {}).get("gained_capability", ""),
+                "title": finding.title,
+                "vulnerability_class": finding.vulnerability_class,
+                "severity": finding.severity.value,
+                "path": finding.evidence.path,
+                "start_line": finding.evidence.start_line,
+                "end_line": finding.evidence.end_line,
+                "attack_path": finding.metadata.get("deep_hunt", {}).get("attack_path", ""),
+            }
+            for candidate, finding in capable
+        ]
+
+        compact_plan = {
+            "plan_id": plan.plan_id,
+            "strategy": plan.strategy,
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "objective": task.objective,
+                    "focus_paths": task.focus_paths,
+                    "vulnerability_themes": task.vulnerability_themes,
+                    "evidence_requirements": task.evidence_requirements,
+                    "business_invariants": task.business_invariants,
+                    "coverage_obligations": task.coverage_obligations,
+                    "falsification_requirements": task.falsification_requirements,
+                    "inventory_refs": task.inventory_refs,
+                    "sensitive_effect_refs": task.sensitive_effect_refs,
+                    "authentication_path_refs": task.authentication_path_refs,
+                }
+                for task in plan.tasks
+            ],
+        }
+
+        def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], int, int]:
+            segment_pivots: list[Candidate] = []
+            segment_failures = 0
+            segment_unexpected = 0
+            self._emit("capability_chain_segment_started", path=segment["path"], start_line=segment["start_line"])
+            next_focus = ""
+            for _continuation in range(int(runtime["discovery_max_continuations"]) + 1):
+                request = {
+                    "repository_context": context.to_dict(),
+                    "hunt_plan": compact_plan,
+                    "verified_roots": capability_payload,
+                    "source_segment": segment,
+                    "continuation_focus": next_focus,
+                }
+                try:
+                    response = self._structured_response(
+                        "plaidnox_capability_chain",
+                        load_json("schemas/capability_chain.json"),
+                        "capability_chain",
+                        request,
+                    )
+                    payload = json.loads(response.output_text)
+                    for item in payload["candidates"]:
+                        pivot = _candidate_from_ai_item(root, item, segment)
+                        if pivot is not None:
+                            pivot.metadata["capability_pivot_of"] = [
+                                finding.fingerprint for _candidate, finding in capable
+                            ]
+                            pivot.metadata["engine"] = "plaidnox-capability-chain"
+                            segment_pivots.append(pivot)
+                    if bool(payload["coverage_complete"]):
+                        break
+                    next_focus = str(payload["next_focus"])
+                    if not next_focus:
+                        raise AIResponseError("AI capability chain was incomplete without a continuation focus")
+                except Exception as exc:  # noqa: BLE001
+                    segment_failures += 1
+                    if not isinstance(exc, AIStageError):
+                        segment_unexpected += 1
+                    break
+            self._emit(
+                "capability_chain_segment_completed",
+                path=segment["path"],
+                start_line=segment["start_line"],
+                candidates=len(segment_pivots),
+                errors=segment_failures,
+            )
+            return segment_pivots, segment_failures, segment_unexpected
+
+        try:
+            queries = self._create_search_plan(context, plan, capability_payload)
+        except Exception as exc:  # noqa: BLE001
+            self._emit("capability_chain_search_plan_failed", error_type=type(exc).__name__)
+            self.capability_chain_unexpected_failures += int(not isinstance(exc, AIStageError))
+            return [], 1
+        segments = _search_segments(
+            root,
+            queries,
+            plan,
+            self.security_graph,
+            self.source_excludes,
+            self.max_file_bytes,
+        )
+        if not segments:
+            raise AIResponseError("AI capability-chain search plan produced no reviewable context")
+        with ThreadPoolExecutor(max_workers=int(runtime["sweep_max_workers"])) as executor:
+            for segment_pivots, segment_failures, segment_unexpected in executor.map(analyze, segments):
+                pivots.extend(segment_pivots)
+                failures += segment_failures
+                self.capability_chain_unexpected_failures += segment_unexpected
+        self._emit("capability_chain_completed", candidates=len(pivots), errors=failures)
+        return pivots, failures
 
     def _create_search_plan(
         self,
@@ -1021,10 +1417,16 @@ class PlaidNoxDeepHuntAgent:
             }
             for task in plan.tasks
         ]
+        obligation_index = [
+            {"ref_id": f"{task.task_id}::obligation::{i}", "task_id": task.task_id, "text": obligation}
+            for task in plan.tasks
+            for i, obligation in enumerate(task.coverage_obligations)
+        ]
         request = {
-            "repository_context": context.to_dict(),
+            "repository_context": _compact_repository_context(context, ""),
             "hunt_plan": {"plan_id": plan.plan_id, "strategy": plan.strategy, "tasks": compact_tasks},
             "verified_roots": verified_roots or [],
+            "coverage_obligation_refs": obligation_index,
         }
         response = self._structured_response(
             "plaidnox_search_query_plan",
@@ -1037,11 +1439,19 @@ class PlaidNoxDeepHuntAgent:
             queries = list(payload["queries"])
             task_ids = {task.task_id for task in plan.tasks}
             covered = {str(task_id) for query in queries for task_id in query["task_ids"]}
+            covered_refs = {str(ref) for query in queries for ref in query.get("coverage_refs", [])}
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError("AI search plan did not match the required schema") from exc
         missing = task_ids - covered
         if missing:
             raise AIResponseError("AI search plan did not cover every hunt task")
+        all_obligation_refs = {item["ref_id"] for item in obligation_index}
+        unknown_refs = covered_refs - all_obligation_refs
+        if unknown_refs:
+            raise AIResponseError("AI search plan referenced an unknown coverage obligation")
+        missing_refs = all_obligation_refs - covered_refs
+        if missing_refs:
+            raise AIResponseError("AI search plan did not cover every coverage obligation")
         runtime = load_json("runtime/code_intelligence.json")
         maximum = int(runtime["maximum_dynamic_queries_per_task"]) * len(plan.tasks)
         if len(queries) > maximum:
@@ -1190,6 +1600,7 @@ class PlaidNoxDeepHuntAgent:
         payload: dict[str, Any],
         max_output_tokens: int | None = None,
         model_tier: ModelTier | None = None,
+        reasoning_effort_override: str | None = None,
     ) -> Any:
         safe_payload = redact_payload(payload)
         serialized_payload = json.dumps(safe_payload, sort_keys=True, ensure_ascii=False)
@@ -1206,9 +1617,13 @@ class PlaidNoxDeepHuntAgent:
             }
         )
         system_prompt, user_prompt = render_operation(prompt_operation, safe_payload)
+        configured_effort = str(
+            load_json("runtime/agent.json")["reasoning_effort_by_operation"].get(prompt_operation, "low")
+        )
+        effort = _stronger_effort(configured_effort, reasoning_effort_override)
         response = self.client.responses.create(
             model=self._model_for_tier(model_tier),
-            reasoning={"effort": "low"},
+            reasoning={"effort": effort},
             input=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1248,6 +1663,61 @@ def load_env_file(path: Path) -> None:
             "IFRIT_RESEARCH_SONAR_MODEL",
         } and value:
             os.environ.setdefault(key, value.strip().strip("\"'"))
+
+
+_EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def _stronger_effort(configured: str, override: str | None) -> str:
+    """Let JEV escalate reasoning effort above the static per-operation default, never below it."""
+    if override is None or override not in _EFFORT_ORDER:
+        return configured
+    if configured not in _EFFORT_ORDER:
+        return configured
+    return override if _EFFORT_ORDER[override] > _EFFORT_ORDER[configured] else configured
+
+
+def _hunt_effort_override(route: RouteDecision | None) -> str | None:
+    if route is None:
+        return None
+    if route.analysis_complexity >= 4 or route.needs_deep_falsification in {"likely", "yes"}:
+        return "high"
+    return None
+
+
+def _context_expansion_max_requests(runtime: dict[str, Any], route: RouteDecision | None) -> int:
+    base = int(runtime["context_expansion_max_requests_per_round"])
+    if route is None:
+        return base
+    breadth_signals = (
+        route.needs_cross_file,
+        route.needs_state_reconstruction,
+        route.needs_external_semantics,
+        route.needs_environment_context,
+    )
+    bonus_per_signal = int(runtime["context_expansion_signal_bonus_requests"])
+    extra = sum(1 for signal in breadth_signals if signal in {"likely", "yes"}) * bonus_per_signal
+    ceiling = int(runtime["context_expansion_max_requests_per_round_ceiling"])
+    return min(base + extra, ceiling)
+
+
+def _retry_facts(
+    review: DeepHuntResult,
+    model_tier: ModelTier | None,
+    context_expansions: list[dict[str, Any]],
+    confidence_history: list[float],
+) -> dict[str, Any]:
+    return {
+        "model_tier": model_tier.value if model_tier is not None else "",
+        "rounds_used": len(confidence_history),
+        "context_requests_pending": len(review.context_requests),
+        "resolved_requests": len(context_expansions),
+        "unresolved_gates": [
+            str(gate.get("gate", "")) for gate in review.gate_results if gate.get("verdict") == "unknown"
+        ],
+        "evidence_gaps": list(review.evidence_gaps or []),
+        "confidence_history": confidence_history,
+    }
 
 
 def _source_window(
@@ -1304,6 +1774,15 @@ def _security_ir_context(
             {"caller": call.caller, "callee": call.callee, "line": call.line}
             for call in (file_ir.calls if file_ir else [])
         ],
+        "references": [
+            {
+                "source": reference.source,
+                "target": reference.target,
+                "line": reference.line,
+                "kind": reference.kind,
+            }
+            for reference in (file_ir.references if file_ir else [])
+        ],
         "routes": [
             {"name": route.name, "line": route.line}
             for route in security_ir.routes
@@ -1339,6 +1818,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             required_preconditions=[str(item) for item in payload["required_preconditions"]],
             evidence_gaps=[str(item) for item in payload["evidence_gaps"]],
             security_invariant=str(payload["security_invariant"]),
+            gained_capability=str(payload["gained_capability"]),
             rejection_reason=str(payload["rejection_reason"]),
             gate_results=[dict(item) for item in payload["gate_results"]],
             evidence_locations=[dict(item) for item in payload["evidence_locations"]],
@@ -1358,8 +1838,9 @@ def _resolve_context_request(
     security_graph: StructuralGraph | None,
     request: dict[str, Any],
     *,
-    exclude: list[str] | None = None,
+    source_excludes: list[str] | None = None,
     max_file_bytes: int | None = None,
+    knowledge_store: KnowledgeStore | None = None,
 ) -> dict[str, Any]:
     """Answer one AI-named Tree-sitter-backed context request from the already-built Security IR."""
     kind = str(request.get("kind", ""))
@@ -1367,6 +1848,10 @@ def _resolve_context_request(
     symbol = str(request.get("symbol", ""))
     start_line = int(request.get("start_line", 1) or 1)
     end_line = int(request.get("end_line", start_line) or start_line)
+    offset = max(int(request.get("offset", 0) or 0), 0)
+    pattern = str(request.get("pattern", ""))
+    query = str(request.get("query", ""))
+    page_size = int(load_json("runtime/agent.json")["context_request_edge_page_size"])
 
     if kind == "window":
         try:
@@ -1375,7 +1860,7 @@ def _resolve_context_request(
                 path,
                 start_line,
                 end_line,
-                exclude=exclude,
+                exclude=source_excludes,
                 max_file_bytes=max_file_bytes,
             )
         except (AIResponseError, OSError) as exc:
@@ -1387,6 +1872,51 @@ def _resolve_context_request(
             "end_line": end_line,
             "resolved": True,
             "content": content,
+        }
+
+    if kind == "search":
+        if not pattern:
+            return {"kind": kind, "resolved": False, "reason": "search requests must include a non-empty pattern"}
+        try:
+            hits = RipgrepDiscovery(root).search(
+                "context_search",
+                pattern,
+                include_globs=[path] if path else [],
+                exclude_globs=list(source_excludes or []),
+            )
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            return {"kind": kind, "resolved": False, "reason": str(exc)}
+        eligible = {
+            item.relative_to(root).as_posix()
+            for item in source_files(root, exclude=source_excludes, max_file_bytes=max_file_bytes)
+            if not _is_sensitive_path(item)
+        }
+        safe_hits = [{"path": hit.path, "line": hit.line} for hit in hits if hit.path in eligible]
+        if not safe_hits:
+            return {"kind": kind, "resolved": False, "reason": "no matches for the requested pattern"}
+        page = safe_hits[offset : offset + page_size]
+        return {
+            "kind": kind,
+            "resolved": True,
+            "matches": page,
+            "offset": offset,
+            "returned": len(page),
+            "total": len(safe_hits),
+            "truncated": offset + len(page) < len(safe_hits),
+        }
+
+    if kind == "knowledge":
+        if not query:
+            return {"kind": kind, "resolved": False, "reason": "knowledge requests must include a non-empty query"}
+        if knowledge_store is None:
+            return {"kind": kind, "resolved": False, "reason": "no knowledge store is configured"}
+        entries = knowledge_store.search(query)
+        if not entries:
+            return {"kind": kind, "resolved": False, "reason": "no stored knowledge matched the query"}
+        return {
+            "kind": kind,
+            "resolved": True,
+            "entries": [entry.to_dict() for entry in entries],
         }
 
     if security_graph is None:
@@ -1416,7 +1946,7 @@ def _resolve_context_request(
                 match.path,
                 match.line,
                 match.end_line or match.line,
-                exclude=exclude,
+                exclude=source_excludes,
                 max_file_bytes=max_file_bytes,
             )
         except (AIResponseError, OSError) as exc:
@@ -1432,14 +1962,24 @@ def _resolve_context_request(
         }
 
     if kind in {"callers", "callees"}:
-        edges = [
+        all_edges = [
             {"caller": call.caller, "callee": call.callee, "path": call.path, "line": call.line}
             for call in security_graph.calls
             if (call.callee == symbol if kind == "callers" else call.caller == symbol)
-        ][:5]
-        if not edges:
+        ]
+        if not all_edges:
             return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no matching edges in the Security IR"}
-        return {"kind": kind, "symbol": symbol, "resolved": True, "edges": edges}
+        page = all_edges[offset : offset + page_size]
+        return {
+            "kind": kind,
+            "symbol": symbol,
+            "resolved": True,
+            "edges": page,
+            "offset": offset,
+            "returned": len(page),
+            "total": len(all_edges),
+            "truncated": offset + len(page) < len(all_edges),
+        }
 
     if kind == "imports":
         file_ir = next((item for item in security_graph.files if item.path == path), None)
@@ -1448,14 +1988,44 @@ def _resolve_context_request(
         return {"kind": kind, "path": path, "resolved": True, "imports": list(file_ir.imports)}
 
     if kind == "route":
-        routes = [
+        all_routes = [
             {"name": route.name, "path": route.path, "line": route.line}
             for route in security_graph.routes
             if symbol == route.name or path == route.path
-        ][:5]
-        if not routes:
+        ]
+        if not all_routes:
             return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no matching route in the Security IR"}
-        return {"kind": kind, "symbol": symbol, "resolved": True, "routes": routes}
+        page = all_routes[offset : offset + page_size]
+        return {
+            "kind": kind,
+            "symbol": symbol,
+            "resolved": True,
+            "routes": page,
+            "offset": offset,
+            "returned": len(page),
+            "total": len(all_routes),
+            "truncated": offset + len(page) < len(all_routes),
+        }
+
+    if kind == "sibling_handlers":
+        all_siblings = [
+            {"name": route.name, "path": route.path, "line": route.line}
+            for route in security_graph.routes
+            if route.path == path and route.name != symbol
+        ]
+        if not all_siblings:
+            return {"kind": kind, "path": path, "resolved": False, "reason": "no sibling routes in the same file"}
+        page = all_siblings[offset : offset + page_size]
+        return {
+            "kind": kind,
+            "path": path,
+            "resolved": True,
+            "routes": page,
+            "offset": offset,
+            "returned": len(page),
+            "total": len(all_siblings),
+            "truncated": offset + len(page) < len(all_siblings),
+        }
 
     return {"kind": kind, "resolved": False, "reason": "unsupported context request kind"}
 
@@ -1541,6 +2111,8 @@ def _validate_deep_hunt_result(
             raise AIResponseError("AI review returned a rejection reason for a supported finding")
         if not review.security_invariant or not review.proof_plan or not review.regression_test:
             raise AIResponseError("AI review omitted required proof or remediation evidence")
+        if not review.gained_capability:
+            raise AIResponseError("AI review supported a finding without naming the gained capability")
         if not metadata_only and not review.evidence_locations:
             raise AIResponseError("AI review supported a finding without machine-checkable evidence locations")
     elif not review.rejection_reason:
@@ -1611,6 +2183,51 @@ def _is_sensitive_path(path: Path) -> bool:
     return name.startswith(".env") or any(term in name for term in ("credential", "secret", "id_rsa", "service-account"))
 
 
+def _production_area(path: str) -> str:
+    """First path segment, used as a coarse proxy for a distinct production area of the repository."""
+    head = path.split("/", 1)[0]
+    return head or "."
+
+
+def _balanced_area_sample(
+    items: list[Any],
+    limit: int,
+    path_of: Callable[[Any], str],
+) -> tuple[list[Any], list[str]]:
+    """Select up to `limit` items round-robin across production areas instead of a first-N slice.
+
+    A plain `items[:limit]` slice starves every area but whichever sorts first in the
+    underlying list. Interleaving by area keeps every part of the repository represented
+    once the repository is larger than the configured limit.
+    """
+    if len(items) <= limit:
+        return list(items), []
+    buckets: dict[str, list[Any]] = {}
+    for item in items:
+        buckets.setdefault(_production_area(path_of(item)), []).append(item)
+    areas = sorted(buckets)
+    selected: list[Any] = []
+    cursor = {area: 0 for area in areas}
+    while len(selected) < limit:
+        progressed = False
+        for area in areas:
+            if len(selected) >= limit:
+                break
+            index = cursor[area]
+            bucket = buckets[area]
+            if index < len(bucket):
+                selected.append(bucket[index])
+                cursor[area] = index + 1
+                progressed = True
+        if not progressed:
+            break
+    included_ids = {id(item) for item in selected}
+    truncated_areas = sorted(
+        area for area, bucket in buckets.items() if any(id(item) not in included_ids for item in bucket)
+    )
+    return selected, truncated_areas
+
+
 def _source_inventory(
     root: Path,
     exclude: list[str] | None = None,
@@ -1639,6 +2256,7 @@ def _execute_recon_search_plan(
     queries: list[dict[str, Any]],
     exclude: list[str] | None,
     max_file_bytes: int | None,
+    include_paths: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SearchHit]]:
     """Execute only model-produced recon searches and return bounded evidence."""
 
@@ -1647,6 +2265,7 @@ def _execute_recon_search_plan(
         path.relative_to(root).as_posix()
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
+        and (include_paths is None or path.relative_to(root).as_posix() in include_paths)
     }
     discovery = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
     evidence: list[dict[str, Any]] = []
@@ -1743,6 +2362,7 @@ def _search_segments(
     graph: StructuralGraph | None,
     exclude: list[str] | None,
     max_file_bytes: int | None,
+    include_paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run AI-created rg queries and expand hits with Tree-sitter Security IR."""
 
@@ -1752,6 +2372,7 @@ def _search_segments(
         path.relative_to(root).as_posix()
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
+        and (include_paths is None or path.relative_to(root).as_posix() in include_paths)
     }
     rg = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
     hits_with_tasks: list[tuple[SearchHit, set[str]]] = []
@@ -1837,7 +2458,7 @@ def _enclosing_symbol(graph: StructuralGraph | None, path: str, line: int):
 
 def _related_ir(graph: StructuralGraph | None, path: str, symbol_name: str) -> dict[str, Any]:
     if graph is None:
-        return {"symbols": [], "calls": [], "imports": []}
+        return {"symbols": [], "calls": [], "references": [], "imports": []}
     files = [item for item in graph.files if item.path == path]
     imports = [value for item in files for value in item.imports]
     calls = [
@@ -1856,7 +2477,115 @@ def _related_ir(graph: StructuralGraph | None, path: str, symbol_name: str) -> d
         for symbol in graph.symbols
         if symbol.path == path
     ]
-    return {"symbols": symbols, "calls": calls, "imports": imports}
+    references = [
+        {
+            "source": item.source,
+            "target": item.target,
+            "line": item.line,
+            "kind": item.kind,
+        }
+        for item in graph.references
+        if item.path == path and (not symbol_name or item.source == symbol_name)
+    ]
+    return {"symbols": symbols, "calls": calls, "references": references, "imports": imports}
+
+
+def _repository_security_ir(
+    graph: StructuralGraph,
+    runtime: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": item.path,
+            "language": item.language,
+            "symbols": [
+                {
+                    "name": symbol.name,
+                    "qualified_name": symbol.qualified_name or symbol.name,
+                    "line": symbol.line,
+                    "end_line": symbol.end_line,
+                    "kind": symbol.kind,
+                }
+                for symbol in item.symbols
+            ],
+            "imports": item.imports,
+            "calls": [
+                {"caller": call.caller, "callee": call.callee, "line": call.line}
+                for call in item.calls
+            ],
+            "references": [
+                {
+                    "source": reference.source,
+                    "target": reference.target,
+                    "line": reference.line,
+                    "kind": reference.kind,
+                }
+                for reference in item.references
+            ],
+        }
+        for item in graph.files[: int(runtime["repository_ir_file_limit"])]
+    ]
+
+
+def _analysis_scope_paths(
+    preparation: PreparedContext,
+    source_tree: list[str],
+) -> list[str]:
+    if preparation.reused:
+        return list(source_tree)
+    if preparation.packet is None:
+        return list(source_tree)
+    available = set(source_tree)
+    paths = set(preparation.changed_paths)
+    paths.update(str(item.get("path", "")) for item in preparation.packet.code_slices)
+    return sorted(path for path in paths if path in available)
+
+
+def _repository_context_from_saved(
+    saved: dict[str, object],
+    codebase: str,
+    revision: str,
+    inventory: list[dict[str, Any]],
+    source_tree: list[str],
+    graph: StructuralGraph,
+    context_fabric: dict[str, Any],
+) -> AIRepositoryContext:
+    def dictionaries(key: str) -> list[dict[str, Any]]:
+        values = saved.get(key, [])
+        return [dict(item) for item in values if isinstance(item, dict)] if isinstance(values, list) else []
+
+    def strings(key: str) -> list[str]:
+        values = saved.get(key, [])
+        return [str(item) for item in values] if isinstance(values, list) else []
+
+    return AIRepositoryContext(
+        codebase=codebase,
+        revision=revision,
+        architecture=str(saved.get("architecture", "")),
+        applications=dictionaries("applications"),
+        source_inventory=inventory,
+        source_tree=source_tree,
+        graph_symbols=len(graph.symbols),
+        graph_routes=len(graph.routes),
+        security_ir=_repository_security_ir(graph, load_json("runtime/agent.json")),
+        business_context=str(saved.get("business_context", "")),
+        context_fabric=context_fabric,
+        actors=dictionaries("actors"),
+        sensitive_assets=dictionaries("sensitive_assets"),
+        input_surfaces=dictionaries("input_surfaces"),
+        trust_boundaries=dictionaries("trust_boundaries"),
+        security_invariants=strings("security_invariants"),
+        coverage_gaps=strings("coverage_gaps"),
+        production_areas=dictionaries("production_areas"),
+        entry_points=dictionaries("entry_points"),
+        sensitive_effects=dictionaries("sensitive_effects"),
+        authentication_paths=dictionaries("authentication_paths"),
+        authorization_decisions=dictionaries("authorization_decisions"),
+        indirect_dispatch=dictionaries("indirect_dispatch"),
+        build_time_variants=dictionaries("build_time_variants"),
+        coverage_ledger=dictionaries("coverage_ledger"),
+        analysis_scope_paths=[],
+    )
 
 
 def _compact_repository_context(
@@ -1865,8 +2594,14 @@ def _compact_repository_context(
 ) -> dict[str, Any]:
     """Build the bounded non-source context reused by per-segment model calls."""
 
+    return _compact_repository_context_value(context.to_dict(), focus_path)
+
+
+def _compact_repository_context_value(
+    source: dict[str, object],
+    focus_path: str,
+) -> dict[str, Any]:
     runtime = load_json("runtime/code_intelligence.json")
-    source = context.to_dict()
     maximum = int(runtime["maximum_compact_context_items_per_section"])
     omitted = {str(item) for item in runtime["compact_context_omitted_fields"]}
     compact: dict[str, Any] = {
@@ -1932,7 +2667,13 @@ def _contains_repository_wide_context(value: Any) -> bool:
 
 
 def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str, Any]) -> Candidate | None:
-    if not item.get("confirmed") or str(item.get("path", "")) != segment["path"]:
+    """Build a Candidate from a discovery/sweep/chain hypothesis.
+
+    Every item surfaced at this stage is an unverified hypothesis, never a verdict: this
+    stage identifies open-vocabulary vulnerability classes and gained capabilities, but
+    only PlaidNox Deep Hunt independently reviews and can mark a candidate confirmed.
+    """
+    if str(item.get("path", "")) != segment["path"]:
         return None
     start = int(item["start_line"])
     end = int(item["end_line"])
@@ -1970,7 +2711,6 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
             "category": category,
             "engine": "plaidnox-litellm-discovery",
             "ai_discovery": True,
-            "ai_remediation": str(item["remediation"]),
             "ai_business_impact": str(item["business_impact"]),
             "classification_references": [dict(reference) for reference in item["classification_references"]],
             "evidence_basis": dict(item.get("evidence_basis", {})),
@@ -2016,6 +2756,29 @@ def _hunt_task_from_value(value: dict[str, Any]) -> HuntTask:
         sensitive_effect_refs=[str(item) for item in value.get("sensitive_effect_refs", [])],
         authentication_path_refs=[str(item) for item in value.get("authentication_path_refs", [])],
     )
+
+
+def _validate_hunt_plan_references(context: AIRepositoryContext, tasks: list[HuntTask]) -> None:
+    """Fail closed if a task's *_refs field names an ID absent from the repository context it was built from."""
+    valid_inventory_paths = {str(item.get("path", "")) for item in context.source_inventory}
+    valid_effect_ids = {str(item.get("effect_id", "")) for item in context.sensitive_effects}
+    valid_authentication_paths = {str(item.get("name", "")) for item in context.authentication_paths}
+    for task in tasks:
+        for ref in task.inventory_refs:
+            if ref not in valid_inventory_paths:
+                raise AIResponseError(
+                    f"AI hunt plan task {task.task_id!r} referenced an inventory path not in the repository context: {ref!r}"
+                )
+        for ref in task.sensitive_effect_refs:
+            if ref not in valid_effect_ids:
+                raise AIResponseError(
+                    f"AI hunt plan task {task.task_id!r} referenced a sensitive effect not in the repository context: {ref!r}"
+                )
+        for ref in task.authentication_path_refs:
+            if ref not in valid_authentication_paths:
+                raise AIResponseError(
+                    f"AI hunt plan task {task.task_id!r} referenced an authentication path not in the repository context: {ref!r}"
+                )
 
 
 def _knowledge_excerpts(entries: list[KnowledgeEntry], decision: str) -> list[dict[str, Any]]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -14,8 +15,10 @@ from .fingerprint import candidate_fingerprint, deduplicate
 from .graph import build_structural_graph
 from .jev import JevClient, JevRouter
 from .models import (
+    Depth,
     Finding,
     FindingState,
+    ModelTier,
     PolicyDecision,
     PolicyResult,
     ScanMode,
@@ -39,6 +42,14 @@ from .validation import FindingValidator, priority_score
 _SECURITY_IR_CONTEXT_VERSION = SECURITY_IR_CONTEXT_VERSION
 _stable_id = stable_id
 
+
+def _symbol_at_location(symbols_by_path: dict[str, list], path: str, line: int):
+    """The Security IR symbol whose line range contains a finding's evidence location."""
+
+    for symbol in symbols_by_path.get(path, []):
+        if symbol.start_line <= line <= symbol.end_line:
+            return symbol
+    return None
 
 def _finding_dependencies(
     finding: Finding,
@@ -119,23 +130,39 @@ class SastPipeline:
         persistence_indexed = False
         persistence_error_type = ""
         persistence_error = ""
-        persisted_ir = None
+        persistence_findings_flagged_for_revalidation = 0
+        symbols_by_path: dict[str, list] = {}
         if self.session_factory is not None:
             try:
                 codebase_id = _stable_id("codebase", self.tenant_id, codebase)
                 snapshot_id = _stable_id("snapshot", self.tenant_id, codebase, revision)
                 scan_id = _stable_id("scan", codebase_id, snapshot_id)
                 workflow_version = str(load_json("prompts/manifest.json")["version"])
-                persisted_ir = security_ir_inputs(root, graph)
+                source_files, symbol_inputs, edge_inputs = security_ir_inputs(root, graph)
+                persisted_ir = (source_files, symbol_inputs, edge_inputs)
+                for symbol in symbol_inputs:
+                    symbols_by_path.setdefault(symbol.path, []).append(symbol)
+                reverse_dependency_hops = int(
+                    load_json("runtime/code_intelligence.json")["maximum_reverse_dependency_depth"]
+                )
                 with unit_of_work(self.session_factory, self.tenant_id) as repository:
                     repository.add_codebase(codebase_id, external_key=codebase, display_name=codebase)
                     repository.add_snapshot(
                         snapshot_id, codebase_id, revision, tree_hash, _SECURITY_IR_CONTEXT_VERSION
                     )
                     repository.start_scan(scan_id, codebase_id, snapshot_id, mode="deep", workflow_version=workflow_version)
-                    repository.save_security_ir(snapshot_id, *persisted_ir)
+                    repository.save_security_ir(snapshot_id, source_files, symbol_inputs, edge_inputs)
+                    # A callee's content changing must revalidate its callers and any
+                    # finding that depended on either -- otherwise a fixed or newly
+                    # broken callee would leave stale findings looking still current.
+                    stale_finding_ids = repository.findings_requiring_revalidation(
+                        codebase_id, snapshot_id, reverse_dependency_hops
+                    )
+                    persistence_findings_flagged_for_revalidation = repository.flag_findings_for_revalidation(
+                        stale_finding_ids
+                    )
                 persistence_indexed = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 # Infra persistence is tolerated like any other optional stage: a
                 # database outage must not fail an otherwise-successful in-memory scan.
                 persistence_error_type = type(exc).__name__
@@ -172,7 +199,7 @@ class SastPipeline:
             ai_discovery_error_types = list(getattr(deep_hunt_agent, "discovery_error_types", []))
             ai_discovery_errors = list(getattr(deep_hunt_agent, "discovery_errors", []))
             ai_discovery_unexpected_failures = int(getattr(deep_hunt_agent, "discovery_unexpected_failures", 0))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             ai_context_failures += 1
             ai_context_error_type = type(exc).__name__
             ai_context_error = str(exc)[:240]
@@ -202,16 +229,23 @@ class SastPipeline:
         ai_variant_failures = 0
         ai_variant_rounds = 0
         ai_variant_unexpected_failures = 0
+        ai_capability_chain_candidates = 0
+        ai_capability_chain_failures = 0
+        ai_capability_chain_unexpected_failures = 0
+        ai_capability_chain_rounds = 0
         jev_routes = 0
+        jev_deep_budget_demotions = 0
         ai_review_error_types: list[str] = []
         ai_review_errors: list[str] = []
         ai_review_unexpected_failures = 0
         work_queue = list(candidates)
         seen_candidates = {candidate_fingerprint(codebase, candidate) for candidate in candidates}
         worker_count = int(load_json("runtime/agent.json")["discovery_max_workers"])
+        deep_budget_max = int(load_json("runtime/agent.json")["deep_hunt_budget_max"])
+        deep_budget_used = 0
 
-        def verify(candidate):
-            route = router.classify(candidate)
+        def verify(candidate_route):
+            candidate, route = candidate_route
             jev_used = route.reason.startswith("JEV ")
             finding = validator.validate(codebase, root, candidate, route)
             if finding is None:
@@ -220,7 +254,7 @@ class SastPipeline:
                 hunt = getattr(deep_hunt_agent, "hunt", None)
                 if not callable(hunt):
                     hunt = deep_hunt_agent.review
-                review = hunt(root, candidate, finding, config.security_context, model_tier=route.model_tier)
+                review = hunt(root, candidate, finding, config.security_context, model_tier=route.model_tier, route=route)
                 if not review.supported:
                     return candidate, None, 1, 0, 0, jev_used, 1, "", "", False
                 finding.metadata["deep_hunt"] = review.to_dict()
@@ -240,14 +274,46 @@ class SastPipeline:
                 finding.state = FindingState.VALIDATED
                 finding.validator = "plaidnox-deep-hunt"
                 return candidate, finding, 1, 1, 0, jev_used, 0, "", "", False
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 unexpected = not isinstance(exc, AIStageError)
                 return candidate, None, 0, 0, 1, jev_used, 1, type(exc).__name__, str(exc)[:240], unexpected
 
         while work_queue:
+            round_routes = [(candidate, router.classify(candidate)) for candidate in work_queue]
+            deep_entries = [entry for entry in round_routes if entry[1].model_tier == ModelTier.DEEP]
+            remaining_budget = max(0, deep_budget_max - deep_budget_used)
+            if len(deep_entries) > remaining_budget:
+                # Ranking is deterministic composition over each candidate's already-decided
+                # route, not a new JEV decision -- every candidate is still dispositioned via
+                # Deep Hunt, only the model tier for the lowest-priority overflow is capped.
+                ranked = sorted(
+                    deep_entries,
+                    key=lambda entry: priority_score(entry[0].severity, entry[0].confidence, entry[1].depth.value),
+                    reverse=True,
+                )
+                demoted_ids = {id(candidate) for candidate, _ in ranked[remaining_budget:]}
+                jev_deep_budget_demotions += len(demoted_ids)
+                round_routes = [
+                    (
+                        candidate,
+                        replace(
+                            route,
+                            depth=Depth.STANDARD,
+                            model_tier=ModelTier.STANDARD,
+                            reason=f"{route.reason}; demoted by scan deep-hunt budget",
+                        )
+                        if id(candidate) in demoted_ids
+                        else route,
+                    )
+                    for candidate, route in round_routes
+                ]
+                deep_budget_used += remaining_budget
+            else:
+                deep_budget_used += len(deep_entries)
+
             verified_round = []
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                results = executor.map(verify, work_queue)
+                results = executor.map(verify, round_routes)
                 for (
                     candidate,
                     finding,
@@ -286,6 +352,22 @@ class SastPipeline:
                     seen_candidates.add(fingerprint)
                     next_round.append(variant)
                     ai_variant_candidates += 1
+
+                chainer = getattr(deep_hunt_agent, "chain_capability_pivots", None)
+                if callable(chainer):
+                    ai_capability_chain_rounds += 1
+                    pivots, chain_failures = chainer(root, context, plan, verified_round)
+                    ai_capability_chain_failures += chain_failures
+                    ai_capability_chain_unexpected_failures += int(
+                        getattr(deep_hunt_agent, "capability_chain_unexpected_failures", 0)
+                    )
+                    for pivot in pivots:
+                        fingerprint = candidate_fingerprint(codebase, pivot)
+                        if fingerprint in seen_candidates:
+                            continue
+                        seen_candidates.add(fingerprint)
+                        next_round.append(pivot)
+                        ai_capability_chain_candidates += 1
             work_queue = next_round
         ai_consolidation_failures = 0
         ai_consolidation_error_type = ""
@@ -300,7 +382,7 @@ class SastPipeline:
                     finding.confidence,
                     str(finding.metadata.get("jev_depth", "standard")),
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             ai_consolidation_failures = 1
             ai_consolidation_error_type = type(exc).__name__
             ai_consolidation_error = str(exc)[:240]
@@ -348,7 +430,7 @@ class SastPipeline:
                             dependencies,
                         )
                         persistence_findings_saved += 1
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 persistence_finding_error_type = type(exc).__name__
                 persistence_finding_error = str(exc)[:240]
 
@@ -375,7 +457,7 @@ class SastPipeline:
                         else:
                             ai_patch_unverified += 1
                         ai_patch_unexpected_failures += int(verification.unexpected_failure)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         ai_patch_proposal_failures += 1
                         ai_patch_unexpected_failures += int(not isinstance(exc, AIStageError))
                         finding.metadata["patch_proposal_error"] = {
@@ -390,6 +472,7 @@ class SastPipeline:
             or ai_discovery_failures
             or ai_failures
             or ai_variant_failures
+            or ai_capability_chain_failures
             or ai_consolidation_failures
         )
         if ai_scan_incomplete and policy.decision is PolicyDecision.PASS:
@@ -451,6 +534,10 @@ class SastPipeline:
                 "ai_variant_failures": ai_variant_failures,
                 "ai_variant_unexpected_failures": ai_variant_unexpected_failures,
                 "ai_variant_rounds": ai_variant_rounds,
+                "ai_capability_chain_candidates": ai_capability_chain_candidates,
+                "ai_capability_chain_failures": ai_capability_chain_failures,
+                "ai_capability_chain_unexpected_failures": ai_capability_chain_unexpected_failures,
+                "ai_capability_chain_rounds": ai_capability_chain_rounds,
                 "ai_pre_consolidation_findings": pre_consolidation_findings,
                 "ai_consolidation_failures": ai_consolidation_failures,
                 "ai_consolidation_error_type": ai_consolidation_error_type,
@@ -463,6 +550,7 @@ class SastPipeline:
                 "ai_patch_proposal_failures": ai_patch_proposal_failures,
                 "ai_patch_unexpected_failures": ai_patch_unexpected_failures,
                 "jev_routes": jev_routes,
+                "jev_deep_budget_demotions": jev_deep_budget_demotions,
                 "persistence_enabled": persistence_enabled,
                 "persistence_indexed": persistence_indexed,
                 "persistence_error_type": persistence_error_type,
@@ -470,6 +558,7 @@ class SastPipeline:
                 "persistence_findings_saved": persistence_findings_saved,
                 "persistence_finding_error_type": persistence_finding_error_type,
                 "persistence_finding_error": persistence_finding_error,
+                "persistence_findings_flagged_for_revalidation": persistence_findings_flagged_for_revalidation,
                 **prompt_cache_metrics,
                 **model_input_metrics,
             },

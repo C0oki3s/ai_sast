@@ -1,0 +1,6 @@
+{
+  "schema": "scm",
+  "migrations": [
+    "0001_scm_application_context.sql"
+  ]
+}

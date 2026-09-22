@@ -48,7 +48,12 @@ class FindingValidator:
                 "jev_model_tier": route.model_tier.value,
                 "jev_needs_validation": route.needs_validation,
                 "jev_needs_deep_hunt": route.needs_deep_hunt,
-                "context_profile": route.profile,
+                "jev_needs_cross_file": route.needs_cross_file,
+                "jev_needs_state_reconstruction": route.needs_state_reconstruction,
+                "jev_needs_external_semantics": route.needs_external_semantics,
+                "jev_needs_environment_context": route.needs_environment_context,
+                "jev_needs_deep_falsification": route.needs_deep_falsification,
+                "jev_analysis_complexity": route.analysis_complexity,
             },
         )
 

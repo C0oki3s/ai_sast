@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -36,12 +36,17 @@ class KnowledgeEntry:
     confidence: float = 0.0
     knowledge_id: str = ""
     content_hash: str = ""
+    claims: list[str] = field(default_factory=list)
 
     def normalised(self) -> KnowledgeEntry:
         content_hash = self.content_hash or _digest(
-            "\n".join((self.topic.strip(), self.content.strip(), self.source_url.strip()))
+            f"{self.topic.strip()}\n{self.content.strip()}\n{self.source_url.strip()}"
         )
         knowledge_id = self.knowledge_id or f"knw-{content_hash[:16]}"
+        runtime = load_json("runtime/agent.json")
+        claim_characters = int(runtime["knowledge_claim_characters"])
+        max_claims = int(runtime["knowledge_max_claims"])
+        claims = [claim.strip()[:claim_characters] for claim in self.claims if claim.strip()][:max_claims]
         return KnowledgeEntry(
             topic=self.topic.strip(),
             content=self.content.strip(),
@@ -55,6 +60,7 @@ class KnowledgeEntry:
             confidence=max(0.0, min(1.0, float(self.confidence))),
             knowledge_id=knowledge_id,
             content_hash=content_hash,
+            claims=claims,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +145,7 @@ class KnowledgeStore:
                     value.provenance,
                     value.confidence,
                     value.content_hash,
+                    json.dumps(value.claims, ensure_ascii=False),
                 ),
             )
         return value
@@ -268,7 +275,7 @@ class JevKnowledgeRouter:
             "query": query,
             "task": task,
             "repository": {
-                "repository": repository_context.get("repository"),
+                "codebase": repository_context.get("codebase"),
                 "architecture": repository_context.get("architecture"),
                 "applications": repository_context.get("applications"),
             },
@@ -281,6 +288,9 @@ class JevKnowledgeRouter:
                     "source_url": item.source_url,
                     "source_updated_at": item.source_updated_at,
                     "confidence": item.confidence,
+                    # What the entry actually says, not just its metadata — JEV
+                    # cannot judge sufficiency from a title and a source URL alone.
+                    "claims": item.claims,
                 }
                 for item in stored
             ],
@@ -301,6 +311,58 @@ class JevKnowledgeRouter:
                 "JEV confidence below the knowledge reuse threshold",
             )
         return KnowledgeDecision(action.choice, scope.choice, confidence, action.model, "JEV knowledge decision")
+
+
+def _joined(values: Any) -> str:
+    return " ".join(str(value) for value in values or [] if value)
+
+
+def _retrieval_terms(scope: str, query: str, task: dict[str, Any], repository_context: dict[str, Any]) -> str:
+    """Build a scope-appropriate database search query from already-available task/repository facts.
+
+    `knowledge_scope` only chooses which already-known facts are most likely to retrieve the
+    right stored knowledge; it never adds new data collection, so each branch below is built
+    only from fields `task`/`repository_context` already carry.
+    """
+    applications = repository_context.get("applications") or []
+    if scope == "repository":
+        parts = [
+            str(task.get("title", "")),
+            _joined(task.get("focus_paths")),
+            _joined(task.get("entry_points")),
+            _joined(task.get("inventory_refs")),
+        ]
+    elif scope == "framework":
+        parts = [
+            str(repository_context.get("architecture", "")),
+            _joined(str(app.get("architecture", "")) for app in applications),
+            query,
+        ]
+    elif scope == "business_domain":
+        parts = [
+            str(repository_context.get("business_context", "")),
+            _joined(task.get("business_invariants")),
+            _joined(repository_context.get("security_invariants")),
+        ]
+    elif scope == "vulnerability_class":
+        parts = [
+            _joined(task.get("vulnerability_themes")),
+            _joined(task.get("falsification_requirements")),
+            query,
+        ]
+    elif scope == "advisory":
+        parts = [
+            query,
+            _joined(service for app in applications for service in app.get("external_services", [])),
+        ]
+    else:
+        parts = [
+            str(task.get("title", "")),
+            str(task.get("objective", "")),
+            _joined(task.get("vulnerability_themes")),
+        ]
+    terms = " ".join(part for part in parts if part).strip()
+    return terms or query
 
 
 class KnowledgeCoordinator:
@@ -336,16 +398,7 @@ class KnowledgeCoordinator:
             )
             entries = [self.store.upsert(item) for item in researched]
         elif decision.action == "retrieve_database":
-            retrieval_terms = " ".join(
-                str(value)
-                for value in (
-                    task.get("title", ""),
-                    task.get("objective", ""),
-                    " ".join(task.get("vulnerability_themes", [])),
-                )
-                if value
-            )
-            entries = self.store.search(retrieval_terms or query)
+            entries = self.store.search(_retrieval_terms(decision.scope, query, task, repository_context))
         self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, entries)
         return decision, entries
 
@@ -357,7 +410,11 @@ class KnowledgeCoordinator:
         queries: list[str],
         repository_context: dict[str, Any],
     ) -> list[tuple[str, KnowledgeDecision, list[KnowledgeEntry]]]:
-        """Classify each query with JEV, then batch fresh research per hunt task."""
+        """Classify each query with JEV, then research each pending query independently.
+
+        Each query gets its own research call so a research result is never attributed
+        to a query it wasn't actually answering.
+        """
         pending_research: list[tuple[str, KnowledgeDecision, list[KnowledgeEntry]]] = []
         resolved: list[tuple[str, KnowledgeDecision, list[KnowledgeEntry]]] = []
         for query in dict.fromkeys(item.strip() for item in queries if item.strip()):
@@ -367,43 +424,23 @@ class KnowledgeCoordinator:
                 pending_research.append((query, decision, stored))
                 continue
             if decision.action == "retrieve_database":
-                retrieval_terms = " ".join(
-                    str(value)
-                    for value in (
-                        task.get("title", ""),
-                        task.get("objective", ""),
-                        " ".join(task.get("vulnerability_themes", [])),
-                    )
-                    if value
-                )
-                stored = self.store.search(retrieval_terms or query)
+                stored = self.store.search(_retrieval_terms(decision.scope, query, task, repository_context))
             self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, stored)
             resolved.append((query, decision, stored))
 
         if pending_research:
             if self.research_provider is None:
                 raise RuntimeError("JEV requested web research but no knowledge research provider is configured")
-            batch_request = json.dumps(
-                {
-                    "queries": [query for query, _decision, _stored in pending_research],
-                    "instruction": "Research every query and return reusable entries covering each one.",
-                },
-                ensure_ascii=False,
-            )
-            researched = self.research_provider.research(
-                batch_request,
-                {
-                    "task": task,
-                    "repository_context": repository_context,
-                    "stored_knowledge": [
-                        item.to_dict()
-                        for _query, _decision, stored in pending_research
-                        for item in stored
-                    ],
-                },
-            )
-            entries = [self.store.upsert(item) for item in researched]
-            for query, decision, _stored in pending_research:
+            for query, decision, stored in pending_research:
+                researched = self.research_provider.research(
+                    query,
+                    {
+                        "task": task,
+                        "repository_context": repository_context,
+                        "stored_knowledge": [item.to_dict() for item in stored],
+                    },
+                )
+                entries = [self.store.upsert(item) for item in researched]
                 self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, entries)
                 resolved.append((query, decision, entries))
         return resolved
@@ -485,6 +522,7 @@ class LiteLLMKnowledgeProvider:
                     ),
                     provenance=f"{self.config['provenance']}:{self.model}",
                     confidence=float(item["confidence"]),
+                    claims=[str(claim) for claim in item["claims"]],
                 )
             )
         if not entries:
@@ -559,4 +597,5 @@ def _entry_from_row(row: sqlite3.Row) -> KnowledgeEntry:
         provenance=str(row["provenance"]),
         confidence=float(row["confidence"]),
         content_hash=str(row["content_hash"]),
+        claims=json.loads(str(row["claims"])),
     )

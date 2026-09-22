@@ -21,6 +21,7 @@ ai = ["litellm>=1.101,<2.0"]
 
 [project.scripts]
 plaidnox-sast = "plaidnox_sast.cli:main"
+plaidnox-scm = "plaidnox_scm.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -30,6 +31,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 plaidnox_sast = ["assets/**/*.json", "assets/**/*.md", "assets/**/*.sql"]
+plaidnox_scm = ["assets/**/*.json", "assets/**/*.md", "assets/**/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

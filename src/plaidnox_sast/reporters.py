@@ -86,7 +86,12 @@ def to_sarif(result: ScanResult) -> dict[str, Any]:
                     "confidence": finding.confidence,
                     "priorityScore": finding.priority_score,
                     "validator": finding.validator,
-                    "contextProfile": finding.metadata.get("context_profile"),
+                    "jevNeedsCrossFile": finding.metadata.get("jev_needs_cross_file"),
+                    "jevNeedsStateReconstruction": finding.metadata.get("jev_needs_state_reconstruction"),
+                    "jevNeedsExternalSemantics": finding.metadata.get("jev_needs_external_semantics"),
+                    "jevNeedsEnvironmentContext": finding.metadata.get("jev_needs_environment_context"),
+                    "jevNeedsDeepFalsification": finding.metadata.get("jev_needs_deep_falsification"),
+                    "jevAnalysisComplexity": finding.metadata.get("jev_analysis_complexity"),
                     "jevModelTier": finding.metadata.get("jev_model_tier"),
                     "jevNeedsDeepHunt": finding.metadata.get("jev_needs_deep_hunt"),
                     "classifications": classifications,
@@ -133,9 +138,11 @@ def write_markdown(result: ScanResult, destination: Path) -> None:
         "",
         "## Summary",
         "",
-        f"Validated findings: **{len(result.findings)}** — "
-        f"{counts['critical']} critical, {counts['high']} high, "
-        f"{counts['medium']} medium, {counts['low']} low.",
+        (
+            f"Validated findings: **{len(result.findings)}** — "
+            f"{counts['critical']} critical, {counts['high']} high, "
+            f"{counts['medium']} medium, {counts['low']} low."
+        ),
         "",
     ]
     if result.repository_context.get("architecture"):

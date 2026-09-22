@@ -2,6 +2,7 @@
   "migrations": [
     "migrations/0001_context_fabric.sql",
     "migrations/0003_security_knowledge.sql",
-    "migrations/0004_hunt_plan_versions.sql"
+    "migrations/0004_hunt_plan_versions.sql",
+    "migrations/0005_incremental_context.sql"
   ]
 }

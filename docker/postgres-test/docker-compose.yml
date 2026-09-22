@@ -9,5 +9,6 @@ services:
       - "5434:5432"
     volumes:
       - ../../src/plaidnox_sast/assets/migrations/postgresql/0001_code_scanning_core.sql:/docker-entrypoint-initdb.d/0001_code_scanning_core.sql:ro,z
+      - ../../src/plaidnox_sast/assets/migrations/postgresql/0002_incremental_repository_context.sql:/docker-entrypoint-initdb.d/0002_incremental_repository_context.sql:ro,z
     tmpfs:
       - /var/lib/postgresql/data

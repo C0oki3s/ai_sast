@@ -27,6 +27,7 @@ from ..assets import load_json
 from ..context_fabric import (
     ContextBase,
     ContextOverlay,
+    PreparedContext,
     SecurityContextPacket,
     SecurityMemory,
 )
@@ -67,6 +68,7 @@ def _entry_from_value(value: KnowledgeValue) -> KnowledgeEntry:
         provenance=value.provenance,
         confidence=value.confidence,
         content_hash=value.content_hash,
+        claims=list(value.claims),
     )
 
 
@@ -82,6 +84,7 @@ class PostgresContextFabricStore:
         with unit_of_work(self.session_factory, self.tenant_id) as repo:
             existing = repo.get_snapshot(snapshot_id)
             if existing is not None:
+                repo.save_security_ir(snapshot_id, *security_ir_inputs(root, graph))
                 return ContextBase(snapshot_id, repository, commit, repo.count_symbols(snapshot_id), reused=True)
             repo.add_codebase(codebase_id, external_key=repository, display_name=repository)
             repo.add_snapshot(
@@ -89,6 +92,74 @@ class PostgresContextFabricStore:
             )
             repo.save_security_ir(snapshot_id, *security_ir_inputs(root, graph))
             return ContextBase(snapshot_id, repository, commit, repo.count_symbols(snapshot_id))
+
+    def prepare_snapshot(
+        self,
+        repository: str,
+        commit: str,
+        root: Path,
+        graph: StructuralGraph,
+        profile: str = "general",
+    ) -> PreparedContext:
+        codebase_id, snapshot_id, _scan_id = _derive_ids(repository, commit, self.tenant_id)
+        current = self.create_base(repository, commit, root, graph)
+        with unit_of_work(self.session_factory, self.tenant_id) as repo:
+            cached = repo.get_repository_context(snapshot_id)
+            if cached is not None:
+                return PreparedContext(current, None, None, None, cached, [], True)
+            prior_value = repo.latest_snapshot(codebase_id, exclude_snapshot_id=snapshot_id)
+            if prior_value is None:
+                return PreparedContext(
+                    current,
+                    None,
+                    None,
+                    None,
+                    None,
+                    [item.path for item in graph.files],
+                    False,
+                )
+            prior_files = {
+                item.path: item.content_hash
+                for item in repo.list_source_files(prior_value.snapshot_id)
+            }
+            previous_context = repo.get_repository_context(prior_value.snapshot_id)
+            prior_count = repo.count_symbols(prior_value.snapshot_id)
+        current_files = {item.path: item.content_hash for item in graph.files}
+        changed_paths = sorted(
+            path
+            for path in set(prior_files) | set(current_files)
+            if prior_files.get(path) != current_files.get(path)
+        )
+        previous = ContextBase(
+            prior_value.snapshot_id,
+            repository,
+            prior_value.revision,
+            prior_count,
+            reused=True,
+        )
+        if not changed_paths:
+            return PreparedContext(current, previous, None, None, previous_context, [], True)
+        overlay = self.create_overlay(previous, commit, root, changed_paths, graph)
+        packet = self.compile_packet(overlay, profile)
+        return PreparedContext(
+            current,
+            previous,
+            overlay,
+            packet,
+            previous_context,
+            changed_paths,
+            False,
+        )
+
+    def save_repository_context(
+        self,
+        context_id: str,
+        repository: str,
+        context: dict[str, object],
+    ) -> None:
+        codebase_id, _snapshot_id, _scan_id = _derive_ids(repository, "context", self.tenant_id)
+        with unit_of_work(self.session_factory, self.tenant_id) as repo:
+            repo.save_repository_context(context_id, codebase_id, context)
 
     def create_overlay(
         self,
@@ -275,6 +346,7 @@ class PostgresKnowledgeStore:
                     value.provenance,
                     value.confidence,
                     value.content_hash,
+                    value.claims,
                 )
             )
             return _entry_from_value(saved)

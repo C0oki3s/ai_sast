@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from .assets import load_json
 from .errors import AIStageError
 from .models import Candidate, Depth, ModelTier, RouteDecision, Severity
+from .redaction import redact_payload
 
 
 class JevError(AIStageError):
@@ -53,7 +54,7 @@ class JevClient:
         routing = load_json(routing_asset)
         payload = {
             "model": self.model,
-            "state": state,
+            "state": redact_payload(state),
             "questions": routing["questions"],
         }
         data = self._request(payload)
@@ -86,9 +87,14 @@ class JevClient:
             raise JevError("JEV routing response was not a JSON object")
         return data
 
-    def decide(self, state: dict[str, Any]) -> tuple[JevAnswer, JevAnswer]:
-        answers = self.decide_questions(state, "routing/jev.json")
-        return answers["analysis_depth"], answers["context_profile"]
+
+_NOUL_SIGNALS = (
+    "needs_cross_file",
+    "needs_state_reconstruction",
+    "needs_external_semantics",
+    "needs_environment_context",
+    "needs_deep_falsification",
+)
 
 
 class JevRouter:
@@ -102,18 +108,30 @@ class JevRouter:
         if self.client is None or candidate.metadata.get("sensitive_evidence") or candidate.metadata.get("content_read") is False:
             return fallback
         try:
-            depth, profile = self.client.decide(_jev_state(candidate))
+            answers = self.client.decide_questions(_jev_state(candidate), "routing/jev.json")
         except JevError:
             return replace(fallback, reason=f"{fallback.reason}; JEV unavailable")
-        if min(depth.confidence, profile.confidence) < self.confidence_threshold:
+        depth_answer = answers["analysis_depth"]
+        complexity_answer = answers["analysis_complexity"]
+        confidences = [depth_answer.confidence, complexity_answer.confidence] + [
+            answers[name].confidence for name in _NOUL_SIGNALS
+        ]
+        if min(confidences) < self.confidence_threshold:
             return replace(fallback, reason=f"{fallback.reason}; JEV low confidence")
         try:
-            selected_depth = Depth(depth.choice)
+            selected_depth = Depth(depth_answer.choice)
         except ValueError:
             return replace(fallback, reason=f"{fallback.reason}; JEV unsupported depth")
-        profiles = load_json("routing/jev.json")["questions"]["context_profile"]["criteria"]
-        if profile.choice not in profiles:
-            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported context strategy")
+        questions = load_json("routing/jev.json")["questions"]
+        noul_criteria = set(questions["needs_cross_file"]["criteria"])
+        signal_values: dict[str, str] = {}
+        for name in _NOUL_SIGNALS:
+            choice = answers[name].choice
+            if choice not in noul_criteria:
+                return replace(fallback, reason=f"{fallback.reason}; JEV unsupported {name}")
+            signal_values[name] = choice
+        if complexity_answer.choice not in questions["analysis_complexity"]["criteria"]:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported analysis_complexity")
         model_tier = {
             Depth.FAST: ModelTier.FAST,
             Depth.STANDARD: ModelTier.STANDARD,
@@ -121,21 +139,127 @@ class JevRouter:
         }[selected_depth]
         task_class = _task_class(str(candidate.metadata.get("category", "unclassified")))
         return RouteDecision(
-            selected_depth,
-            profile.choice,
-            f"JEV {depth.model} confidence {min(depth.confidence, profile.confidence):.2f}",
-            task_class,
-            model_tier,
-            True,
-            True,
+            depth=selected_depth,
+            reason=f"JEV {depth_answer.model} confidence {min(confidences):.2f}",
+            task_class=task_class,
+            model_tier=model_tier,
+            needs_validation=True,
+            needs_deep_hunt=True,
+            needs_cross_file=signal_values["needs_cross_file"],
+            needs_state_reconstruction=signal_values["needs_state_reconstruction"],
+            needs_external_semantics=signal_values["needs_external_semantics"],
+            needs_environment_context=signal_values["needs_environment_context"],
+            needs_deep_falsification=signal_values["needs_deep_falsification"],
+            analysis_complexity=int(complexity_answer.choice),
         )
 
     def _local_classify(self, candidate: Candidate) -> RouteDecision:
         category = str(candidate.metadata.get("category", "unclassified"))
         task_class = _task_class(category)
         if candidate.severity in {Severity.CRITICAL, Severity.HIGH}:
-            return RouteDecision(Depth.DEEP, "mixed", "severity-safe routing fallback", task_class, ModelTier.DEEP)
-        return RouteDecision(Depth.STANDARD, "mixed", "provider-neutral routing fallback", task_class, ModelTier.STANDARD)
+            return RouteDecision(
+                Depth.DEEP,
+                "severity-safe routing fallback",
+                task_class,
+                ModelTier.DEEP,
+                needs_cross_file="likely",
+                needs_state_reconstruction="likely",
+                needs_external_semantics="likely",
+                needs_environment_context="likely",
+                needs_deep_falsification="likely",
+                analysis_complexity=4,
+            )
+        return RouteDecision(
+            Depth.STANDARD,
+            "provider-neutral routing fallback",
+            task_class,
+            ModelTier.STANDARD,
+            needs_cross_file="unlikely",
+            needs_state_reconstruction="unlikely",
+            needs_external_semantics="unlikely",
+            needs_environment_context="unlikely",
+            needs_deep_falsification="unlikely",
+            analysis_complexity=2,
+        )
+
+
+FRONTIER_PRIORITY_WEIGHT = {"low": 0, "standard": 1, "high": 2}
+
+
+@dataclass(slots=True)
+class FrontierDecision:
+    priority: str
+    reason: str
+
+
+class JevFrontierRouter:
+    """Ranks confirmed gained-capability findings so a bounded pivot search spends
+    its budget on the most promising part of the capability-chain frontier first."""
+
+    def __init__(self, client: JevClient | None = None, confidence_threshold: float | None = None) -> None:
+        self.client = client
+        configured = float(load_json("routing/capability_chain_frontier.json")["confidence_threshold"])
+        self.confidence_threshold = configured if confidence_threshold is None else confidence_threshold
+
+    def prioritize(self, finding_facts: dict[str, Any]) -> FrontierDecision:
+        fallback = self._local_prioritize(finding_facts)
+        if self.client is None:
+            return fallback
+        try:
+            answers = self.client.decide_questions(finding_facts, "routing/capability_chain_frontier.json")
+        except JevError:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unavailable")
+        answer = answers["pivot_priority"]
+        if answer.confidence < self.confidence_threshold:
+            return replace(fallback, reason=f"{fallback.reason}; JEV low confidence")
+        criteria = load_json("routing/capability_chain_frontier.json")["questions"]["pivot_priority"]["criteria"]
+        if answer.choice not in criteria:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported pivot_priority")
+        return FrontierDecision(answer.choice, f"JEV {answer.model} confidence {answer.confidence:.2f}")
+
+    def _local_prioritize(self, finding_facts: dict[str, Any]) -> FrontierDecision:
+        if str(finding_facts.get("severity", "medium")) in {"critical", "high"}:
+            return FrontierDecision("high", "severity-safe frontier fallback")
+        return FrontierDecision("standard", "provider-neutral frontier fallback")
+
+
+@dataclass(slots=True)
+class RetryDecision:
+    action: str
+    reason: str
+
+
+class JevRetryRouter:
+    """Chooses at most one bounded extra Deep Hunt round after context has already
+    been expanded to its normal budget and a genuine evidence gap remains."""
+
+    def __init__(self, client: JevClient | None = None, confidence_threshold: float | None = None) -> None:
+        self.client = client
+        configured = float(load_json("routing/retry_route.json")["confidence_threshold"])
+        self.confidence_threshold = configured if confidence_threshold is None else confidence_threshold
+
+    def decide(self, retry_facts: dict[str, Any]) -> RetryDecision:
+        fallback = self._local_decide(retry_facts)
+        if self.client is None:
+            return fallback
+        try:
+            answers = self.client.decide_questions(retry_facts, "routing/retry_route.json")
+        except JevError:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unavailable")
+        answer = answers["next_action"]
+        if answer.confidence < self.confidence_threshold:
+            return replace(fallback, reason=f"{fallback.reason}; JEV low confidence")
+        criteria = load_json("routing/retry_route.json")["questions"]["next_action"]["criteria"]
+        if answer.choice not in criteria:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported next_action")
+        return RetryDecision(answer.choice, f"JEV {answer.model} confidence {answer.confidence:.2f}")
+
+    def _local_decide(self, retry_facts: dict[str, Any]) -> RetryDecision:
+        if str(retry_facts.get("model_tier", "")) != ModelTier.DEEP.value:
+            return RetryDecision("escalate_model", "tier-safe retry fallback")
+        if retry_facts.get("context_requests_pending", 0):
+            return RetryDecision("expand_context", "unresolved-context retry fallback")
+        return RetryDecision("mark_unresolved", "no-further-signal retry fallback")
 
 
 def _task_class(category: str) -> str:

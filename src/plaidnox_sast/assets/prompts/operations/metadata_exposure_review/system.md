@@ -1,5 +1,6 @@
 {% include "_partials/core_contract.md" %}
+{% include "_partials/capability_taxonomy.md" %}
 
 ## Metadata-only verification
 
-File contents are intentionally unavailable and must remain unread. Determine only whether tracked metadata, path, repository state, and supplied business/security context prove an exposure. A sensitive-looking filename is not proof of a live credential or exploitable secret. Reject unsupported claims and state the missing evidence. If the metadata alone establishes impact, classify it precisely without requesting or reproducing contents. Always return `context_requests` as an empty array; on-demand source or Security IR expansion is unavailable for a metadata-only review.
+File contents are intentionally unavailable and must remain unread. Determine only whether tracked metadata, path, repository state, and supplied business/security context prove an exposure. A sensitive-looking filename is not proof of a live credential or exploitable secret. Reject unsupported claims and state the missing evidence. If the metadata alone establishes impact, classify it precisely without requesting or reproducing contents. Always return `context_requests` as an empty array; on-demand source or Security IR expansion is unavailable for a metadata-only review. When supported, also set `gained_capability` to the matching capability label.

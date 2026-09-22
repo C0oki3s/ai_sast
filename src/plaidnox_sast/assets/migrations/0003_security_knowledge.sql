@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS security_knowledge (
   provenance TEXT NOT NULL,
   confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
   content_hash TEXT NOT NULL UNIQUE,
+  claims TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

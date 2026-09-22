@@ -24,9 +24,43 @@
             "maxItems": 100,
             "items": {"type": "string", "minLength": 1, "maxLength": 300}
           },
-          "objective": {"type": "string", "minLength": 1, "maxLength": 2000}
+          "objective": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "direction": {
+            "type": "string",
+            "enum": ["forward", "backward", "boundary", "variant", "inventory"]
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "entry_point",
+              "origin",
+              "effect",
+              "control",
+              "caller",
+              "callee",
+              "writer",
+              "reader",
+              "missing_branch",
+              "indirect_dispatch",
+              "alternate_implementation"
+            ]
+          },
+          "coverage_refs": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {"type": "string", "minLength": 1, "maxLength": 160}
+          }
         },
-        "required": ["query_id", "task_ids", "pattern", "include_globs", "objective"]
+        "required": [
+          "query_id",
+          "task_ids",
+          "pattern",
+          "include_globs",
+          "objective",
+          "direction",
+          "purpose",
+          "coverage_refs"
+        ]
       }
     },
     "coverage_notes": {"type": "string", "minLength": 1, "maxLength": 4000}

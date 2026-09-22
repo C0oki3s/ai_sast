@@ -289,3 +289,130 @@ def test_finding_round_trips_through_postgresql_shaped_schema():
     assert updated.finding_id == saved.finding_id
     assert updated.state == "false_positive"
     assert updated.evidence == []
+
+
+def test_a_changed_callee_flags_its_own_and_its_callers_findings_but_leaves_unrelated_findings_alone():
+    """Mutation test for the Phase 2 exit condition: a changed callee revalidates
+    callers and linked findings, while unrelated code (and its findings) is reused."""
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    caller = SymbolInput(
+        stable_key="app.js:handleSignin:0",
+        qualified_name="handleSignin",
+        kind="function",
+        path="app.js",
+        start_line=4,
+        end_line=8,
+        content_hash="hash-caller-1",
+        content="function handleSignin() { decodeToken(); }",
+    )
+    callee = SymbolInput(
+        stable_key="app.js:decodeToken:0",
+        qualified_name="decodeToken",
+        kind="function",
+        path="app.js",
+        start_line=1,
+        end_line=3,
+        content_hash="hash-callee-1",
+        content="function decodeToken() { return jwt.decode(token); }",
+    )
+    unrelated = SymbolInput(
+        stable_key="util.js:formatDate:0",
+        qualified_name="formatDate",
+        kind="function",
+        path="util.js",
+        start_line=1,
+        end_line=2,
+        content_hash="hash-unrelated-1",
+        content="function formatDate(value) { return value; }",
+    )
+    source_files = [SourceFileInput("app.js", "javascript", "file-hash-1", 128), SourceFileInput("util.js", "javascript", "file-hash-2", 64)]
+    edge = EdgeInput(caller.stable_key, callee.stable_key, "calls", "tree_sitter")
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot_1 = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-hash-1", "context-v1")
+        repository.save_security_ir(snapshot_1.snapshot_id, source_files, [caller, callee, unrelated], [edge])
+        scan_1 = repository.start_scan("scan-1", "codebase-1", snapshot_1.snapshot_id, "deep", "workflow-v1")
+
+        caller_finding = repository.save_finding(
+            "finding-caller",
+            "codebase-1",
+            scan_1.scan_id,
+            "fingerprint-caller",
+            "Token decoded without verification",
+            "improper-authentication",
+            "high",
+            "validated",
+            0.9,
+            "handleSignin decodes the token via decodeToken without verifying it.",
+            "Account takeover via forged tokens.",
+            "Verify the signature before trusting claims.",
+            {"deep_hunt": "supported"},
+            [],
+            [FindingDependencyInput("symbol", caller.stable_key, caller.content_hash)],
+        )
+        callee_finding = repository.save_finding(
+            "finding-callee",
+            "codebase-1",
+            scan_1.scan_id,
+            "fingerprint-callee",
+            "JWT decoded without verification",
+            "improper-authentication",
+            "high",
+            "validated",
+            0.9,
+            "decodeToken never verifies the token signature.",
+            "Account takeover via forged tokens.",
+            "Verify the signature before trusting claims.",
+            {"deep_hunt": "supported"},
+            [],
+            [FindingDependencyInput("symbol", callee.stable_key, callee.content_hash)],
+        )
+        unrelated_finding = repository.save_finding(
+            "finding-unrelated",
+            "codebase-1",
+            scan_1.scan_id,
+            "fingerprint-unrelated",
+            "Date formatting uses local timezone",
+            "improper-input-validation",
+            "low",
+            "validated",
+            0.6,
+            "formatDate does not normalise timezones.",
+            "Minor display inconsistency.",
+            "Normalise to UTC.",
+            {"deep_hunt": "supported"},
+            [],
+            [FindingDependencyInput("symbol", unrelated.stable_key, unrelated.content_hash)],
+        )
+
+    # A new snapshot mutates only the callee's body; the caller and the
+    # unrelated symbol keep their identity (`stable_key`) and their content.
+    mutated_callee = SymbolInput(
+        stable_key=callee.stable_key,
+        qualified_name=callee.qualified_name,
+        kind=callee.kind,
+        path=callee.path,
+        start_line=callee.start_line,
+        end_line=callee.end_line,
+        content_hash="hash-callee-2-mutated",
+        content="function decodeToken() { return jwt.verify(token, secret); }",
+    )
+    with unit_of_work(factory, "tenant-a") as repository:
+        snapshot_2 = repository.add_snapshot("snapshot-2", "codebase-1", "revision-2", "tree-hash-2", "context-v1")
+        repository.save_security_ir(snapshot_2.snapshot_id, source_files, [caller, mutated_callee, unrelated], [edge])
+
+        stale = repository.findings_requiring_revalidation("codebase-1", snapshot_2.snapshot_id, hops=3)
+        assert set(stale) == {caller_finding.finding_id, callee_finding.finding_id}
+
+        flagged = repository.flag_findings_for_revalidation(stale)
+        assert flagged == 2
+
+        assert repository.get_finding(caller_finding.finding_id).state == "discovered"
+        assert repository.get_finding(callee_finding.finding_id).state == "discovered"
+        # Unrelated code was reused: its finding is untouched by the callee mutation.
+        assert repository.get_finding(unrelated_finding.finding_id).state == "validated"

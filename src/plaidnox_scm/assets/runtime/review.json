@@ -1,0 +1,37 @@
+{
+  "workflow_version": "2026-09-23.1",
+  "context_version": "2",
+  "context_builder_version": "sast-repository-context-v1",
+  "l1_model_tier": "standard",
+  "l1_reasoning_effort": "high",
+  "l1_max_output_tokens": 6000,
+  "maximum_file_bytes": 262144,
+  "maximum_application_context_characters": 24000,
+  "context_broker": {
+    "maximum_requests_per_candidate": 8,
+    "maximum_records_per_request": 20,
+    "maximum_record_characters": 6000,
+    "maximum_prompt_characters": 8000,
+    "context_lines_before": 8,
+    "context_lines_after": 12
+  },
+  "evidence_roles": {
+    "root_cause": "ROOT_CAUSE_CHANGED_CODE",
+    "context": "CONTEXT_ONLY",
+    "deep_hunt_mapping": {
+      "origin": "ATTACKER_ORIGIN",
+      "propagation": "DOWNSTREAM_TRUST",
+      "boundary": "SECURITY_BOUNDARY",
+      "defense": "DEFENSE_REMOVED_OR_BYPASSED",
+      "effect": "SENSITIVE_EFFECT"
+    }
+  },
+  "provisional_adapter": {
+    "rule_id": "plaidnox.scm.changed-code-hypothesis",
+    "category": "changed-code-security-invariant",
+    "vulnerability_class": "unclassified-security-invariant-regression",
+    "severity": "medium",
+    "confidence": 0.5,
+    "validator": "plaidnox-deep-hunt"
+  }
+}

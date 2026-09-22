@@ -91,6 +91,46 @@ def test_postgresql_context_adapter_preserves_overlay_memory_and_finding_context
     assert packet.cache["base_context_hit"] is True
 
 
+def test_postgresql_context_adapter_prepares_incremental_scope_and_reuses_summary(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    stable = repository / "account.js"
+    stable.write_text("function loadAccount(id) { return database.find(id); }\n", encoding="utf-8")
+    changed = repository / "format.js"
+    changed.write_text("function format(value) { return String(value); }\n", encoding="utf-8")
+    factory = _session_factory()
+    store = PostgresContextFabricStore(factory, "tenant-incremental")
+
+    first = store.prepare_snapshot(
+        "owner/repo",
+        "revision-a",
+        repository,
+        build_structural_graph(repository),
+    )
+    store.save_repository_context(
+        first.current.context_id,
+        "owner/repo",
+        {"architecture": "Account and formatting modules.", "applications": []},
+    )
+    changed.write_text(
+        "function format(value) { return String(value).trim(); }\n",
+        encoding="utf-8",
+    )
+
+    second = store.prepare_snapshot(
+        "owner/repo",
+        "revision-b",
+        repository,
+        build_structural_graph(repository),
+    )
+
+    assert second.changed_paths == ["format.js"]
+    assert second.overlay is not None
+    assert second.packet is not None
+    assert {item["path"] for item in second.packet.code_slices} == {"format.js"}
+    assert second.previous_repository_context["architecture"].startswith("Account")
+
+
 def test_postgresql_knowledge_adapter_is_content_addressed_reusable_and_idempotent():
     factory = _session_factory()
     repository = "owner/repo"
@@ -153,3 +193,95 @@ def test_postgresql_context_identity_is_namespaced_by_tenant(tmp_path):
     )
 
     assert tenant_a.context_id != tenant_b.context_id
+
+
+def test_postgres_context_fabric_store_indexes_once_and_reuses_thereafter(sample_repo):
+    factory = _session_factory()
+    store = PostgresContextFabricStore(factory, "tenant-a")
+    graph = build_structural_graph(sample_repo)
+
+    first = store.create_base("owner/repo", "a" * 40, sample_repo, graph)
+    second = store.create_base("owner/repo", "a" * 40, sample_repo, graph)
+
+    assert first.context_id == second.context_id
+    assert first.symbol_count > 0
+    assert first.reused is False
+    assert second.reused is True
+
+
+def test_postgres_knowledge_store_upsert_is_content_addressed_and_searchable():
+    factory = _session_factory()
+    store = PostgresKnowledgeStore(factory, "tenant-a")
+    entry = KnowledgeEntry(
+        topic="JWT verification",
+        content="Always verify the signature before trusting claims.",
+        vulnerability_class="improper-authentication",
+        ecosystem="npm",
+        framework="express",
+        source_url="https://example.com/jwt",
+        source_title="JWT best practices",
+        provenance="web-research",
+        confidence=0.9,
+    )
+
+    saved = store.upsert(entry)
+    saved_again = store.upsert(entry)
+
+    assert saved.knowledge_id == saved_again.knowledge_id
+
+    results = store.search("jwt verification")
+    assert [item.knowledge_id for item in results] == [saved.knowledge_id]
+
+
+def test_postgres_knowledge_store_round_trips_claims():
+    factory = _session_factory()
+    store = PostgresKnowledgeStore(factory, "tenant-a")
+    entry = KnowledgeEntry(
+        topic="JWT verification",
+        content="Always verify the signature before trusting claims.",
+        vulnerability_class="improper-authentication",
+        ecosystem="npm",
+        framework="express",
+        source_url="https://example.com/jwt",
+        source_title="JWT best practices",
+        provenance="web-research",
+        confidence=0.9,
+        claims=["Verify the JWT signature before trusting any embedded claims."],
+    )
+
+    saved = store.upsert(entry)
+
+    assert saved.claims == ["Verify the JWT signature before trusting any embedded claims."]
+    results = store.search("jwt verification")
+    assert results[0].claims == ["Verify the JWT signature before trusting any embedded claims."]
+
+
+def test_postgres_knowledge_store_record_usage_creates_task_row_before_plan_is_saved():
+    factory = _session_factory()
+    store = PostgresKnowledgeStore(factory, "tenant-a")
+    decision = KnowledgeDecision("reuse_stored", "task", 0.9, "jev-model", "already covered")
+
+    store.record_usage("owner/repo", "revision-1", "task-key-1", "jwt verification", decision, [])
+
+
+def test_postgres_knowledge_store_save_and_load_plan_round_trips():
+    factory = _session_factory()
+    store = PostgresKnowledgeStore(factory, "tenant-a")
+    tasks = [
+        {"task_id": "task-key-1", "title": "Inspect auth", "objective": "Find auth bypass"},
+    ]
+
+    plan_id = store.save_plan("owner/repo", "a" * 40, "recon", tasks)
+    loaded = store.load_plan("owner/repo", "a" * 40)
+
+    assert loaded is not None
+    assert loaded["plan_id"] == plan_id
+    assert loaded["strategy"] == "recon"
+    assert loaded["tasks"] == tasks
+
+
+def test_postgres_knowledge_store_load_plan_is_none_when_no_plan_was_saved():
+    factory = _session_factory()
+    store = PostgresKnowledgeStore(factory, "tenant-a")
+
+    assert store.load_plan("owner/repo", "a" * 40) is None

@@ -41,6 +41,15 @@ class Call:
 
 
 @dataclass(slots=True)
+class Reference:
+    source: str
+    target: str
+    path: str
+    line: int
+    kind: str
+
+
+@dataclass(slots=True)
 class SearchHit:
     query_id: str
     path: str
@@ -55,6 +64,7 @@ class FileSecurityIR:
     content_hash: str
     symbols: list[Symbol] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
+    references: list[Reference] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
 
 
@@ -63,6 +73,7 @@ class StructuralGraph:
     symbols: list[Symbol] = field(default_factory=list)
     routes: list[Symbol] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
+    references: list[Reference] = field(default_factory=list)
     files: list[FileSecurityIR] = field(default_factory=list)
     search_hits: list[SearchHit] = field(default_factory=list)
     tree_sitter_files: int = 0
@@ -300,8 +311,38 @@ def build_structural_graph(
         graph.files.append(file_ir)
         graph.symbols.extend(file_ir.symbols)
         graph.calls.extend(file_ir.calls)
+        graph.references.extend(file_ir.references)
 
     return graph
+
+
+def build_file_security_ir(
+    root: Path,
+    relative_path: str,
+    max_file_bytes: int | None = None,
+) -> FileSecurityIR | None:
+    """Build Tree-sitter Security IR for one changed file without indexing the repository."""
+
+    root = root.resolve()
+    path = (root / relative_path).resolve()
+    if root not in path.parents or not path.is_file():
+        return None
+    config = load_json("code_intelligence/languages.json")
+    extensions = {str(item).lower() for item in config["source_extensions"]}
+    filenames = {str(item) for item in config["source_filenames"]}
+    if path.suffix.lower() not in extensions and path.name not in filenames:
+        return None
+    maximum = max_file_bytes if max_file_bytes is not None else int(config["default_max_file_bytes"])
+    try:
+        if path.stat().st_size > maximum:
+            return None
+        content = path.read_bytes()
+    except OSError:
+        return None
+    language = _language_for(path, config)
+    return _tree_sitter_ir(relative_path, language, content, config) or _fallback_ir(
+        relative_path, language, content
+    )
 
 
 def _tree_sitter_ir(
@@ -322,8 +363,11 @@ def _tree_sitter_ir(
     symbol_types = {str(item) for item in config["symbol_node_types"]}
     call_types = {str(item) for item in config["call_node_types"]}
     import_types = {str(item) for item in config["import_node_types"]}
+    reference_types = {str(item) for item in config["reference_node_types"]}
+    maximum_references = int(config["maximum_references_per_file"])
     symbols: list[Symbol] = []
     calls: list[Call] = []
+    references: list[Reference] = []
     imports: list[str] = []
 
     def visit(node: Any, enclosing: str = "") -> None:
@@ -353,6 +397,26 @@ def _tree_sitter_ir(
             callee = _node_text(function_node, content) if function_node is not None else ""
             if callee:
                 calls.append(Call(current or relative, callee, relative, node.start_point[0] + 1))
+        if node.type in reference_types and len(references) < maximum_references:
+            target = _node_text(node, content)
+            parent_name = node.parent.child_by_field_name("name") if node.parent is not None else None
+            is_definition_name = (
+                node.parent is not None
+                and node.parent.type in symbol_types
+                and parent_name is not None
+                and parent_name.start_byte == node.start_byte
+                and parent_name.end_byte == node.end_byte
+            )
+            if target and not is_definition_name:
+                references.append(
+                    Reference(
+                        current or relative,
+                        target,
+                        relative,
+                        node.start_point[0] + 1,
+                        node.type,
+                    )
+                )
         for child in node.children:
             visit(child, current)
 
@@ -363,6 +427,12 @@ def _tree_sitter_ir(
         content_hash=hashlib.sha256(content).hexdigest(),
         symbols=symbols,
         calls=calls,
+        references=list(
+            {
+                (item.source, item.target, item.path, item.line, item.kind): item
+                for item in references
+            }.values()
+        ),
         imports=list(dict.fromkeys(imports)),
     )
 

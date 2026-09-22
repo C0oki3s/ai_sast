@@ -1,0 +1,15 @@
+{
+  "questions": {
+    "next_action": {
+      "type": "choice",
+      "instructions": "Deep Hunt has already spent its normal context-expansion budget on this candidate and still has an unresolved evidence gap. Given the current state (rounds used, pending and resolved context requests, unresolved gates, confidence so far), choose the single next action most likely to resolve the gap.",
+      "criteria": {
+        "retry_same_model": "The unresolved gap looks like response noise rather than a genuine missing-evidence problem; retrying the same model and context once more is likely to succeed.",
+        "escalate_model": "The gap looks like a reasoning-depth problem; escalating to the strongest model tier for one more round is likely to resolve it.",
+        "expand_context": "Deep Hunt has already asked for specific additional context or research it has not yet received; resolving the pending requests and giving one more round is likely to resolve the gap.",
+        "mark_unresolved": "Further rounds are unlikely to resolve this gap; stop spending budget and report the finding as-is."
+      }
+    }
+  },
+  "confidence_threshold": 0.85
+}

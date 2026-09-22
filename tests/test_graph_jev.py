@@ -6,7 +6,13 @@ from plaidnox_sast.graph import (
     readable_source_tree,
     source_files,
 )
-from plaidnox_sast.jev import JevClient, JevRouter
+from plaidnox_sast.jev import (
+    FRONTIER_PRIORITY_WEIGHT,
+    JevClient,
+    JevFrontierRouter,
+    JevRetryRouter,
+    JevRouter,
+)
 from plaidnox_sast.models import (
     Candidate,
     Depth,
@@ -28,6 +34,21 @@ def test_structural_graph_returns_changed_attack_surface(sample_repo):
     surface = build_structural_graph(sample_repo).affected_surface(["app.js"])
     assert surface["changed_paths"] == ["app.js"]
     assert surface["routes"] == []
+
+
+def test_structural_graph_keeps_symbol_references_for_incremental_navigation(tmp_path):
+    (tmp_path / "service.py").write_text(
+        "def load_record(identifier):\n    return identifier\n\n"
+        "def handle_request(value):\n    return load_record(value)\n",
+        encoding="utf-8",
+    )
+
+    graph = build_structural_graph(tmp_path)
+
+    assert any(
+        item.source == "handle_request" and item.target == "load_record"
+        for item in graph.references
+    )
 
 
 def test_readable_source_tree_is_stable_and_excludes_secret_containers(sample_repo):
@@ -104,7 +125,9 @@ def test_jev_escalates_ssrf_to_deep():
     )
     decision = JevRouter().classify(candidate)
     assert decision.depth is Depth.DEEP
-    assert decision.profile == "mixed"
+    assert decision.needs_cross_file == "likely"
+    assert decision.needs_deep_falsification == "likely"
+    assert decision.analysis_complexity == 4
     assert decision.task_class == "ssrf"
     assert decision.model_tier is ModelTier.DEEP
     assert decision.needs_deep_hunt is True
@@ -137,12 +160,23 @@ class FakeHTTPResponse:
         return False
 
 
+def _noul_answers(choice="likely", confidence=0.9):
+    return {
+        "needs_cross_file": {"choice": choice, "confidence": confidence},
+        "needs_state_reconstruction": {"choice": choice, "confidence": confidence},
+        "needs_external_semantics": {"choice": choice, "confidence": confidence},
+        "needs_environment_context": {"choice": choice, "confidence": confidence},
+        "needs_deep_falsification": {"choice": choice, "confidence": confidence},
+        "analysis_complexity": {"choice": "3", "confidence": confidence},
+    }
+
+
 def test_jev_uses_high_confidence_remote_route(monkeypatch):
     response = {
         "model": "jev-test",
         "answers": {
             "analysis_depth": {"choice": "deep", "confidence": 0.93},
-            "context_profile": {"choice": "cross_file", "confidence": 0.91},
+            **_noul_answers("likely", 0.91),
         },
     }
     monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
@@ -151,7 +185,8 @@ def test_jev_uses_high_confidence_remote_route(monkeypatch):
     )
     decision = JevRouter(JevClient("test-key", endpoint="https://example.test")).classify(candidate)
     assert decision.depth is Depth.DEEP
-    assert decision.profile == "cross_file"
+    assert decision.needs_cross_file == "likely"
+    assert decision.analysis_complexity == 3
     assert decision.reason.startswith("JEV jev-test")
 
 
@@ -159,7 +194,7 @@ def test_jev_falls_back_when_confidence_is_low(monkeypatch):
     response = {
         "answers": {
             "analysis_depth": {"choice": "fast", "confidence": 0.6},
-            "context_profile": {"choice": "general", "confidence": 0.6},
+            **_noul_answers("unlikely", 0.6),
         },
     }
     monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
@@ -175,7 +210,7 @@ def test_jev_requests_each_typed_decision_without_local_prompt_cache(monkeypatch
         "model": "jev-test",
         "answers": {
             "analysis_depth": {"choice": "standard", "confidence": 0.95},
-            "context_profile": {"choice": "generic", "confidence": 0.94},
+            **_noul_answers("unlikely", 0.94),
         },
     }
 
@@ -191,3 +226,106 @@ def test_jev_requests_each_typed_decision_without_local_prompt_cache(monkeypatch
     client.decide_questions(state, "routing/jev.json")
 
     assert len(calls) == 2
+
+
+def test_jev_client_redacts_secrets_from_state_before_sending(monkeypatch):
+    response = {
+        "model": "jev-test",
+        "answers": {
+            "analysis_depth": {"choice": "standard", "confidence": 0.95},
+            **_noul_answers("unlikely", 0.94),
+        },
+    }
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeHTTPResponse(response)
+
+    monkeypatch.setattr("plaidnox_sast.jev.urlopen", fake_urlopen)
+    client = JevClient("test-key", endpoint="https://example.test")
+    state = {"message": "Uses AKIAABCDEFGHIJKLMNOP to sign requests."}
+
+    client.decide_questions(state, "routing/jev.json")
+
+    assert "AKIAABCDEFGHIJKLMNOP" not in captured["body"]["state"]["message"]
+    assert captured["body"]["state"]["message"] == "Uses <redacted-aws-access-key> to sign requests."
+
+
+def test_frontier_priority_weight_orders_low_below_standard_below_high():
+    assert FRONTIER_PRIORITY_WEIGHT["low"] < FRONTIER_PRIORITY_WEIGHT["standard"] < FRONTIER_PRIORITY_WEIGHT["high"]
+
+
+def test_frontier_router_locally_prioritizes_high_severity_capabilities_as_high():
+    decision = JevFrontierRouter().prioritize({"severity": "critical", "capability": "remote code execution"})
+    assert decision.priority == "high"
+    assert decision.reason == "severity-safe frontier fallback"
+
+
+def test_frontier_router_locally_prioritizes_other_severities_as_standard():
+    decision = JevFrontierRouter().prioritize({"severity": "medium", "capability": "read internal config"})
+    assert decision.priority == "standard"
+
+
+def test_frontier_router_uses_high_confidence_remote_route(monkeypatch):
+    response = {
+        "model": "jev-test",
+        "answers": {"pivot_priority": {"choice": "low", "confidence": 0.9}},
+    }
+    monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
+    router = JevFrontierRouter(JevClient("test-key", endpoint="https://example.test"))
+    decision = router.prioritize({"severity": "high", "capability": "ssrf into metadata service"})
+    assert decision.priority == "low"
+    assert decision.reason.startswith("JEV jev-test")
+
+
+def test_frontier_router_falls_back_when_confidence_is_low(monkeypatch):
+    response = {
+        "answers": {"pivot_priority": {"choice": "low", "confidence": 0.5}},
+    }
+    monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
+    router = JevFrontierRouter(JevClient("test-key", endpoint="https://example.test"))
+    decision = router.prioritize({"severity": "critical", "capability": "admin token theft"})
+    assert decision.priority == "high"
+    assert decision.reason.endswith("JEV low confidence")
+
+
+def test_retry_router_locally_escalates_a_candidate_never_routed_to_deep():
+    decision = JevRetryRouter().decide({"model_tier": "standard", "context_requests_pending": 1})
+    assert decision.action == "escalate_model"
+    assert decision.reason == "tier-safe retry fallback"
+
+
+def test_retry_router_locally_expands_context_for_a_deep_candidate_with_a_pending_request():
+    decision = JevRetryRouter().decide({"model_tier": "deep", "context_requests_pending": 2})
+    assert decision.action == "expand_context"
+    assert decision.reason == "unresolved-context retry fallback"
+
+
+def test_retry_router_locally_marks_unresolved_when_deep_and_nothing_pending():
+    decision = JevRetryRouter().decide({"model_tier": "deep", "context_requests_pending": 0})
+    assert decision.action == "mark_unresolved"
+    assert decision.reason == "no-further-signal retry fallback"
+
+
+def test_retry_router_uses_high_confidence_remote_route(monkeypatch):
+    response = {
+        "model": "jev-test",
+        "answers": {"next_action": {"choice": "escalate_model", "confidence": 0.9}},
+    }
+    monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
+    router = JevRetryRouter(JevClient("test-key", endpoint="https://example.test"))
+    decision = router.decide({"model_tier": "deep", "context_requests_pending": 0})
+    assert decision.action == "escalate_model"
+    assert decision.reason.startswith("JEV jev-test")
+
+
+def test_retry_router_falls_back_when_confidence_is_low(monkeypatch):
+    response = {
+        "answers": {"next_action": {"choice": "mark_unresolved", "confidence": 0.5}},
+    }
+    monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
+    router = JevRetryRouter(JevClient("test-key", endpoint="https://example.test"))
+    decision = router.decide({"model_tier": "deep", "context_requests_pending": 1})
+    assert decision.action == "expand_context"
+    assert decision.reason.endswith("JEV low confidence")

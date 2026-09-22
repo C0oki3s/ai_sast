@@ -1,0 +1,14 @@
+{
+  "questions": {
+    "pivot_priority": {
+      "type": "choice",
+      "instructions": "Given a confirmed finding's gained capability and attack path, estimate how likely a further security-boundary crossing exists that is worth actively searching for. This is not a vulnerability taxonomy.",
+      "criteria": {
+        "low": "This capability is unlikely to reach a new boundary; a further pivot search is unlikely to be productive.",
+        "standard": "This capability may reach a further boundary; a pivot search is worth the standard effort.",
+        "high": "This capability is a strong new foothold (e.g. broad server-side reach, credential or token material, administrative control) very likely to cross a further boundary."
+      }
+    }
+  },
+  "confidence_threshold": 0.85
+}

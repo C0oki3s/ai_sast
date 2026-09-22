@@ -16,9 +16,21 @@
   "maximum_flow_depth": 6,
   "maximum_flow_edges": 80,
   "maximum_compact_context_items_per_section": 80,
-  "audited_source_payload_keys": ["content", "source_window", "code_slices", "context_expansions"],
-  "repository_wide_context_keys": ["security_ir", "source_inventory", "source_tree"],
-  "compact_context_omitted_fields": ["evidence", "gaps"],
+  "audited_source_payload_keys": [
+    "content",
+    "source_window",
+    "code_slices",
+    "context_expansions"
+  ],
+  "repository_wide_context_keys": [
+    "security_ir",
+    "source_inventory",
+    "source_tree"
+  ],
+  "compact_context_omitted_fields": [
+    "evidence",
+    "gaps"
+  ],
   "compact_repository_context_scalar_fields": [
     "schema_version",
     "codebase",
@@ -42,6 +54,7 @@
     "authorization_decisions",
     "indirect_dispatch",
     "build_time_variants",
-    "coverage_ledger"
+    "coverage_ledger",
+    "analysis_scope_paths"
   ]
 }

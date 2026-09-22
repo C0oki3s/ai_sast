@@ -1,0 +1,76 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "changed_path": {"type": "string", "minLength": 1, "maxLength": 500},
+          "changed_symbol": {"type": "string", "maxLength": 500},
+          "changed_lines": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "start": {"type": "integer", "minimum": 1},
+              "end": {"type": "integer", "minimum": 1}
+            },
+            "required": ["start", "end"]
+          },
+          "behavior_before": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "behavior_after": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "security_role": {"type": "string", "minLength": 1, "maxLength": 1600},
+          "suspected_broken_invariant": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "provisional_attacker_capability": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "context_facts_used": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {"type": "string", "maxLength": 1200}
+          },
+          "context_gaps": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {"type": "string", "maxLength": 1200}
+          },
+          "requested_expansion": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "definition", "callers", "callees", "imports", "route",
+                    "window", "sibling_handlers", "search", "flow"
+                  ]
+                },
+                "target": {"type": "string", "minLength": 1, "maxLength": 500},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 1200}
+              },
+              "required": ["kind", "target", "reason"]
+            }
+          }
+        },
+        "required": [
+          "candidate_id", "changed_path", "changed_symbol", "changed_lines",
+          "behavior_before", "behavior_after", "security_role",
+          "suspected_broken_invariant", "provisional_attacker_capability",
+          "context_facts_used", "context_gaps", "requested_expansion"
+        ]
+      }
+    },
+    "coverage_complete": {"type": "boolean"},
+    "coverage_gaps": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"type": "string", "maxLength": 1200}
+    }
+  },
+  "required": ["candidates", "coverage_complete", "coverage_gaps"]
+}
