@@ -11,6 +11,7 @@ from plaidnox_sast.ai import (
     HuntPlan,
     HuntTask,
     PlaidNoxDeepHuntAgent,
+    _resolve_context_request,
     load_env_file,
 )
 from plaidnox_sast.graph import build_structural_graph
@@ -240,6 +241,17 @@ def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(samp
     supplied = client.responses.kwargs["input"][1]["content"]
     assert "mongodb+srv://admin:secret" not in supplied
     assert "<redacted-mongodb-uri>" in supplied
+
+
+def test_ai_review_never_reads_a_path_excluded_by_the_project_source_policy(sample_repo):
+    client = FakeClient()
+    agent = PlaidNoxDeepHuntAgent(client, model="test-model")
+    agent.configure_source_policy(["app.js"], 1024 * 1024)
+
+    with pytest.raises(AIResponseError, match="not admitted by the project source policy"):
+        agent.review(sample_repo, deep_candidate(), finding())
+
+    assert client.responses.kwargs is None
 
 
 def test_ai_review_keeps_sensitive_contents_out_of_metadata_review(sample_repo):
@@ -613,6 +625,35 @@ app.get("/users/:id", async (req, res) => {
     assert client.responses.requests[1]["text"]["format"]["name"] == "plaidnox_repository_context"
     assert client.responses.requests[2]["text"]["format"]["name"] == "plaidnox_search_query_plan"
     assert client.responses.requests[3]["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
+    discovery_payload = json.loads(client.responses.requests[3]["input"][1]["content"])
+    compact_context = discovery_payload["repository_context"]
+    assert "security_ir" not in compact_context
+    assert "source_inventory" not in compact_context
+    assert "source_tree" not in compact_context
+    assert compact_context["focus_path"] == "app.js"
+    discovery_audit = agent.model_input_audit()[3]
+    assert discovery_audit["operation"] == "vulnerability_discovery"
+    assert discovery_audit["repository_wide_context"] is False
+
+
+def test_ai_can_request_a_bounded_call_flow_only_when_needed(tmp_path):
+    source = tmp_path / "service.py"
+    source.write_text(
+        "def load_record(identifier):\n    return store.load(identifier)\n\n"
+        "def handle_request(identifier):\n    return load_record(identifier)\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+
+    result = _resolve_context_request(
+        tmp_path,
+        graph,
+        {"kind": "flow", "path": "service.py", "symbol": "load_record", "start_line": 1, "end_line": 2},
+    )
+
+    assert result["resolved"] is True
+    assert result["edges"]
+    assert len(result["edges"]) <= 80
 
 
 def test_ai_attaches_context_fabric_before_reconnaissance(sample_repo, tmp_path):

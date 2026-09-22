@@ -113,6 +113,42 @@ def test_changed_callee_keeps_identity_and_revalidates_unchanged_caller(tmp_path
     assert base_ids["handleRequest"] in overlay.affected_symbols
 
 
+def test_unrelated_change_reuses_linked_finding_context(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "account.js").write_text(
+        "function loadAccount(id) { return database.find(id); }\n",
+        encoding="utf-8",
+    )
+    unrelated = repository / "format.js"
+    unrelated.write_text("function format(value) { return String(value); }\n", encoding="utf-8")
+    store = ContextFabricStore(tmp_path / "context.sqlite")
+    base_graph = build_structural_graph(repository)
+    base = store.create_base("owner/repo", "revision-a", repository, base_graph)
+    ids = {
+        name: symbol_id
+        for symbol_id, _path, name, _line, _content_hash, _content in _snapshot_symbols(repository, base_graph)
+    }
+    store.link_finding("owner/repo", "FND-account", base.context_id, [ids["loadAccount"]])
+
+    unrelated.write_text(
+        "function format(value) { return String(value).trim(); }\n",
+        encoding="utf-8",
+    )
+    overlay = store.create_overlay(
+        base,
+        "revision-b",
+        repository,
+        ["format.js"],
+        build_structural_graph(repository),
+    )
+    packet = store.compile_packet(overlay, "mixed")
+
+    assert ids["loadAccount"] not in overlay.affected_symbols
+    assert packet.prior_findings == []
+    assert all(item["path"] == "format.js" for item in packet.code_slices)
+
+
 def test_context_snapshot_contains_only_files_admitted_to_security_ir(tmp_path):
     (tmp_path / "app.py").write_text("def run():\n    return True\n", encoding="utf-8")
     (tmp_path / "generated.py").write_text("def generated():\n    return False\n", encoding="utf-8")

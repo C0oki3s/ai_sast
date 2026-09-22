@@ -109,6 +109,9 @@ class SastPipeline:
         configure_source_policy = getattr(deep_hunt_agent, "configure_source_policy", None)
         if callable(configure_source_policy):
             configure_source_policy(config.exclude, config.max_file_bytes)
+        reset_model_input_audit = getattr(deep_hunt_agent, "reset_model_input_audit", None)
+        if callable(reset_model_input_audit):
+            reset_model_input_audit()
 
         codebase_id = ""
         scan_id = ""
@@ -403,6 +406,10 @@ class SastPipeline:
                 [*policy.reasons, "PlaidNox Deep Hunt was also incomplete; review recorded error metrics"],
             )
         prompt_cache_metrics = getattr(deep_hunt_agent, "prompt_cache_metrics", dict)()
+        model_input_metrics = getattr(deep_hunt_agent, "model_input_metrics", dict)()
+        model_input_audit = getattr(deep_hunt_agent, "model_input_audit", list)()
+        if model_input_audit:
+            repository_context["model_input_audit"] = model_input_audit
         return ScanResult(
             codebase=codebase,
             revision=revision,
@@ -464,6 +471,7 @@ class SastPipeline:
                 "persistence_finding_error_type": persistence_finding_error_type,
                 "persistence_finding_error": persistence_finding_error,
                 **prompt_cache_metrics,
+                **model_input_metrics,
             },
             repository_context=repository_context,
         )

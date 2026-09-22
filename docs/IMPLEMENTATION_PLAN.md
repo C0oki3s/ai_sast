@@ -22,24 +22,54 @@ its end-to-end exit condition.
 Exit condition: met by unit/E2E fixtures; repeated real-repository acceptance
 evidence remains required before production release.
 
-## 2. ripgrep + Tree-sitter Code Intelligence — active
+## 2. ripgrep + Tree-sitter Code Intelligence
 
-- Make AI-created `rg` queries the primary discovery and navigation path.
-- Use Tree-sitter to persist only the Security IR needed for symbols, imports,
-  calls, routes, guards, sources, sinks, and focused context expansion.
-- Do not persist a complete AST or build whole-program dataflow by default.
-- Add precise compiler/LSP indexes and targeted taint/dataflow only when the AI
-  identifies a flow question that cannot be resolved from the Security IR.
-- Keep symbol identity stable across content changes.
-- Enforce project excludes and maximum file sizes in inventory, IR, discovery,
-  context compilation, and model input.
-- Build generic snapshot overlays and dependency-aware invalidation with no SCM
-  concepts in the Code Scanning core.
-- Persist exact finding dependencies automatically from verified evidence.
+### 2a. Generic incremental core — implemented
 
-Exit condition: mutation tests prove that a changed callee revalidates callers
-and linked findings, unrelated code is reused, and the model-call audit shows
-that broad source contents were not resent.
+- AI-created `rg` queries are the primary discovery and navigation path. The
+  executor contains no vulnerability search expressions; it only validates and
+  executes bounded model-produced queries.
+- Tree-sitter persists a compact syntax Security IR for files, stable symbols,
+  imports, and calls. AI reconnaissance supplies repository-specific entry
+  points, input surfaces, sensitive effects, controls, trust boundaries, and
+  security invariants. These roles are not inferred from hardcoded framework or
+  vulnerability patterns.
+- A full AST and whole-program dataflow graph are not persisted. An AI review
+  can request a bounded bidirectional call-flow slice only when a concrete flow
+  question remains open.
+- Symbol identity remains stable across body and line changes; content hashes
+  independently trigger invalidation.
+- The external language inventory covers the primary supported languages and
+  common build/dependency manifests. Project exclusions and exact maximum file
+  sizes apply to inventory, Tree-sitter IR, `rg`, source windows, context
+  expansion, and patch evidence.
+- Content-addressed bases and overlays propagate changes through reverse call
+  dependencies without introducing SCM concepts into Code Scanning.
+- Verified evidence is linked automatically to exact stable symbol
+  dependencies.
+- Per-segment discovery and variant calls receive focused source plus a compact
+  repository context; they no longer resend the repository-wide source tree,
+  inventory, or Security IR. Every LiteLLM call records only a content-free
+  payload hash, character counts, tier, operation, and broad-context flag for
+  audit and cost analysis.
+
+The exit condition is met by
+`tests/test_context_fabric.py::test_changed_callee_keeps_identity_and_revalidates_unchanged_caller`,
+`tests/test_context_fabric.py::test_unrelated_change_reuses_linked_finding_context`,
+`tests/test_ai.py::test_ai_builds_context_then_discovers_evidenced_candidates`,
+`tests/test_ai.py::test_ai_can_request_a_bounded_call_flow_only_when_needed`,
+and the source-policy cases in `tests/test_graph_jev.py` and `tests/test_ai.py`.
+
+### 2b. Optional precision adapters — deferred follow-on
+
+- Add compiler/LSP semantic indexes for languages where they materially improve
+  symbol resolution beyond Tree-sitter.
+- Add targeted, language-specific taint/dataflow adapters for an AI-identified
+  flow question that cannot be proven from the bounded Security IR slice.
+- A bounded call-flow slice is structural navigation, not a taint proof. Until
+  an adapter exists for a required flow, the review must preserve the evidence
+  gap or mark required coverage incomplete; it must never treat missing
+  precision as proof that the code is safe.
 
 ## 3. PostgreSQL ORM persistence — implemented
 
@@ -107,7 +137,8 @@ knowledge whenever production persistence is configured.
   already supplied, but may also name `context_requests` (kind: definition /
   callers / callees / imports / route / window, plus path/symbol/line range)
   describing the smallest additional evidence that would resolve an open
-  gate. `_resolve_context_request()` answers each request purely from the
+  gate. A `flow` request returns a bounded bidirectional call neighborhood and
+  its definitions. `_resolve_context_request()` answers each request purely from the
   already-built `StructuralGraph` (no new Tree-sitter parsing), is tolerant of
   resolution failures (`{"resolved": False, "reason": ...}` rather than
   raising), and the resolved answers are echoed back as `context_expansions`

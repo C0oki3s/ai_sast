@@ -171,21 +171,32 @@ reported finding has redacted code evidence and a completed Deep Hunt verdict.
 
 ### Phase 2 — Code Intelligence correctness
 
-Status: current implementation phase.
+Status: generic incremental core implemented; precision adapters deferred.
 
-- Replace content-derived symbol identifiers with stable semantic identities.
-- Expand source/configuration recognition across supported languages and common
-  manifests while respecting explicit excludes and maximum file sizes.
-- Use model-planned `rg` for primary discovery, Tree-sitter for the cached Security IR,
-  and targeted dataflow only when a task needs it. Search expressions are generated from
-  observed repository evidence; the runtime contains no baked-in vulnerability queries.
-- Persist edge deltas and dependency-aware snapshot overlays.
-- Propagate changes through callers, callees, routes, controls, data stores,
-  threat assumptions, and prior finding dependencies.
-- Compile the minimum complete context packet before any discovery or hunt call.
+- Stable semantic symbol identities are independent of content and line numbers;
+  body changes update content hashes and invalidation state.
+- Source/configuration recognition is externalized across supported languages
+  and common manifests. Explicit excludes and exact maximum file sizes apply at
+  inventory, IR, ripgrep, source-read, context-expansion, and model-input
+  boundaries.
+- Model-planned `rg` is the primary discovery path. Tree-sitter supplies the
+  cached syntax Security IR. Repository-specific security roles remain AI
+  derived rather than encoded as vulnerability/framework searches.
+- Content-addressed bases and dependency-aware overlays propagate changed
+  callees to callers and linked findings without adding SCM behavior.
+- Discovery and variant calls use focused Security IR slices and compact
+  repository context. Content-free model-call audits prove that they do not
+  resend the broad source inventory, source tree, or repository-wide IR.
+- AI reviews can request bounded call-flow expansion only when needed.
 
-Exit: mutation tests prove that a changed callee revalidates its callers and
-linked findings, while an unrelated change does not spend model tokens on them.
+Exit met: mutation tests prove that changed callees revalidate callers and
+linked findings, unrelated changes omit those findings and code slices, and
+per-segment model calls avoid repository-wide context.
+
+Deferred Phase 2b: compiler/LSP semantic adapters and true language-specific
+taint/dataflow are optional precision layers. The current call-flow expansion is
+structural navigation, not taint proof; unresolved required flows remain explicit
+evidence gaps or incomplete coverage.
 
 ### Phase 3 — PostgreSQL ORM persistence
 

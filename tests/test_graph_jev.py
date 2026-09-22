@@ -62,6 +62,35 @@ def test_source_inventory_enforces_excludes_and_maximum_size(tmp_path):
     assert [path.name for path in files] == ["keep.py"]
 
 
+def test_source_inventory_recognizes_common_extensionless_manifests(tmp_path):
+    for filename in ("go.mod", "requirements.txt", "build.gradle", "Cargo.lock"):
+        (tmp_path / filename).write_text("module metadata\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("not source inventory\n", encoding="utf-8")
+
+    files = source_files(tmp_path)
+
+    assert [path.name for path in files] == [
+        "Cargo.lock",
+        "build.gradle",
+        "go.mod",
+        "requirements.txt",
+    ]
+
+
+def test_ripgrep_enforces_project_excludes_and_exact_maximum_size(tmp_path):
+    (tmp_path / "keep.py").write_text("signal()\n", encoding="utf-8")
+    (tmp_path / "excluded.py").write_text("signal()\n", encoding="utf-8")
+    (tmp_path / "large.py").write_text("signal()\n" + "x" * 100, encoding="utf-8")
+
+    hits = RipgrepDiscovery(
+        tmp_path,
+        exclude=["excluded.py"],
+        max_file_bytes=20,
+    ).search("bounded", "signal")
+
+    assert [hit.path for hit in hits] == ["keep.py"]
+
+
 def test_jev_escalates_ssrf_to_deep():
     candidate = Candidate(
         rule_id="ssrf",

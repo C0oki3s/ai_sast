@@ -2,9 +2,9 @@
   "maximum_pattern_characters": 2000,
   "maximum_hits_per_query": 500,
   "rg_timeout_seconds": 30,
-  "rg_max_filesize": "1M",
   "context_lines_before": 40,
   "context_lines_after": 40,
+  "source_window_max_characters": 12000,
   "maximum_dynamic_queries_per_task": 30,
   "maximum_recon_queries": 120,
   "maximum_recon_hits_per_query": 60,
@@ -12,5 +12,36 @@
   "recon_context_lines_after": 12,
   "maximum_recon_evidence_characters": 240000,
   "maximum_reverse_dependency_depth": 12,
-  "maximum_context_packet_slices": 24
+  "maximum_context_packet_slices": 24,
+  "maximum_flow_depth": 6,
+  "maximum_flow_edges": 80,
+  "maximum_compact_context_items_per_section": 80,
+  "audited_source_payload_keys": ["content", "source_window", "code_slices", "context_expansions"],
+  "repository_wide_context_keys": ["security_ir", "source_inventory", "source_tree"],
+  "compact_context_omitted_fields": ["evidence", "gaps"],
+  "compact_repository_context_scalar_fields": [
+    "schema_version",
+    "codebase",
+    "revision",
+    "architecture",
+    "business_context",
+    "context_fabric"
+  ],
+  "compact_repository_context_collection_fields": [
+    "applications",
+    "actors",
+    "sensitive_assets",
+    "input_surfaces",
+    "trust_boundaries",
+    "security_invariants",
+    "coverage_gaps",
+    "production_areas",
+    "entry_points",
+    "sensitive_effects",
+    "authentication_paths",
+    "authorization_decisions",
+    "indirect_dispatch",
+    "build_time_variants",
+    "coverage_ledger"
+  ]
 }

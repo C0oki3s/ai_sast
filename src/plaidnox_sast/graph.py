@@ -99,28 +99,81 @@ def source_files(
 ) -> list[Path]:
     """Return eligible source/configuration files without executing target code."""
 
+    root = root.resolve()
     config = load_json("code_intelligence/languages.json")
     extensions = {str(item).lower() for item in config["source_extensions"]}
     filenames = {str(item) for item in config["source_filenames"]}
     ignored_directories = {str(item) for item in config["ignored_directories"]}
     excluded = list(exclude or [])
     maximum = max_file_bytes if max_file_bytes is not None else int(config["default_max_file_bytes"])
+    if maximum < 1:
+        raise ValueError("max_file_bytes must be positive")
     files: list[Path] = []
     for path in root.rglob("*"):
-        if not path.is_file() or ignored_directories.intersection(path.relative_to(root).parts):
-            continue
-        relative = path.relative_to(root).as_posix()
-        if excluded and any(fnmatch.fnmatch(relative, pattern) for pattern in excluded):
-            continue
-        if path.suffix.lower() not in extensions and path.name not in filenames:
-            continue
-        try:
-            if path.stat().st_size > maximum:
-                continue
-        except OSError:
-            continue
-        files.append(path)
+        if _source_file_is_admitted(
+            root,
+            path,
+            excluded,
+            maximum,
+            extensions,
+            filenames,
+            ignored_directories,
+        ):
+            files.append(path)
     return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+
+
+def source_file_is_admitted(
+    root: Path,
+    path: Path,
+    exclude: Iterable[str] | None = None,
+    max_file_bytes: int | None = None,
+) -> bool:
+    """Check one path against the same source policy used by inventory and discovery."""
+
+    root = root.resolve()
+    config = load_json("code_intelligence/languages.json")
+    maximum = max_file_bytes if max_file_bytes is not None else int(config["default_max_file_bytes"])
+    if maximum < 1:
+        raise ValueError("max_file_bytes must be positive")
+    return _source_file_is_admitted(
+        root,
+        path,
+        [str(item) for item in (exclude or [])],
+        maximum,
+        {str(item).lower() for item in config["source_extensions"]},
+        {str(item) for item in config["source_filenames"]},
+        {str(item) for item in config["ignored_directories"]},
+    )
+
+
+def _source_file_is_admitted(
+    root: Path,
+    path: Path,
+    exclude: list[str],
+    maximum: int,
+    extensions: set[str],
+    filenames: set[str],
+    ignored_directories: set[str],
+) -> bool:
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root).as_posix()
+        resolved = candidate.resolve()
+    except (OSError, ValueError):
+        return False
+    if root not in resolved.parents or not candidate.is_file():
+        return False
+    if ignored_directories.intersection(candidate.relative_to(root).parts):
+        return False
+    if exclude and any(fnmatch.fnmatch(relative, pattern) for pattern in exclude):
+        return False
+    if candidate.suffix.lower() not in extensions and candidate.name not in filenames:
+        return False
+    try:
+        return candidate.stat().st_size <= maximum
+    except OSError:
+        return False
 
 
 def readable_source_tree(
@@ -141,8 +194,22 @@ def readable_source_tree(
 class RipgrepDiscovery:
     """Safe, bounded ripgrep JSON adapter for AI-created discovery queries."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        exclude: Iterable[str] = (),
+        max_file_bytes: int | None = None,
+    ) -> None:
         self.root = root.resolve()
+        self.exclude = tuple(str(item) for item in exclude)
+        config = load_json("code_intelligence/languages.json")
+        self.max_file_bytes = (
+            max_file_bytes
+            if max_file_bytes is not None
+            else int(config["default_max_file_bytes"])
+        )
+        if self.max_file_bytes < 1:
+            raise ValueError("max_file_bytes must be positive")
         if not shutil.which("rg"):
             raise RuntimeError("ripgrep is required for Code Scanning discovery")
 
@@ -163,7 +230,7 @@ class RipgrepDiscovery:
             "--no-config",
             "--hidden",
             "--max-filesize",
-            str(runtime["rg_max_filesize"]),
+            str(self.max_file_bytes),
         ]
         languages = load_json("code_intelligence/languages.json")
         for extension in languages["source_extensions"]:
@@ -173,7 +240,7 @@ class RipgrepDiscovery:
         command.extend(("--type", "plaidnox"))
         for value in include_globs:
             command.extend(("--glob", str(value)))
-        for value in exclude_globs:
+        for value in dict.fromkeys((*self.exclude, *(str(item) for item in exclude_globs))):
             command.extend(("--glob", f"!{value}"))
         command.extend(("--", pattern, "."))
         result = subprocess.run(

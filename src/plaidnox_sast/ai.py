@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from .graph import (
     StructuralGraph,
     build_structural_graph,
     readable_source_tree,
+    source_file_is_admitted,
     source_files,
 )
 from .knowledge import KnowledgeCoordinator, KnowledgeEntry, LiteLLMKnowledgeProvider
@@ -234,6 +236,7 @@ class PlaidNoxDeepHuntAgent:
         self.security_graph: StructuralGraph | None = None
         self.source_excludes: list[str] = []
         self.max_file_bytes: int | None = None
+        self._model_input_audit: list[dict[str, Any]] = []
 
     @classmethod
     def from_environment(
@@ -272,6 +275,28 @@ class PlaidNoxDeepHuntAgent:
     def prompt_cache_metrics(self) -> dict[str, int | float]:
         return self.cache_telemetry.snapshot().to_metrics()
 
+    def model_input_audit(self) -> list[dict[str, Any]]:
+        """Return content-free hashes and sizes for each generative request."""
+
+        return [dict(item) for item in self._model_input_audit]
+
+    def reset_model_input_audit(self) -> None:
+        """Start a new scan-scoped model-input audit."""
+
+        self._model_input_audit.clear()
+
+    def model_input_metrics(self) -> dict[str, int]:
+        return {
+            "model_input_calls": len(self._model_input_audit),
+            "model_input_characters": sum(int(item["payload_characters"]) for item in self._model_input_audit),
+            "model_source_context_characters": sum(
+                int(item["source_context_characters"]) for item in self._model_input_audit
+            ),
+            "model_calls_with_repository_wide_context": sum(
+                int(bool(item["repository_wide_context"])) for item in self._model_input_audit
+            ),
+        }
+
     def web_knowledge_provider(self) -> LiteLLMKnowledgeProvider:
         return LiteLLMKnowledgeProvider.from_environment(self.cache_telemetry)
 
@@ -297,7 +322,12 @@ class PlaidNoxDeepHuntAgent:
         review: DeepHuntResult | None = None
         for round_index in range(max_rounds + 1):
             code_window = "[contents intentionally unavailable]" if metadata_only else _source_window(
-                root, candidate.evidence.path, candidate.evidence.start_line, candidate.evidence.end_line
+                root,
+                candidate.evidence.path,
+                candidate.evidence.start_line,
+                candidate.evidence.end_line,
+                exclude=self.source_excludes,
+                max_file_bytes=self.max_file_bytes,
             )
             evidence = {
                 "rule_id": candidate.rule_id,
@@ -340,7 +370,15 @@ class PlaidNoxDeepHuntAgent:
                 round=round_index + 1,
             )
             for request in review.context_requests[:max_requests]:
-                context_expansions.append(_resolve_context_request(root, self.security_graph, request))
+                context_expansions.append(
+                    _resolve_context_request(
+                        root,
+                        self.security_graph,
+                        request,
+                        exclude=self.source_excludes,
+                        max_file_bytes=self.max_file_bytes,
+                    )
+                )
         self._emit(
             "candidate_verification_completed",
             rule_id=candidate.rule_id,
@@ -389,6 +427,8 @@ class PlaidNoxDeepHuntAgent:
                     str(location.get("path", finding.evidence.path)),
                     int(location.get("start_line", finding.evidence.start_line) or 1),
                     int(location.get("end_line", finding.evidence.start_line) or 1),
+                    exclude=self.source_excludes,
+                    max_file_bytes=self.max_file_bytes,
                 ),
             }
             for location in evidence_locations
@@ -761,7 +801,10 @@ class PlaidNoxDeepHuntAgent:
             next_focus = ""
             for _continuation in range(int(runtime["discovery_max_continuations"]) + 1):
                 request = {
-                    "repository_context": context.to_dict(),
+                    "repository_context": _compact_repository_context(
+                        context,
+                        str(segment["path"]),
+                    ),
                     "hunt_plan": {"strategy": plan.strategy, "tasks": related_tasks} if plan else None,
                     "source_segment": segment,
                     "continuation_focus": next_focus,
@@ -869,7 +912,10 @@ class PlaidNoxDeepHuntAgent:
             next_focus = ""
             for _continuation in range(int(runtime["discovery_max_continuations"]) + 1):
                 request = {
-                    "repository_context": context.to_dict(),
+                    "repository_context": _compact_repository_context(
+                        context,
+                        str(segment["path"]),
+                    ),
                     "hunt_plan": compact_plan,
                     "verified_roots": verified_payload,
                     "source_segment": segment,
@@ -1145,7 +1191,21 @@ class PlaidNoxDeepHuntAgent:
         max_output_tokens: int | None = None,
         model_tier: ModelTier | None = None,
     ) -> Any:
-        system_prompt, user_prompt = render_operation(prompt_operation, redact_payload(payload))
+        safe_payload = redact_payload(payload)
+        serialized_payload = json.dumps(safe_payload, sort_keys=True, ensure_ascii=False)
+        runtime = load_json("runtime/code_intelligence.json")
+        source_keys = {str(item) for item in runtime["audited_source_payload_keys"]}
+        self._model_input_audit.append(
+            {
+                "operation": prompt_operation,
+                "model_tier": model_tier.value if model_tier is not None else "default",
+                "payload_hash": hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest(),
+                "payload_characters": len(serialized_payload),
+                "source_context_characters": _payload_characters_for_keys(safe_payload, source_keys),
+                "repository_wide_context": _contains_repository_wide_context(safe_payload),
+            }
+        )
+        system_prompt, user_prompt = render_operation(prompt_operation, safe_payload)
         response = self.client.responses.create(
             model=self._model_for_tier(model_tier),
             reasoning={"effort": "low"},
@@ -1190,15 +1250,33 @@ def load_env_file(path: Path) -> None:
             os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
-def _source_window(root: Path, relative_path: str, start_line: int, end_line: int) -> str:
+def _source_window(
+    root: Path,
+    relative_path: str,
+    start_line: int,
+    end_line: int,
+    *,
+    exclude: list[str] | None = None,
+    max_file_bytes: int | None = None,
+) -> str:
+    """Read a bounded source window only when the project source policy admits the file."""
+
     source_path = (root / relative_path).resolve()
     if root.resolve() not in source_path.parents:
         raise AIResponseError("finding path escapes the repository")
+    if not source_file_is_admitted(
+        root,
+        source_path,
+        exclude=exclude,
+        max_file_bytes=max_file_bytes,
+    ):
+        raise AIResponseError("source path is not admitted by the project source policy")
+    runtime = load_json("runtime/code_intelligence.json")
     lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    start = max(0, start_line - 41)
-    end = min(len(lines), end_line + 40)
+    start = max(0, start_line - int(runtime["context_lines_before"]) - 1)
+    end = min(len(lines), end_line + int(runtime["context_lines_after"]))
     numbered = [f"{index + 1}: {line}" for index, line in enumerate(lines[start:end], start)]
-    return _redact("\n".join(numbered)[:12000])
+    return _redact("\n".join(numbered)[: int(runtime["source_window_max_characters"])])
 
 
 def _security_ir_context(
@@ -1279,6 +1357,9 @@ def _resolve_context_request(
     root: Path,
     security_graph: StructuralGraph | None,
     request: dict[str, Any],
+    *,
+    exclude: list[str] | None = None,
+    max_file_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Answer one AI-named Tree-sitter-backed context request from the already-built Security IR."""
     kind = str(request.get("kind", ""))
@@ -1289,7 +1370,14 @@ def _resolve_context_request(
 
     if kind == "window":
         try:
-            content = _source_window(root, path, start_line, end_line)
+            content = _source_window(
+                root,
+                path,
+                start_line,
+                end_line,
+                exclude=exclude,
+                max_file_bytes=max_file_bytes,
+            )
         except (AIResponseError, OSError) as exc:
             return {"kind": kind, "path": path, "resolved": False, "reason": str(exc)}
         return {
@@ -1304,6 +1392,17 @@ def _resolve_context_request(
     if security_graph is None:
         return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no Security IR is available"}
 
+    if kind == "flow":
+        flow = _bounded_call_flow(security_graph, symbol)
+        if not flow["edges"]:
+            return {
+                "kind": kind,
+                "symbol": symbol,
+                "resolved": False,
+                "reason": "no matching call-flow edges in the Security IR",
+            }
+        return {"kind": kind, "symbol": symbol, "resolved": True, **flow}
+
     if kind == "definition":
         match = next(
             (item for item in security_graph.symbols if symbol in {item.name, item.qualified_name}),
@@ -1312,7 +1411,14 @@ def _resolve_context_request(
         if match is None:
             return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "symbol not found in the Security IR"}
         try:
-            content = _source_window(root, match.path, match.line, match.end_line or match.line)
+            content = _source_window(
+                root,
+                match.path,
+                match.line,
+                match.end_line or match.line,
+                exclude=exclude,
+                max_file_bytes=max_file_bytes,
+            )
         except (AIResponseError, OSError) as exc:
             return {"kind": kind, "symbol": symbol, "resolved": False, "reason": str(exc)}
         return {
@@ -1352,6 +1458,60 @@ def _resolve_context_request(
         return {"kind": kind, "symbol": symbol, "resolved": True, "routes": routes}
 
     return {"kind": kind, "resolved": False, "reason": "unsupported context request kind"}
+
+
+def _bounded_call_flow(graph: StructuralGraph, symbol: str) -> dict[str, Any]:
+    """Return an AI-requested, bounded bidirectional call neighborhood."""
+
+    runtime = load_json("runtime/code_intelligence.json")
+    maximum_depth = int(runtime["maximum_flow_depth"])
+    maximum_edges = int(runtime["maximum_flow_edges"])
+    frontier = {symbol, symbol.rsplit(".", 1)[-1]}
+    visited = set(frontier)
+    selected: list[dict[str, Any]] = []
+    seen_edges: set[tuple[str, str, str, int]] = set()
+    for depth in range(maximum_depth):
+        next_frontier: set[str] = set()
+        for call in graph.calls:
+            caller_aliases = {call.caller, call.caller.rsplit(".", 1)[-1]}
+            callee_aliases = {call.callee, call.callee.rsplit(".", 1)[-1]}
+            if not (frontier & caller_aliases or frontier & callee_aliases):
+                continue
+            edge_key = (call.caller, call.callee, call.path, call.line)
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            selected.append(
+                {
+                    "caller": call.caller,
+                    "callee": call.callee,
+                    "path": call.path,
+                    "line": call.line,
+                    "depth": depth + 1,
+                }
+            )
+            next_frontier.update(caller_aliases | callee_aliases)
+            if len(selected) >= maximum_edges:
+                break
+        if len(selected) >= maximum_edges:
+            break
+        next_frontier -= visited
+        if not next_frontier:
+            break
+        visited.update(next_frontier)
+        frontier = next_frontier
+    definitions = [
+        {
+            "name": item.name,
+            "qualified_name": item.qualified_name or item.name,
+            "path": item.path,
+            "start_line": item.line,
+            "end_line": item.end_line,
+        }
+        for item in graph.symbols
+        if {item.name, item.qualified_name, item.name.rsplit(".", 1)[-1]} & visited
+    ]
+    return {"edges": selected, "definitions": definitions[:maximum_edges]}
 
 
 def _validate_deep_hunt_result(
@@ -1488,7 +1648,7 @@ def _execute_recon_search_plan(
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
     }
-    discovery = RipgrepDiscovery(root)
+    discovery = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
     evidence: list[dict[str, Any]] = []
     all_hits: list[SearchHit] = []
     total_characters = 0
@@ -1593,7 +1753,7 @@ def _search_segments(
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
     }
-    rg = RipgrepDiscovery(root)
+    rg = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
     hits_with_tasks: list[tuple[SearchHit, set[str]]] = []
     tasks_with_hits: set[str] = set()
     for query in queries:
@@ -1633,7 +1793,7 @@ def _search_segments(
                 "content": _redact("\n".join(lines[start_line - 1 : end_line])),
                 "query_ids": [],
                 "task_ids": [],
-                "security_ir": _related_ir(graph, hit.path, enclosing.name if enclosing else ""),
+                "security_ir_slice": _related_ir(graph, hit.path, enclosing.name if enclosing else ""),
             },
         )
         segment["query_ids"] = sorted(set(segment["query_ids"]) | {hit.query_id})
@@ -1658,7 +1818,7 @@ def _search_segments(
     for segment in fallback_segments:
         segment["query_ids"] = []
         segment["task_ids"] = sorted(focus_paths[str(segment["path"])])
-        segment["security_ir"] = _related_ir(graph, str(segment["path"]), "")
+        segment["security_ir_slice"] = _related_ir(graph, str(segment["path"]), "")
         key = (str(segment["path"]), int(segment["start_line"]), int(segment["end_line"]))
         segments_by_key.setdefault(key, segment)
     return sorted(segments_by_key.values(), key=lambda item: (str(item["path"]), int(item["start_line"])))
@@ -1697,6 +1857,78 @@ def _related_ir(graph: StructuralGraph | None, path: str, symbol_name: str) -> d
         if symbol.path == path
     ]
     return {"symbols": symbols, "calls": calls, "imports": imports}
+
+
+def _compact_repository_context(
+    context: AIRepositoryContext,
+    focus_path: str,
+) -> dict[str, Any]:
+    """Build the bounded non-source context reused by per-segment model calls."""
+
+    runtime = load_json("runtime/code_intelligence.json")
+    source = context.to_dict()
+    maximum = int(runtime["maximum_compact_context_items_per_section"])
+    omitted = {str(item) for item in runtime["compact_context_omitted_fields"]}
+    compact: dict[str, Any] = {
+        key: source.get(key)
+        for key in runtime["compact_repository_context_scalar_fields"]
+        if key in source
+    }
+    for key in runtime["compact_repository_context_collection_fields"]:
+        values = source.get(key, [])
+        if not isinstance(values, list):
+            continue
+        ordered = sorted(
+            enumerate(values),
+            key=lambda item: (
+                0 if focus_path and focus_path in json.dumps(item[1], ensure_ascii=False) else 1,
+                item[0],
+            ),
+        )
+        compact[str(key)] = [
+            _without_fields(value, omitted)
+            for _index, value in ordered[:maximum]
+        ]
+    compact["focus_path"] = focus_path
+    return compact
+
+
+def _without_fields(value: Any, omitted: set[str]) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _without_fields(item, omitted)
+            for key, item in value.items()
+            if str(key) not in omitted
+        }
+    if isinstance(value, list):
+        return [_without_fields(item, omitted) for item in value]
+    return value
+
+
+def _payload_characters_for_keys(value: Any, keys: set[str], active: bool = False) -> int:
+    if isinstance(value, dict):
+        return sum(
+            _payload_characters_for_keys(item, keys, active or str(key) in keys)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return sum(_payload_characters_for_keys(item, keys, active) for item in value)
+    return len(value) if active and isinstance(value, str) else 0
+
+
+def _contains_repository_wide_context(value: Any) -> bool:
+    broad_keys = {
+        str(item)
+        for item in load_json("runtime/code_intelligence.json")["repository_wide_context_keys"]
+    }
+    if isinstance(value, dict):
+        return any(
+            (str(key) in broad_keys and bool(item)) or _contains_repository_wide_context(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_repository_wide_context(item) for item in value)
+    return False
 
 
 def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str, Any]) -> Candidate | None:

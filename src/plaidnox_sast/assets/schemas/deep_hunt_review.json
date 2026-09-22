@@ -217,6 +217,7 @@
               "definition",
               "callers",
               "callees",
+              "flow",
               "imports",
               "route",
               "window"
