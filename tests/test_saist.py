@@ -45,5 +45,6 @@ def test_saist_sarif_is_converted_to_redacted_candidate(tmp_path):
     assert candidate.rule_id == "datadog-saist.javascript.ssrf"
     assert candidate.severity is Severity.HIGH
     assert candidate.vulnerability_class == "CWE-918"
+    assert candidate.metadata["classification_references"][0]["namespace"] == "CWE"
     assert candidate.metadata["engine"] == "datadog-saist"
     assert "mongodb+srv://" not in candidate.evidence.snippet

@@ -48,6 +48,7 @@ class PolicyDecision(StrEnum):
     PASS = "pass"
     WARN = "warn"
     BLOCK = "block"
+    INCOMPLETE = "incomplete"
 
 
 @dataclass(slots=True)
@@ -103,7 +104,7 @@ class RouteDecision:
     task_class: str = "generic"
     model_tier: ModelTier = ModelTier.STANDARD
     needs_validation: bool = True
-    needs_deep_hunt: bool = False
+    needs_deep_hunt: bool = True
 
 
 @dataclass(slots=True)

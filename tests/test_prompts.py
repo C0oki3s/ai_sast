@@ -5,9 +5,8 @@ from pathlib import Path
 import pytest
 
 import plaidnox_sast.prompts as prompt_module
-from plaidnox_sast.prompts import PromptTemplateError, render_operation, render_prompt
 from plaidnox_sast.assets import load_json
-
+from plaidnox_sast.prompts import PromptTemplateError, render_operation, render_prompt
 
 OPERATIONS = (
     "recon_search_plan",
@@ -21,6 +20,7 @@ OPERATIONS = (
     "finding_consolidation",
     "finding_group_narratives",
     "knowledge_research",
+    "patch_proposal",
 )
 
 

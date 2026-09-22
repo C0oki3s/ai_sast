@@ -2,18 +2,71 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import hashlib
+import re
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import CodebaseRecord, ScanRunRecord, SnapshotRecord
+from ..assets import load_json
+from ..graph import StructuralGraph, Symbol
+from .models import (
+    CodebaseRecord,
+    CodeEdgeRecord,
+    FindingDependencyRecord,
+    FindingEvidenceRecord,
+    FindingRecord,
+    HuntPlanRecord,
+    HuntTaskRecord,
+    KnowledgeUsageRecord,
+    ScanRunRecord,
+    SecurityKnowledgeRecord,
+    SecurityMemoryRecord,
+    SnapshotRecord,
+    SourceFileRecord,
+    SymbolRecord,
+)
 
 
 class PersistenceConflictError(RuntimeError):
     """Raised when an immutable record is reused with conflicting data."""
+
+
+def _hash(*parts: str) -> str:
+    return hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def stable_id(prefix: str, *parts: str) -> str:
+    """A codebase/revision-derived id safe as a primary key (unlike raw names)."""
+
+    digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:32]
+    return f"{prefix}-{digest}"
+
+
+def symbol_id(stable_key: str) -> str:
+    """Return the cross-snapshot identity used for a Security IR symbol."""
+
+    return f"sym-{_hash(stable_key)}"
+
+
+# Versions the shape of `security_ir_inputs()`'s output, independent of prompt wording.
+SECURITY_IR_CONTEXT_VERSION = "1"
+
+
+def snapshot_tree_hash(graph: StructuralGraph) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(graph.files, key=lambda value: value.path):
+        digest.update(item.path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(item.content_hash.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +98,165 @@ class ScanRunValue:
     state: str
     mode: str
     workflow_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFileInput:
+    path: str
+    language: str
+    content_hash: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolInput:
+    """Occurrence-disambiguated identity; `stable_key` must exclude content (Rule 5)."""
+
+    stable_key: str
+    qualified_name: str
+    kind: str
+    path: str
+    start_line: int
+    end_line: int
+    content_hash: str
+    content: str
+    signature: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolValue:
+    symbol_id: str
+    stable_key: str
+    qualified_name: str
+    kind: str
+    path: str
+    start_line: int
+    end_line: int
+    content_hash: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityMemoryValue:
+    memory_id: str
+    codebase_id: str | None
+    scope: str
+    category: str
+    statement: str
+    provenance: str
+    status: str
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeInput:
+    source_stable_key: str
+    target_stable_key: str
+    relation: str
+    provenance: str
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class HuntPlanValue:
+    plan_id: str
+    scan_id: str
+    strategy: str
+    context_hash: str
+    workflow_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class HuntTaskInput:
+    task_key: str
+    title: str
+    objective: str
+    task_data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class HuntTaskValue:
+    task_id: str
+    plan_id: str
+    task_key: str
+    title: str
+    objective: str
+    task_data: dict[str, Any]
+    state: str
+    attempt_count: int
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class FindingEvidenceInput:
+    evidence_type: str
+    path: str
+    start_line: int | None
+    end_line: int | None
+    redacted_content: str
+    content_hash: str
+    provenance: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingDependencyInput:
+    dependency_type: str
+    dependency_key: str
+    dependency_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingEvidenceValue(FindingEvidenceInput):
+    evidence_id: str
+    sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class FindingDependencyValue(FindingDependencyInput):
+    finding_dependency_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeInput:
+    knowledge_id: str
+    topic: str
+    vulnerability_class: str
+    ecosystem: str
+    framework: str
+    content: str
+    source_url: str
+    source_title: str
+    source_updated_at: str
+    provenance: str
+    confidence: float
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeValue(KnowledgeInput):
+    tenant_id: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingValue:
+    finding_id: str
+    tenant_id: str
+    codebase_id: str
+    scan_id: str
+    fingerprint: str
+    title: str
+    vulnerability_class: str
+    severity: str
+    state: str
+    confidence: float
+    summary: str
+    impact: str
+    remediation: str
+    validation: dict[str, Any]
+    evidence: list[FindingEvidenceValue]
+    dependencies: list[FindingDependencyValue]
 
 
 class CodeScanningRepository:
@@ -172,6 +384,840 @@ class CodeScanningRepository:
         self.session.flush()
         return _scan_value(record)
 
+    def save_security_ir(
+        self,
+        snapshot_id: str,
+        source_files: Iterable[SourceFileInput],
+        symbols: Iterable[SymbolInput],
+        edges: Iterable[EdgeInput],
+    ) -> bool:
+        """Persist Security IR for an immutable snapshot; no-op if already indexed."""
+
+        already_indexed = self.session.scalar(
+            select(SourceFileRecord.source_file_id).where(SourceFileRecord.snapshot_id == snapshot_id).limit(1)
+        )
+        if already_indexed is not None:
+            return False
+        file_id_by_path: dict[str, str] = {}
+        for item in source_files:
+            source_file_id = f"srcfile-{_hash(snapshot_id, item.path)}"
+            file_id_by_path[item.path] = source_file_id
+            self.session.add(
+                SourceFileRecord(
+                    source_file_id=source_file_id,
+                    snapshot_id=snapshot_id,
+                    path=item.path,
+                    language=item.language,
+                    content_hash=item.content_hash,
+                    size_bytes=item.size_bytes,
+                )
+            )
+        symbol_id_by_key: dict[str, str] = {}
+        for item in symbols:
+            source_file_id = file_id_by_path.get(item.path)
+            if source_file_id is None:
+                raise PersistenceConflictError(f"symbol path {item.path!r} has no matching source file")
+            current_symbol_id = symbol_id(item.stable_key)
+            symbol_id_by_key[item.stable_key] = current_symbol_id
+            self.session.add(
+                SymbolRecord(
+                    symbol_version_id=f"symv-{_hash(snapshot_id, item.stable_key)}",
+                    symbol_id=current_symbol_id,
+                    snapshot_id=snapshot_id,
+                    source_file_id=source_file_id,
+                    stable_key=item.stable_key,
+                    qualified_name=item.qualified_name,
+                    signature=item.signature,
+                    kind=item.kind,
+                    path=item.path,
+                    start_line=item.start_line,
+                    end_line=item.end_line,
+                    content_hash=item.content_hash,
+                    content=item.content,
+                )
+            )
+        for item in edges:
+            source_symbol_id = symbol_id_by_key.get(item.source_stable_key)
+            target_symbol_id = symbol_id_by_key.get(item.target_stable_key)
+            if source_symbol_id is None or target_symbol_id is None:
+                continue
+            self.session.add(
+                CodeEdgeRecord(
+                    edge_id=f"edge-{_hash(snapshot_id, source_symbol_id, target_symbol_id, item.relation)}",
+                    snapshot_id=snapshot_id,
+                    source_symbol_id=source_symbol_id,
+                    target_symbol_id=target_symbol_id,
+                    relation=item.relation,
+                    provenance=item.provenance,
+                    confidence=item.confidence,
+                    attributes={},
+                )
+            )
+        self.session.flush()
+        return True
+
+    def count_symbols(self, snapshot_id: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count()).select_from(SymbolRecord).where(SymbolRecord.snapshot_id == snapshot_id)
+            )
+            or 0
+        )
+
+    def list_symbols(
+        self,
+        snapshot_id: str,
+        symbol_ids: Iterable[str] | None = None,
+        paths: Iterable[str] | None = None,
+    ) -> list[SymbolValue]:
+        """Load a bounded symbol set from one immutable tenant-owned snapshot."""
+
+        snapshot = self.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise PersistenceConflictError("snapshot does not exist in the tenant scope")
+        query = select(SymbolRecord).where(SymbolRecord.snapshot_id == snapshot_id)
+        selected_ids = list(dict.fromkeys(symbol_ids or []))
+        selected_paths = list(dict.fromkeys(paths or []))
+        if selected_ids:
+            query = query.where(SymbolRecord.symbol_id.in_(selected_ids))
+        if selected_paths:
+            query = query.where(SymbolRecord.path.in_(selected_paths))
+        rows = self.session.execute(
+            query.order_by(SymbolRecord.path, SymbolRecord.start_line, SymbolRecord.symbol_id)
+        ).scalars().all()
+        return [
+            SymbolValue(
+                symbol_id=row.symbol_id,
+                stable_key=row.stable_key,
+                qualified_name=row.qualified_name,
+                kind=row.kind,
+                path=row.path,
+                start_line=row.start_line,
+                end_line=row.end_line,
+                content_hash=row.content_hash,
+                content=row.content,
+            )
+            for row in rows
+        ]
+
+    def reverse_dependencies(self, snapshot_id: str, changed_symbol_ids: Iterable[str], hops: int = 3) -> list[str]:
+        """Walk call edges backwards so a changed callee revalidates its callers."""
+
+        affected = set(changed_symbol_ids)
+        frontier = set(affected)
+        for _ in range(hops):
+            if not frontier:
+                break
+            rows = (
+                self.session.execute(
+                    select(CodeEdgeRecord.source_symbol_id).where(
+                        CodeEdgeRecord.snapshot_id == snapshot_id,
+                        CodeEdgeRecord.target_symbol_id.in_(frontier),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            frontier = set(rows) - affected
+            affected.update(frontier)
+        return sorted(affected)
+
+    def upsert_security_memory(
+        self,
+        memory_id: str,
+        codebase_id: str | None,
+        scope: str,
+        category: str,
+        statement: str,
+        provenance: str,
+        status: str = "active",
+    ) -> SecurityMemoryValue:
+        if codebase_id is not None and self.get_codebase(codebase_id) is None:
+            raise PersistenceConflictError("memory codebase does not exist in the tenant scope")
+        record = self.session.scalar(
+            select(SecurityMemoryRecord).where(
+                SecurityMemoryRecord.memory_id == memory_id,
+                SecurityMemoryRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            record = SecurityMemoryRecord(
+                memory_id=memory_id,
+                tenant_id=self.tenant_id,
+                codebase_id=codebase_id,
+                scope=scope,
+                category=category,
+                statement=statement,
+                provenance=provenance,
+                status=status,
+                version=1,
+            )
+            self.session.add(record)
+        else:
+            changed = (
+                record.codebase_id != codebase_id
+                or record.scope != scope
+                or record.category != category
+                or record.statement != statement
+                or record.provenance != provenance
+                or record.status != status
+            )
+            record.codebase_id = codebase_id
+            record.scope = scope
+            record.category = category
+            record.statement = statement
+            record.provenance = provenance
+            record.status = status
+            if changed:
+                record.version += 1
+        self.session.flush()
+        return _security_memory_value(record)
+
+    def active_security_memories(
+        self,
+        codebase_id: str,
+        category: str,
+    ) -> list[SecurityMemoryValue]:
+        rows = self.session.execute(
+            select(SecurityMemoryRecord)
+            .where(
+                SecurityMemoryRecord.tenant_id == self.tenant_id,
+                SecurityMemoryRecord.status == "active",
+                or_(
+                    SecurityMemoryRecord.codebase_id == codebase_id,
+                    SecurityMemoryRecord.codebase_id.is_(None),
+                ),
+                or_(
+                    SecurityMemoryRecord.category == category,
+                    SecurityMemoryRecord.category == "all",
+                ),
+            )
+            .order_by(SecurityMemoryRecord.memory_id)
+        ).scalars().all()
+        return [_security_memory_value(row) for row in rows]
+
+    def link_finding_symbols(
+        self,
+        codebase_id: str,
+        fingerprint: str,
+        snapshot_id: str,
+        symbol_ids: Iterable[str],
+    ) -> None:
+        finding = self.session.scalar(
+            select(FindingRecord).where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingRecord.fingerprint == fingerprint,
+            )
+        )
+        if finding is None:
+            raise PersistenceConflictError("finding does not exist in the tenant scope")
+        known = {item.symbol_id: item for item in self.list_symbols(snapshot_id, symbol_ids=symbol_ids)}
+        for symbol_id in dict.fromkeys(symbol_ids):
+            symbol = known.get(symbol_id)
+            if symbol is None:
+                continue
+            dependency_key = symbol.stable_key
+            existing = self.session.scalar(
+                select(FindingDependencyRecord).where(
+                    FindingDependencyRecord.finding_id == finding.finding_id,
+                    FindingDependencyRecord.dependency_type == "symbol",
+                    FindingDependencyRecord.dependency_key == dependency_key,
+                )
+            )
+            if existing is None:
+                self.session.add(
+                    FindingDependencyRecord(
+                        finding_dependency_id=f"dep-{_hash(finding.finding_id, 'symbol', dependency_key)}",
+                        finding_id=finding.finding_id,
+                        dependency_type="symbol",
+                        dependency_key=dependency_key,
+                        dependency_hash=symbol.content_hash,
+                    )
+                )
+            else:
+                existing.dependency_hash = symbol.content_hash
+        self.session.flush()
+
+    def prior_findings_for_symbols(
+        self,
+        codebase_id: str,
+        snapshot_id: str,
+        symbol_ids: Iterable[str],
+    ) -> list[str]:
+        symbols = self.list_symbols(snapshot_id, symbol_ids=symbol_ids)
+        keys = [item.stable_key for item in symbols]
+        if not keys:
+            return []
+        rows = self.session.execute(
+            select(FindingRecord.fingerprint)
+            .join(FindingDependencyRecord, FindingDependencyRecord.finding_id == FindingRecord.finding_id)
+            .where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingDependencyRecord.dependency_type == "symbol",
+                FindingDependencyRecord.dependency_key.in_(keys),
+            )
+            .distinct()
+            .order_by(FindingRecord.fingerprint)
+        ).scalars().all()
+        return list(rows)
+
+    def create_hunt_plan(
+        self,
+        plan_id: str,
+        scan_id: str,
+        strategy: str,
+        context_hash: str,
+        workflow_version: str,
+    ) -> HuntPlanValue:
+        existing = self.session.scalar(
+            select(HuntPlanRecord).where(
+                HuntPlanRecord.scan_id == scan_id,
+                HuntPlanRecord.context_hash == context_hash,
+            )
+        )
+        if existing:
+            return _hunt_plan_value(existing)
+        record = HuntPlanRecord(
+            plan_id=plan_id,
+            scan_id=scan_id,
+            strategy=strategy,
+            context_hash=context_hash,
+            workflow_version=workflow_version,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return _hunt_plan_value(record)
+
+    def create_hunt_tasks(self, plan_id: str, tasks: Iterable[HuntTaskInput]) -> list[HuntTaskValue]:
+        values: list[HuntTaskValue] = []
+        for item in tasks:
+            existing = self.session.scalar(
+                select(HuntTaskRecord).where(
+                    HuntTaskRecord.plan_id == plan_id,
+                    HuntTaskRecord.task_key == item.task_key,
+                )
+            )
+            if existing:
+                values.append(_hunt_task_value(existing))
+                continue
+            record = HuntTaskRecord(
+                task_id=f"task-{_hash(plan_id, item.task_key)}",
+                plan_id=plan_id,
+                task_key=item.task_key,
+                title=item.title,
+                objective=item.objective,
+                task_data=item.task_data,
+                state="planned",
+                attempt_count=0,
+            )
+            self.session.add(record)
+            self.session.flush()
+            values.append(_hunt_task_value(record))
+        return values
+
+    def get_hunt_plan(self, plan_id: str) -> HuntPlanValue | None:
+        record = self.session.get(HuntPlanRecord, plan_id)
+        return _hunt_plan_value(record) if record else None
+
+    def ensure_hunt_plan(
+        self,
+        plan_id: str,
+        scan_id: str,
+        workflow_version: str,
+        strategy: str | None = None,
+    ) -> HuntPlanValue:
+        """Get-or-create a plan cache row; fills in `strategy` once it is known."""
+
+        record = self.session.get(HuntPlanRecord, plan_id)
+        if record is None:
+            record = HuntPlanRecord(
+                plan_id=plan_id,
+                scan_id=scan_id,
+                strategy=strategy or "",
+                context_hash=f"pending-{plan_id}",
+                workflow_version=workflow_version,
+            )
+            self.session.add(record)
+            self.session.flush()
+            return _hunt_plan_value(record)
+        if strategy is not None and record.strategy != strategy:
+            record.strategy = strategy
+            self.session.flush()
+        return _hunt_plan_value(record)
+
+    def upsert_hunt_task(
+        self,
+        plan_id: str,
+        task_key: str,
+        title: str,
+        objective: str,
+        task_data: dict[str, Any],
+    ) -> HuntTaskValue:
+        """Get-or-create a task row, overwriting `title`/`objective`/`task_data` in place.
+
+        Leasing state (`state`, `attempt_count`, `lease_owner`, `lease_expires_at`) is
+        left untouched so this is safe to call again once knowledge resolution fills
+        in a task's final `task_data`.
+        """
+
+        record = self.session.scalar(
+            select(HuntTaskRecord).where(
+                HuntTaskRecord.plan_id == plan_id,
+                HuntTaskRecord.task_key == task_key,
+            )
+        )
+        if record is None:
+            record = HuntTaskRecord(
+                task_id=f"task-{_hash(plan_id, task_key)}",
+                plan_id=plan_id,
+                task_key=task_key,
+                title=title,
+                objective=objective,
+                task_data=task_data,
+                state="planned",
+                attempt_count=0,
+            )
+            self.session.add(record)
+        else:
+            record.title = title
+            record.objective = objective
+            record.task_data = task_data
+        self.session.flush()
+        return _hunt_task_value(record)
+
+    def list_hunt_tasks(self, plan_id: str) -> list[HuntTaskValue]:
+        rows = (
+            self.session.execute(
+                select(HuntTaskRecord).where(HuntTaskRecord.plan_id == plan_id).order_by(HuntTaskRecord.created_at)
+            )
+            .scalars()
+            .all()
+        )
+        return [_hunt_task_value(row) for row in rows]
+
+    def lease_next_task(
+        self,
+        plan_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> HuntTaskValue | None:
+        """Compare-and-swap lease: portable across PostgreSQL and the SQLite test adapter."""
+
+        if not worker_id.strip():
+            raise ValueError("worker_id is required")
+        moment = now or datetime.now(UTC)
+        considered: set[str] = set()
+        while True:
+            filters = [
+                HuntTaskRecord.plan_id == plan_id,
+                HuntTaskRecord.state.in_(("planned", "leased")),
+                or_(HuntTaskRecord.lease_expires_at.is_(None), HuntTaskRecord.lease_expires_at <= moment),
+            ]
+            if considered:
+                filters.append(HuntTaskRecord.task_id.not_in(considered))
+            candidate_id = self.session.scalar(
+                select(HuntTaskRecord.task_id).where(*filters).order_by(HuntTaskRecord.created_at).limit(1)
+            )
+            if candidate_id is None:
+                return None
+            considered.add(candidate_id)
+            result = self.session.execute(
+                update(HuntTaskRecord)
+                .where(
+                    HuntTaskRecord.task_id == candidate_id,
+                    HuntTaskRecord.state.in_(("planned", "leased")),
+                    or_(HuntTaskRecord.lease_expires_at.is_(None), HuntTaskRecord.lease_expires_at <= moment),
+                )
+                .values(
+                    state="leased",
+                    lease_owner=worker_id,
+                    lease_expires_at=moment + timedelta(seconds=lease_seconds),
+                    attempt_count=HuntTaskRecord.attempt_count + 1,
+                )
+            )
+            if result.rowcount == 1:
+                self.session.flush()
+                return _hunt_task_value(self.session.get(HuntTaskRecord, candidate_id))
+            # Lost the race to another worker; retry against the next eligible candidate.
+
+    def complete_task(self, task_id: str, worker_id: str) -> bool:
+        """Idempotent: returns False if already completed or leased by someone else."""
+
+        result = self.session.execute(
+            update(HuntTaskRecord)
+            .where(
+                HuntTaskRecord.task_id == task_id,
+                HuntTaskRecord.lease_owner == worker_id,
+                HuntTaskRecord.state == "leased",
+            )
+            .values(state="completed", lease_owner=None, lease_expires_at=None)
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def release_task(self, task_id: str, worker_id: str) -> bool:
+        """Return a leased task to the pool so another worker can retry it."""
+
+        result = self.session.execute(
+            update(HuntTaskRecord)
+            .where(
+                HuntTaskRecord.task_id == task_id,
+                HuntTaskRecord.lease_owner == worker_id,
+                HuntTaskRecord.state == "leased",
+            )
+            .values(state="planned", lease_owner=None, lease_expires_at=None)
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def save_finding(
+        self,
+        finding_id: str,
+        codebase_id: str,
+        scan_id: str,
+        fingerprint: str,
+        title: str,
+        vulnerability_class: str,
+        severity: str,
+        state: str,
+        confidence: float,
+        summary: str,
+        impact: str,
+        remediation: str,
+        validation: dict[str, Any],
+        evidence: Iterable[FindingEvidenceInput],
+        dependencies: Iterable[FindingDependencyInput],
+    ) -> FindingValue:
+        """Upsert by (codebase_id, fingerprint) so re-verification updates in place."""
+
+        record = self.session.scalar(
+            select(FindingRecord).where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingRecord.fingerprint == fingerprint,
+            )
+        )
+        if record is None:
+            record = FindingRecord(
+                finding_id=finding_id,
+                tenant_id=self.tenant_id,
+                codebase_id=codebase_id,
+                scan_id=scan_id,
+                fingerprint=fingerprint,
+                title=title,
+                vulnerability_class=vulnerability_class,
+                severity=severity,
+                state=state,
+                confidence=confidence,
+                summary=summary,
+                impact=impact,
+                remediation=remediation,
+                validation=validation,
+            )
+            self.session.add(record)
+        else:
+            record.scan_id = scan_id
+            record.title = title
+            record.vulnerability_class = vulnerability_class
+            record.severity = severity
+            record.state = state
+            record.confidence = confidence
+            record.summary = summary
+            record.impact = impact
+            record.remediation = remediation
+            record.validation = validation
+        self.session.flush()
+
+        self.session.execute(delete(FindingEvidenceRecord).where(FindingEvidenceRecord.finding_id == record.finding_id))
+        self.session.execute(
+            delete(FindingDependencyRecord).where(FindingDependencyRecord.finding_id == record.finding_id)
+        )
+        for sequence, item in enumerate(evidence):
+            self.session.add(
+                FindingEvidenceRecord(
+                    evidence_id=f"ev-{_hash(record.finding_id, str(sequence))}",
+                    finding_id=record.finding_id,
+                    sequence=sequence,
+                    evidence_type=item.evidence_type,
+                    path=item.path,
+                    start_line=item.start_line,
+                    end_line=item.end_line,
+                    redacted_content=item.redacted_content,
+                    content_hash=item.content_hash,
+                    provenance=item.provenance,
+                )
+            )
+        for item in dependencies:
+            self.session.add(
+                FindingDependencyRecord(
+                    finding_dependency_id=f"dep-{_hash(record.finding_id, item.dependency_type, item.dependency_key)}",
+                    finding_id=record.finding_id,
+                    dependency_type=item.dependency_type,
+                    dependency_key=item.dependency_key,
+                    dependency_hash=item.dependency_hash,
+                )
+            )
+        self.session.flush()
+        found = self.get_finding(record.finding_id)
+        assert found is not None
+        return found
+
+    def get_finding(self, finding_id: str) -> FindingValue | None:
+        record = self.session.scalar(
+            select(FindingRecord).where(
+                FindingRecord.finding_id == finding_id,
+                FindingRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            return None
+        evidence_rows = (
+            self.session.execute(
+                select(FindingEvidenceRecord)
+                .where(FindingEvidenceRecord.finding_id == finding_id)
+                .order_by(FindingEvidenceRecord.sequence)
+            )
+            .scalars()
+            .all()
+        )
+        dependency_rows = (
+            self.session.execute(
+                select(FindingDependencyRecord).where(FindingDependencyRecord.finding_id == finding_id)
+            )
+            .scalars()
+            .all()
+        )
+        return FindingValue(
+            finding_id=record.finding_id,
+            tenant_id=record.tenant_id,
+            codebase_id=record.codebase_id,
+            scan_id=record.scan_id,
+            fingerprint=record.fingerprint,
+            title=record.title,
+            vulnerability_class=record.vulnerability_class,
+            severity=record.severity,
+            state=record.state,
+            confidence=record.confidence,
+            summary=record.summary,
+            impact=record.impact,
+            remediation=record.remediation,
+            validation=record.validation,
+            evidence=[
+                FindingEvidenceValue(
+                    evidence_type=row.evidence_type,
+                    path=row.path,
+                    start_line=row.start_line,
+                    end_line=row.end_line,
+                    redacted_content=row.redacted_content,
+                    content_hash=row.content_hash,
+                    provenance=row.provenance,
+                    evidence_id=row.evidence_id,
+                    sequence=row.sequence,
+                )
+                for row in evidence_rows
+            ],
+            dependencies=[
+                FindingDependencyValue(
+                    dependency_type=row.dependency_type,
+                    dependency_key=row.dependency_key,
+                    dependency_hash=row.dependency_hash,
+                    finding_dependency_id=row.finding_dependency_id,
+                )
+                for row in dependency_rows
+            ],
+        )
+
+    def upsert_knowledge(self, item: KnowledgeInput) -> KnowledgeValue:
+        """Content-addressed insert: identical content always resolves to the same row."""
+
+        record = self.session.scalar(
+            select(SecurityKnowledgeRecord).where(
+                SecurityKnowledgeRecord.tenant_id == self.tenant_id,
+                SecurityKnowledgeRecord.content_hash == item.content_hash,
+            )
+        )
+        if record is not None:
+            return _knowledge_value(record)
+        record = SecurityKnowledgeRecord(
+            knowledge_id=item.knowledge_id,
+            tenant_id=self.tenant_id,
+            topic=item.topic,
+            vulnerability_class=item.vulnerability_class,
+            ecosystem=item.ecosystem,
+            framework=item.framework,
+            content=item.content,
+            source_url=item.source_url,
+            source_title=item.source_title,
+            source_updated_at=item.source_updated_at,
+            provenance=item.provenance,
+            confidence=item.confidence,
+            content_hash=item.content_hash,
+            status="active",
+        )
+        self.session.add(record)
+        self.session.flush()
+        return _knowledge_value(record)
+
+    def search_knowledge(self, query: str, limit: int) -> list[KnowledgeValue]:
+        runtime = load_json("runtime/agent.json")
+        minimum_length = int(runtime["knowledge_search_min_token_characters"])
+        stop_words = {str(item).lower() for item in runtime["knowledge_search_stop_words"]}
+        tokens = [
+            token
+            for token in re.findall(r"[a-zA-Z0-9_.+-]+", query.lower())
+            if len(token) >= minimum_length and token not in stop_words
+        ]
+        search_values = [value for value in dict.fromkeys([query.strip(), *tokens]) if value]
+
+        rows_by_id: dict[str, SecurityKnowledgeRecord] = {}
+        matches: dict[str, int] = {}
+        for value in search_values:
+            term = f"%{value}%"
+            rows = (
+                self.session.execute(
+                    select(SecurityKnowledgeRecord).where(
+                        SecurityKnowledgeRecord.tenant_id == self.tenant_id,
+                        SecurityKnowledgeRecord.status == "active",
+                        or_(
+                            SecurityKnowledgeRecord.topic.ilike(term),
+                            SecurityKnowledgeRecord.content.ilike(term),
+                            SecurityKnowledgeRecord.vulnerability_class.ilike(term),
+                            SecurityKnowledgeRecord.ecosystem.ilike(term),
+                            SecurityKnowledgeRecord.framework.ilike(term),
+                        ),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                rows_by_id[row.knowledge_id] = row
+                matches[row.knowledge_id] = matches.get(row.knowledge_id, 0) + 1
+
+        ranked = sorted(
+            rows_by_id.values(),
+            key=lambda row: (-matches[row.knowledge_id], -row.confidence, row.topic),
+        )
+        return [_knowledge_value(row) for row in ranked[:limit]]
+
+    def record_knowledge_usage(
+        self,
+        usage_id: str,
+        scan_id: str,
+        task_id: str,
+        knowledge_id: str | None,
+        query: str,
+        decision: str,
+        decision_confidence: float,
+        reason: str,
+    ) -> None:
+        record = self.session.get(KnowledgeUsageRecord, usage_id)
+        if record is None:
+            record = KnowledgeUsageRecord(
+                usage_id=usage_id,
+                scan_id=scan_id,
+                task_id=task_id,
+                knowledge_id=knowledge_id,
+                query=query,
+                decision=decision,
+                decision_confidence=decision_confidence,
+                reason=reason,
+            )
+            self.session.add(record)
+        else:
+            if record.scan_id != scan_id or record.task_id != task_id:
+                raise PersistenceConflictError("usage_id already identifies another hunt task")
+            record.knowledge_id = knowledge_id
+            record.query = query
+            record.decision = decision
+            record.decision_confidence = decision_confidence
+            record.reason = reason
+        self.session.flush()
+
+
+def security_ir_inputs(
+    root: Path, graph: StructuralGraph
+) -> tuple[list[SourceFileInput], list[SymbolInput], list[EdgeInput]]:
+    """Adapt a Tree-sitter Security IR graph into ORM-ready, stable-identity records.
+
+    Symbol identity excludes content: ordinary symbols use path, kind, and
+    qualified name. Only true overloads add a normalized signature digest and
+    occurrence, so body and line changes preserve identity.
+    """
+
+    source_files: list[SourceFileInput] = []
+    symbol_inputs: list[SymbolInput] = []
+    stable_keys_by_path_name: dict[tuple[str, str], list[str]] = {}
+    stable_keys_by_name: dict[str, list[str]] = {}
+    symbols_by_path: dict[str, list[Symbol]] = {}
+    for symbol in graph.symbols + graph.routes:
+        symbols_by_path.setdefault(symbol.path, []).append(symbol)
+
+    for file_ir in sorted(graph.files, key=lambda item: item.path):
+        path = root / file_ir.path
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            size_bytes = path.stat().st_size
+        except OSError:
+            continue
+        source_files.append(SourceFileInput(file_ir.path, file_ir.language, file_ir.content_hash, size_bytes))
+        lines = text.splitlines()
+        entries = sorted(symbols_by_path.get(file_ir.path, []), key=lambda item: item.line)
+        if not entries:
+            entries = [Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file")]
+        identity_counts: dict[tuple[str, str], int] = {}
+        for entry in entries:
+            name = entry.qualified_name or entry.name
+            identity_counts[(entry.kind, name)] = identity_counts.get((entry.kind, name), 0) + 1
+        duplicate_occurrences: dict[tuple[str, str, str], int] = {}
+        for entry in entries:
+            name = entry.qualified_name or entry.name
+            line = entry.line
+            end = max(line, entry.end_line)
+            content = "\n".join(line_text.rstrip() for line_text in lines[line - 1 : min(end, len(lines))]).strip()
+            stable_key = f"{file_ir.path}:{entry.kind}:{name}"
+            if identity_counts[(entry.kind, name)] > 1:
+                signature_hash = hashlib.sha256(entry.signature.strip().encode("utf-8")).hexdigest()[:16]
+                duplicate_key = (entry.kind, name, signature_hash)
+                occurrence = duplicate_occurrences.get(duplicate_key, 0)
+                duplicate_occurrences[duplicate_key] = occurrence + 1
+                stable_key = f"{stable_key}:{signature_hash}:{occurrence}"
+            symbol_inputs.append(
+                SymbolInput(
+                    stable_key=stable_key,
+                    qualified_name=name,
+                    kind=entry.kind,
+                    path=file_ir.path,
+                    start_line=line,
+                    end_line=max(line, end),
+                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    content=content,
+                    signature=entry.signature,
+                )
+            )
+            aliases = {entry.name, name, entry.name.rsplit(".", 1)[-1], name.rsplit(".", 1)[-1]}
+            for alias in aliases:
+                stable_keys_by_path_name.setdefault((file_ir.path, alias), []).append(stable_key)
+                stable_keys_by_name.setdefault(alias, []).append(stable_key)
+
+    edge_inputs: list[EdgeInput] = []
+    seen_edges: set[tuple[str, str]] = set()
+    for call in graph.calls:
+        source_keys = stable_keys_by_path_name.get((call.path, call.caller), [])
+        callee_name = call.callee.rsplit(".", 1)[-1]
+        for source_key in source_keys:
+            for target_key in stable_keys_by_name.get(callee_name, []):
+                if source_key == target_key or (source_key, target_key) in seen_edges:
+                    continue
+                seen_edges.add((source_key, target_key))
+                edge_inputs.append(EdgeInput(source_key, target_key, "calls", "tree_sitter"))
+
+    return source_files, symbol_inputs, edge_inputs
+
+
 @contextmanager
 def unit_of_work(
     factory: sessionmaker[Session],
@@ -218,4 +1264,61 @@ def _scan_value(record: ScanRunRecord) -> ScanRunValue:
         record.state,
         record.mode,
         record.workflow_version,
+    )
+
+
+def _hunt_plan_value(record: HuntPlanRecord) -> HuntPlanValue:
+    return HuntPlanValue(
+        record.plan_id,
+        record.scan_id,
+        record.strategy,
+        record.context_hash,
+        record.workflow_version,
+    )
+
+
+def _knowledge_value(record: SecurityKnowledgeRecord) -> KnowledgeValue:
+    return KnowledgeValue(
+        knowledge_id=record.knowledge_id,
+        topic=record.topic,
+        vulnerability_class=record.vulnerability_class,
+        ecosystem=record.ecosystem,
+        framework=record.framework,
+        content=record.content,
+        source_url=record.source_url,
+        source_title=record.source_title,
+        source_updated_at=record.source_updated_at,
+        provenance=record.provenance,
+        confidence=record.confidence,
+        content_hash=record.content_hash,
+        tenant_id=record.tenant_id,
+        status=record.status,
+    )
+
+
+def _security_memory_value(record: SecurityMemoryRecord) -> SecurityMemoryValue:
+    return SecurityMemoryValue(
+        memory_id=record.memory_id,
+        codebase_id=record.codebase_id,
+        scope=record.scope,
+        category=record.category,
+        statement=record.statement,
+        provenance=record.provenance,
+        status=record.status,
+        version=record.version,
+    )
+
+
+def _hunt_task_value(record: HuntTaskRecord) -> HuntTaskValue:
+    return HuntTaskValue(
+        record.task_id,
+        record.plan_id,
+        record.task_key,
+        record.title,
+        record.objective,
+        record.task_data,
+        record.state,
+        record.attempt_count,
+        record.lease_owner,
+        record.lease_expires_at,
     )

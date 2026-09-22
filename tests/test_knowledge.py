@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from plaidnox_sast.cache_telemetry import LiteLLMCacheTelemetry
 from plaidnox_sast.jev import JevAnswer
 from plaidnox_sast.knowledge import (
     JevKnowledgeRouter,
@@ -11,7 +12,6 @@ from plaidnox_sast.knowledge import (
     KnowledgeStore,
     LiteLLMKnowledgeProvider,
 )
-from plaidnox_sast.cache_telemetry import LiteLLMCacheTelemetry
 
 
 class FakeJevClient:

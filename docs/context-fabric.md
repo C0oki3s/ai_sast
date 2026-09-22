@@ -10,9 +10,9 @@ PostgreSQL is the production store through the SQLAlchemy models under
 
 - `src/plaidnox_sast/assets/migrations/postgresql/0001_code_scanning_core.sql`
 
-The existing SQLite migrations and `ContextFabricStore` remain a transitional
-local/test adapter while ORM repositories are completed. They are not the
-production deployment contract.
+The SQLite migrations and `ContextFabricStore` remain an explicit local/test
+adapter. With `PLAIDNOX_DATABASE_URL` configured, both Context Fabric and the
+knowledge store use tenant-scoped PostgreSQL repositories.
 
 ## Snapshot lifecycle
 

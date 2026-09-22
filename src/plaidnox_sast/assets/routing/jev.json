@@ -4,37 +4,22 @@
       "type": "choice",
       "instructions": "Choose the minimum analysis depth needed for this security candidate.",
       "criteria": {
-        "fast": "A localized security signal with no cross-boundary reasoning required.",
-        "standard": "A security-relevant candidate needing nearby control-flow or configuration review.",
-        "deep": "A potentially high-impact, attacker-controlled, cross-function, authorization, SSRF, or business-logic path requiring adversarial validation."
+        "fast": "The supplied evidence is local and can be verified from one bounded code or configuration slice.",
+        "standard": "Verification requires multiple related symbols, controls, or configuration facts.",
+        "deep": "Verification requires a long or uncertain path, stateful workflow, indirect behavior, external semantics, or high-impact adversarial falsification."
       }
     },
     "context_profile": {
       "type": "choice",
-      "instructions": "Choose the security context profile that best fits the candidate.",
+      "instructions": "Choose the evidence-expansion strategy needed to verify this candidate. This is not a vulnerability taxonomy.",
       "criteria": {
-        "injection": "Untrusted data can reach an interpreter, query, template, or command sink.",
-        "authentication": "Identity, token, session, or credential handling.",
-        "authorization": "Access control, tenancy, object ownership, or privilege checks.",
-        "ssrf": "Server-side requests or browser-backed renderers can reach remote or internal resources.",
-        "business_logic": "Security impact depends on workflow state, values, or domain invariants.",
-        "secrets": "Credential or sensitive configuration exposure.",
-        "general": "A security candidate outside the named profiles."
+        "local": "One bounded source or configuration region is sufficient.",
+        "cross_file": "Definitions, callers, callees, wrappers, registrations, or configuration across files are required.",
+        "stateful": "Stored data, queues, caches, retries, concurrency, or multi-step workflow state must be reconstructed.",
+        "external_knowledge": "Version-specific platform, framework, protocol, advisory, or dependency behavior must be researched.",
+        "mixed": "More than one expansion strategy is materially required."
       }
     }
   },
-  "confidence_threshold": 0.85,
-  "deep_categories": ["authorization", "business_logic", "ssrf"],
-  "task_classes": {
-    "injection": "injection",
-    "ssrf": "ssrf",
-    "authorization": "authorization",
-    "authentication": "authentication",
-    "business_logic": "business_logic",
-    "crypto": "crypto",
-    "secrets": "secrets",
-    "dependency": "dependency",
-    "infrastructure": "infrastructure",
-    "data_exposure": "data_exposure"
-  }
+  "confidence_threshold": 0.85
 }

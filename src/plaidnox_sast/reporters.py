@@ -30,6 +30,12 @@ def to_sarif(result: ScanResult) -> dict[str, Any]:
     rules: dict[str, dict[str, Any]] = {}
     entries: list[dict[str, Any]] = []
     for finding in result.findings:
+        classifications = _classification_references(finding)
+        classification_tags = [
+            str(reference["identifier"])
+            for reference in classifications
+            if reference.get("identifier")
+        ]
         rules.setdefault(
             finding.rule_id,
             {
@@ -37,7 +43,10 @@ def to_sarif(result: ScanResult) -> dict[str, Any]:
                 "name": finding.title.replace(" ", ""),
                 "shortDescription": {"text": finding.title},
                 "help": {"text": finding.remediation},
-                "properties": {"tags": [finding.vulnerability_class, "security"]},
+                "properties": {
+                    "tags": list(dict.fromkeys([finding.vulnerability_class, *classification_tags, "security"])),
+                    "classifications": classifications,
+                },
             },
         )
         region: dict[str, Any] = {
@@ -80,6 +89,7 @@ def to_sarif(result: ScanResult) -> dict[str, Any]:
                     "contextProfile": finding.metadata.get("context_profile"),
                     "jevModelTier": finding.metadata.get("jev_model_tier"),
                     "jevNeedsDeepHunt": finding.metadata.get("jev_needs_deep_hunt"),
+                    "classifications": classifications,
                 },
             }
         )
@@ -174,7 +184,7 @@ def write_markdown(result: ScanResult, destination: Path) -> None:
                 "",
                 f"**Severity:** {finding.severity.value.upper()}  ",
                 f"**Confidence:** {finding.confidence:.0%}  ",
-                f"**CWE:** {finding.vulnerability_class}  ",
+                f"**Classification:** {_markdown_text(finding.vulnerability_class)}  ",
                 f"**Location:** `{finding.evidence.path}:{finding.evidence.start_line}`  ",
                 f"**Fingerprint:** `{finding.fingerprint}`  ",
                 f"**Validation:** {finding.validator}",
@@ -198,6 +208,19 @@ def write_markdown(result: ScanResult, destination: Path) -> None:
             lines.extend(
                 f"- `{item['path']}:{item['start_line']}-{item['end_line']}`"
                 for item in alternatives
+            )
+        classifications = _classification_references(finding)
+        if classifications:
+            lines.extend(["", "**Classification references**", ""])
+            lines.extend(
+                f"- {_markdown_text(str(item.get('namespace', '')))}: "
+                f"{_markdown_text(str(item.get('identifier', '')))}"
+                + (
+                    f" — {_markdown_text(str(item.get('name', '')))}"
+                    if item.get("name")
+                    else ""
+                )
+                for item in classifications
             )
     lines.extend(
         [
@@ -229,4 +252,20 @@ def _alternative_evidence(finding: Finding) -> list[dict[str, Any]]:
         for item in values
         if isinstance(item, dict)
         and {"path", "start_line", "end_line"}.issubset(item)
+    ]
+
+
+def _classification_references(finding: Finding) -> list[dict[str, str]]:
+    values = finding.metadata.get("classification_references", [])
+    if not isinstance(values, list):
+        return []
+    return [
+        {
+            "namespace": str(item.get("namespace", "")),
+            "identifier": str(item.get("identifier", "")),
+            "name": str(item.get("name", "")),
+            "source_url": str(item.get("source_url", "")),
+        }
+        for item in values
+        if isinstance(item, dict) and item.get("identifier")
     ]

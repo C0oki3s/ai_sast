@@ -15,10 +15,6 @@
             "type": "string",
             "maxLength": 240
           },
-          "cwe": {
-            "type": "string",
-            "maxLength": 120
-          },
           "severity": {
             "type": "string",
             "enum": [
@@ -116,12 +112,56 @@
               "controls_checked",
               "missing_evidence"
             ]
+          },
+          "vulnerability_class": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1
+          },
+          "classification_references": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "namespace": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "identifier": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                "name": {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                "source_url": {
+                  "type": "string",
+                  "maxLength": 1000
+                }
+              },
+              "required": [
+                "namespace",
+                "identifier",
+                "name",
+                "source_url"
+              ]
+            }
+          },
+          "business_impact": {
+            "type": "string",
+            "maxLength": 1600
           }
         },
         "required": [
           "confirmed",
           "title",
-          "cwe",
+          "vulnerability_class",
+          "classification_references",
+          "business_impact",
           "severity",
           "confidence",
           "category",

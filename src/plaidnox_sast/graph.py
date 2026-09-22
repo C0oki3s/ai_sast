@@ -11,12 +11,12 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
-import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .assets import load_json
 
@@ -29,6 +29,7 @@ class Symbol:
     end_line: int = 0
     kind: str = "symbol"
     qualified_name: str = ""
+    signature: str = ""
 
 
 @dataclass(slots=True)
@@ -225,7 +226,7 @@ def build_structural_graph(
         language = _language_for(path, config)
         file_ir = _tree_sitter_ir(relative, language, content, config)
         if file_ir is None:
-            file_ir = _fallback_ir(relative, language, content, config)
+            file_ir = _fallback_ir(relative, language, content)
             graph.fallback_files += 1
         else:
             graph.tree_sitter_files += 1
@@ -262,6 +263,8 @@ def _tree_sitter_ir(
         current = enclosing
         if node.type in symbol_types:
             name_node = node.child_by_field_name("name")
+            if name_node is None and node.parent is not None:
+                name_node = node.parent.child_by_field_name("name")
             name = _node_text(name_node, content) if name_node is not None else ""
             if name:
                 current = f"{enclosing}.{name}" if enclosing else name
@@ -273,6 +276,7 @@ def _tree_sitter_ir(
                         node.end_point[0] + 1,
                         node.type,
                         current,
+                        _symbol_signature(node, content),
                     )
                 )
         if node.type in import_types:
@@ -300,21 +304,10 @@ def _fallback_ir(
     relative: str,
     language: str,
     content: bytes,
-    config: dict[str, Any],
 ) -> FileSecurityIR:
     text = content.decode("utf-8", errors="replace")
-    symbols: list[Symbol] = []
-    for pattern in config["fallback_symbol_patterns"]:
-        compiled = re.compile(str(pattern))
-        for number, line in enumerate(text.splitlines(), 1):
-            match = compiled.search(line)
-            if match:
-                name = next((value for value in match.groups() if value), "")
-                if name:
-                    symbols.append(Symbol(name, relative, number, number, "fallback", name))
-    if not symbols:
-        name = Path(relative).stem
-        symbols.append(Symbol(name, relative, 1, max(1, len(text.splitlines())), "file", name))
+    name = Path(relative).as_posix()
+    symbols = [Symbol(name, relative, 1, max(1, len(text.splitlines())), "file", name, "")]
     return FileSecurityIR(
         path=relative,
         language=language or "unknown",
@@ -332,3 +325,12 @@ def _language_for(path: Path, config: dict[str, Any]) -> str:
 
 def _node_text(node: Any, content: bytes) -> str:
     return content[node.start_byte : node.end_byte].decode("utf-8", errors="replace").strip()
+
+
+def _symbol_signature(node: Any, content: bytes) -> str:
+    """Return a body-independent structural signature for overloaded symbols."""
+
+    body = node.child_by_field_name("body")
+    end_byte = body.start_byte if body is not None else min(node.end_byte, node.start_byte + 2000)
+    raw = content[node.start_byte:end_byte].decode("utf-8", errors="replace")
+    return " ".join(raw.split())

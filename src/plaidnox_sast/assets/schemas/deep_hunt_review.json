@@ -170,6 +170,83 @@
     "regression_test": {
       "type": "string",
       "maxLength": 2400
+    },
+    "classification_references": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "identifier": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "source_url": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        },
+        "required": [
+          "namespace",
+          "identifier",
+          "name",
+          "source_url"
+        ]
+      }
+    },
+    "context_requests": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "definition",
+              "callers",
+              "callees",
+              "imports",
+              "route",
+              "window"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "kind",
+          "path",
+          "symbol",
+          "start_line",
+          "end_line"
+        ]
+      }
     }
   },
   "required": [
@@ -177,6 +254,7 @@
     "confidence",
     "title",
     "vulnerability_class",
+    "classification_references",
     "severity",
     "message",
     "business_impact",
@@ -191,6 +269,7 @@
     "gate_results",
     "evidence_locations",
     "proof_plan",
-    "regression_test"
+    "regression_test",
+    "context_requests"
   ]
 }

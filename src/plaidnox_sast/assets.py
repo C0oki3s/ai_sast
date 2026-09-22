@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
-
 
 ASSET_ROOT = Path(__file__).resolve().parent / "assets"
 
@@ -15,7 +14,7 @@ class AssetConfigurationError(RuntimeError):
     """Raised when a deployable runtime asset is missing or malformed."""
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_text(relative_path: str) -> str:
     path = _asset_path(relative_path)
     try:
@@ -24,7 +23,7 @@ def load_text(relative_path: str) -> str:
         raise AssetConfigurationError(f"Unable to read runtime asset: {relative_path}") from exc
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_json(relative_path: str) -> dict[str, Any]:
     try:
         value = json.loads(load_text(relative_path))

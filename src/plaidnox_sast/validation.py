@@ -19,12 +19,12 @@ class FindingValidator:
         validator = "candidate-intake"
         evidence = candidate.evidence
 
-        guidance = load_json("policy/cwe_guidance.json")
-        guidance_item = guidance.get(candidate.vulnerability_class, guidance["default"])
-        impact = str(guidance_item["impact"])
-        remediation = str(guidance_item["remediation"])
-        if candidate.metadata.get("ai_remediation"):
-            remediation = str(candidate.metadata["ai_remediation"])
+        impact = str(candidate.metadata.get("ai_business_impact") or candidate.message)
+        defaults = load_json("policy/candidate_defaults.json")
+        remediation = str(
+            candidate.metadata.get("ai_remediation")
+            or defaults["provisional_remediation"]
+        )
         score = priority_score(candidate.severity, confidence, route.depth.value)
         return Finding(
             fingerprint=candidate_fingerprint(repository, candidate),

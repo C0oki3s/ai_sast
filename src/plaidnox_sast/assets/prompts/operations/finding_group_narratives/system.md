@@ -1,4 +1,5 @@
 {% include "_partials/core_contract.md" %}
+{% include "_partials/classification_protocol.md" %}
 
 ## Consolidated narratives
 

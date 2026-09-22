@@ -4,6 +4,8 @@
   "discovery_max_workers": 4,
   "sweep_max_workers": 2,
   "discovery_max_continuations": 8,
+  "context_expansion_max_rounds": 2,
+  "context_expansion_max_requests_per_round": 5,
   "repository_entrypoint_limit": 100,
   "repository_route_limit": 1000,
   "repository_symbol_limit": 5000,

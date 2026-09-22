@@ -28,7 +28,7 @@ These rules are mandatory for every PlaidNox Code Scanning change.
 2. **PostgreSQL is the production database.** Runtime persistence uses
    SQLAlchemy 2.x ORM repositories. Ordered PostgreSQL DDL remains in standalone
    migration files so operators can review and apply it independently. SQLite
-   is a temporary local/test adapter and is not the production architecture.
+   is an explicit local/test adapter and is not the production architecture.
 3. **No secrets in context or model input.** Secrets stay in a secret manager or
    process environment and are redacted before code is stored, cached, logged,
    or sent to any model.
@@ -189,14 +189,13 @@ linked findings, while an unrelated change does not spend model tokens on them.
 
 ### Phase 3 — PostgreSQL ORM persistence
 
-Status: schema, ORM model, tenant-scoped repository, and transaction foundation
-implemented; runtime store migration and worker concurrency remain.
+Status: implemented and verified against the checked-in PostgreSQL migration.
 
 - Establish SQLAlchemy models, scoped sessions, typed repositories, and unit of
   work boundaries for Code Scanning.
 - Apply independently reviewable PostgreSQL migrations.
-- Move Context Fabric, knowledge, hunt plans/tasks, findings, and model audit
-  records from runner-local SQLite adapters into PostgreSQL repositories.
+- Run Context Fabric, knowledge, hunt plans/tasks, findings, evidence, and
+  exact symbol dependencies through PostgreSQL repositories in production.
 - Add tenant isolation keys, optimistic concurrency, timestamps, retention
   state, indexes, transaction tests, and backup/restore verification.
 - Keep SQLite only for isolated unit tests or an explicitly labelled local mode.

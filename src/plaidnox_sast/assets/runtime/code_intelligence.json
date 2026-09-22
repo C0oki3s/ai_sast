@@ -10,5 +10,7 @@
   "maximum_recon_hits_per_query": 60,
   "recon_context_lines_before": 6,
   "recon_context_lines_after": 12,
-  "maximum_recon_evidence_characters": 240000
+  "maximum_recon_evidence_characters": 240000,
+  "maximum_reverse_dependency_depth": 12,
+  "maximum_context_packet_slices": 24
 }

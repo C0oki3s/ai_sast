@@ -8,7 +8,7 @@ from pathlib import Path
 from .ai import PlaidNoxDeepHuntAgent, load_env_file
 from .assets import load_json
 from .config import load_local_project_config
-from .context_fabric import ContextFabricStore
+from .context_fabric import ContextFabric, ContextFabricStore
 from .graph import build_structural_graph
 from .jev import JevClient
 from .knowledge import (
@@ -18,6 +18,13 @@ from .knowledge import (
     research_provider_from_environment,
 )
 from .models import PolicyDecision
+from .persistence import (
+    DatabaseConfigurationError,
+    DatabaseSettings,
+    PostgresContextFabricStore,
+    PostgresKnowledgeStore,
+)
+from .persistence import session_factory as build_session_factory
 from .pipeline import SastPipeline
 from .reporters import write_json, write_markdown, write_repository_context, write_sarif
 from .saist import DatadogSAISTDetector
@@ -33,6 +40,12 @@ def _parser() -> argparse.ArgumentParser:
     local.add_argument("--revision", help="immutable source revision; defaults to a content-derived snapshot hash")
     local.add_argument("--output", type=Path, required=True)
     local.add_argument("--enforce", action="store_true")
+    local.add_argument(
+        "--propose-patches",
+        action="store_true",
+        help="propose a unified-diff fix for each verified finding and verify it against an ephemeral "
+        "rescanned copy; never writes to the scanned path",
+    )
     _add_ai_arguments(local)
     _add_engine_arguments(local)
     return parser
@@ -71,7 +84,13 @@ def _add_engine_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--context-store",
         type=Path,
-        help="transitional local-only SQLite context cache path",
+        help="explicit local-only SQLite context cache path",
+    )
+    parser.add_argument(
+        "--tenant-id",
+        default="default",
+        help="tenant scope for PostgreSQL persistence; only meaningful when "
+        "PLAIDNOX_DATABASE_URL is configured",
     )
 
 
@@ -85,8 +104,21 @@ def main(argv: list[str] | None = None) -> int:
     deep_hunt_agent.set_event_sink(lambda event: print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True))
     if args.saist and not args.saist_bin:
         raise SystemExit("--saist requires --saist-bin pointing to the upstream datadog-saist binary")
+
+    try:
+        database_settings = DatabaseSettings.from_environment()
+        persistence_session_factory = build_session_factory(database_settings)
+    except DatabaseConfigurationError:
+        persistence_session_factory = None
+
+    # PostgreSQL owns production context/knowledge whenever configured;
+    # --context-store is used only by the explicit local adapter.
     context_database = args.context_store or output / "context-fabric.sqlite"
-    context_store = ContextFabricStore(context_database)
+    context_store = (
+        PostgresContextFabricStore(persistence_session_factory, args.tenant_id)
+        if persistence_session_factory is not None
+        else ContextFabricStore(context_database)
+    )
     deep_hunt_agent.configure_context_fabric(context_store)
     jev_client = (
         JevClient.from_environment(args.jev_model)
@@ -94,7 +126,11 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     if jev_client is not None:
-        knowledge_store = KnowledgeStore(context_database)
+        knowledge_store = (
+            PostgresKnowledgeStore(persistence_session_factory, args.tenant_id)
+            if persistence_session_factory is not None
+            else KnowledgeStore(context_database)
+        )
         deep_hunt_agent.configure_knowledge(
             KnowledgeCoordinator(
                 knowledge_store,
@@ -107,14 +143,17 @@ def main(argv: list[str] | None = None) -> int:
     pipeline = SastPipeline(
         saist_detector=DatadogSAISTDetector(args.saist_bin) if args.saist else None,
         jev_client=jev_client,
+        session_factory=persistence_session_factory,
+        tenant_id=args.tenant_id,
     )
     result = pipeline.scan_snapshot(
         args.path,
         args.codebase,
         revision=args.revision,
         deep_hunt_agent=deep_hunt_agent,
+        propose_patches=args.propose_patches,
     )
-    _record_context_base(context_database, result, args.path)
+    _record_context_base(context_store, result, args.path)
     decision = result.policy.decision
     finding_count = len(result.findings)
     write_json(result, output / "report.json")
@@ -136,13 +175,13 @@ def main(argv: list[str] | None = None) -> int:
             indent=2,
         )
     )
-    if args.enforce and decision is PolicyDecision.BLOCK:
+    if args.enforce and decision in (PolicyDecision.BLOCK, PolicyDecision.INCOMPLETE):
         return 2
     return 0
 
 
-def _record_context_base(context_store: Path | None, result, root: Path) -> None:
-    """Persist the source-snapshot understanding in the transitional local store."""
+def _record_context_base(context_store: ContextFabric | None, result, root: Path) -> None:
+    """Record the reusable snapshot through the configured persistence adapter."""
     if context_store is None:
         return
     config = load_local_project_config(root)
@@ -151,7 +190,7 @@ def _record_context_base(context_store: Path | None, result, root: Path) -> None
         exclude=config.exclude,
         max_file_bytes=config.max_file_bytes,
     )
-    context = ContextFabricStore(context_store).create_base(result.codebase, result.revision, root, graph)
+    context = context_store.create_base(result.codebase, result.revision, root, graph)
     result.repository_context["context_fabric"] = {
         "context_id": context.context_id,
         "revision": context.commit,

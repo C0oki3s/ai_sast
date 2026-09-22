@@ -6,15 +6,22 @@ import threading
 import pytest
 
 from plaidnox_sast.ai import (
-    AIResponseError,
     AIRepositoryContext,
+    AIResponseError,
     HuntPlan,
     HuntTask,
     PlaidNoxDeepHuntAgent,
     load_env_file,
 )
 from plaidnox_sast.graph import build_structural_graph
-from plaidnox_sast.models import Candidate, Evidence, Finding, FindingState, Severity
+from plaidnox_sast.models import (
+    Candidate,
+    Evidence,
+    Finding,
+    FindingState,
+    ModelTier,
+    Severity,
+)
 
 
 def review_payload(**overrides):
@@ -23,6 +30,14 @@ def review_payload(**overrides):
             "confidence": 0.91,
             "title": "Server-side request through PDF renderer",
             "vulnerability_class": "CWE-918",
+            "classification_references": [
+                {
+                    "namespace": "CWE",
+                    "identifier": "CWE-918",
+                    "name": "Server-Side Request Forgery",
+                    "source_url": "https://cwe.mitre.org/data/definitions/918.html",
+                }
+            ],
             "severity": "high",
             "message": "Request input reaches a browser-backed renderer.",
             "business_impact": "An attacker can make the renderer access protected resources.",
@@ -52,6 +67,7 @@ def review_payload(**overrides):
             ],
             "proof_plan": "Submit controlled content and observe the renderer request boundary.",
             "regression_test": "Assert remote resources are rejected for attacker-controlled report content.",
+            "context_requests": [],
         }
     payload.update(overrides)
     return payload
@@ -185,6 +201,47 @@ app.post("/reports", async (req, res) => {
     assert "<redacted-mongodb-uri>" in supplied
 
 
+def test_ai_review_routes_to_the_model_configured_for_the_jev_model_tier(sample_repo):
+    (sample_repo / "app.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/reports', async (req, res) => {\n"
+        "  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+        "});\n"
+    )
+    client = FakeClient()
+    agent = PlaidNoxDeepHuntAgent(client, model="test-model")
+
+    agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
+    assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
+    assert client.responses.kwargs["model"] != "test-model"
+
+    agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
+    assert client.responses.kwargs["model"] == agent.model_by_tier["fast"]
+
+    agent.review(sample_repo, deep_candidate(), finding())
+    assert client.responses.kwargs["model"] == "test-model"
+
+
+def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
+    (sample_repo / "app.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/reports', async (req, res) => {\n"
+        "  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+        "});\n"
+    )
+    client = FakeClient()
+    candidate = deep_candidate()
+    candidate.message = "Leak via mongodb+srv://admin:secret@host/db in the discovery message"
+    review = PlaidNoxDeepHuntAgent(client, model="test-model").review(sample_repo, candidate, finding())
+
+    assert review.supported is True
+    supplied = client.responses.kwargs["input"][1]["content"]
+    assert "mongodb+srv://admin:secret" not in supplied
+    assert "<redacted-mongodb-uri>" in supplied
+
+
 def test_ai_review_keeps_sensitive_contents_out_of_metadata_review(sample_repo):
     candidate = deep_candidate()
     candidate.metadata["sensitive_evidence"] = True
@@ -214,6 +271,197 @@ def test_metadata_review_rejects_invented_source_locations(sample_repo):
 
     with pytest.raises(AIResponseError, match="invented source-code evidence"):
         PlaidNoxDeepHuntAgent(FakeClient()).review(sample_repo, candidate, finding())
+
+
+def test_ai_review_resolves_an_on_demand_context_request_before_the_final_verdict(sample_repo):
+    (sample_repo / "app.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/reports', async (req, res) => {\n"
+        "  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+        "});\n"
+    )
+    first_round = review_payload(
+        supported=False,
+        rejection_reason="Evidence gap: the imports of app.js are not yet available.",
+        evidence_gaps=["Need to see the imports of app.js before ruling on reachability."],
+        context_requests=[
+            {"kind": "window", "path": "app.js", "symbol": "", "start_line": 1, "end_line": 2}
+        ],
+    )
+    second_round = review_payload()
+    client = QueueClient([first_round, second_round])
+
+    review = PlaidNoxDeepHuntAgent(client).review(sample_repo, deep_candidate(), finding())
+
+    assert review.supported is True
+    assert len(client.responses.requests) == 2
+    second_request_payload = json.loads(client.responses.requests[1]["input"][1]["content"])
+    expansions = second_request_payload["context_expansions"]
+    assert len(expansions) == 1
+    assert expansions[0]["kind"] == "window"
+    assert expansions[0]["resolved"] is True
+    assert "express" in expansions[0]["content"]
+
+
+def test_ai_review_stops_requesting_context_at_the_configured_round_limit(sample_repo):
+    (sample_repo / "app.js").write_text("const express = require('express');\n")
+    always_requesting = review_payload(
+        supported=False,
+        rejection_reason="Evidence gap: still need more context.",
+        evidence_gaps=["Still need more context."],
+        evidence_locations=[],
+        context_requests=[
+            {"kind": "window", "path": "app.js", "symbol": "", "start_line": 1, "end_line": 1}
+        ],
+    )
+    client = QueueClient([always_requesting, always_requesting, always_requesting])
+
+    review = PlaidNoxDeepHuntAgent(client).review(sample_repo, deep_candidate(), finding())
+
+    assert review.supported is False
+    assert len(client.responses.requests) == 3
+
+
+def test_metadata_review_rejects_an_on_demand_context_request(sample_repo):
+    candidate = deep_candidate()
+    candidate.metadata["sensitive_evidence"] = True
+    payload = review_payload(
+        evidence_locations=[],
+        context_requests=[
+            {"kind": "window", "path": "app.js", "symbol": "", "start_line": 1, "end_line": 1}
+        ],
+    )
+
+    with pytest.raises(AIResponseError, match="on-demand source or Security IR expansion"):
+        PlaidNoxDeepHuntAgent(FakeClient(payload)).review(sample_repo, candidate, finding())
+
+
+PATCH_TEXT = (
+    "--- a/app.js\n"
+    "+++ b/app.js\n"
+    "@@ -1,5 +1,5 @@\n"
+    " const express = require('express');\n"
+    " const app = express();\n"
+    " app.post('/reports', async (req, res) => {\n"
+    "-  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+    "+  return html_to_pdf.generatePdf({ content: sanitize(req.body.name) });\n"
+    " });\n"
+)
+
+
+def patch_proposal_payload(**overrides):
+    payload = {
+        "proposed": True,
+        "patch": PATCH_TEXT,
+        "summary": "Sanitize report content before passing it to the PDF renderer.",
+        "files_changed": ["app.js"],
+        "risk_notes": "Assumes a sanitize() helper is already available in this module.",
+        "confidence": 0.8,
+        "rejection_reason": "",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_reports_fixture(sample_repo):
+    (sample_repo / "app.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/reports', async (req, res) => {\n"
+        "  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+        "});\n"
+    )
+    verified = finding()
+    verified.evidence = Evidence(
+        "app.js", 4, 4, "html_to_pdf.generatePdf({ content: req.body.name });", "POST /reports",
+        "html_to_pdf.generatePdf", [],
+    )
+    verified.metadata["deep_hunt"] = review_payload(
+        evidence_locations=[{"path": "app.js", "start_line": 4, "end_line": 4, "role": "origin"}]
+    )
+    return verified
+
+
+def test_ai_proposes_a_patch_and_verifies_it_fixes_the_finding(sample_repo):
+    verified = _write_reports_fixture(sample_repo)
+    original_source = (sample_repo / "app.js").read_text()
+    fixed_review = review_payload(
+        supported=False,
+        rejection_reason="Content is now sanitized before reaching the renderer.",
+        evidence_gaps=[],
+        evidence_locations=[],
+    )
+    client = SchemaClient(
+        {
+            "plaidnox_patch_proposal": patch_proposal_payload(),
+            "plaidnox_security_review": fixed_review,
+        }
+    )
+    agent = PlaidNoxDeepHuntAgent(client)
+
+    proposal = agent.propose_patch(sample_repo, verified)
+    assert proposal.proposed is True
+    assert proposal.files_changed == ["app.js"]
+
+    verification = agent.verify_patch(sample_repo, verified, proposal)
+    assert verification.applied is True
+    assert verification.verified is True
+    assert verification.rescan_supported is False
+    assert (sample_repo / "app.js").read_text() == original_source
+
+
+def test_ai_patch_proposal_rejects_a_diff_whose_headers_do_not_match_files_changed(sample_repo):
+    verified = _write_reports_fixture(sample_repo)
+    client = FakeClient(patch_proposal_payload(files_changed=["other.js"]))
+
+    with pytest.raises(AIResponseError, match="declared files did not match"):
+        PlaidNoxDeepHuntAgent(client).propose_patch(sample_repo, verified)
+
+
+def test_ai_patch_proposal_declines_without_a_reason_is_rejected(sample_repo):
+    verified = _write_reports_fixture(sample_repo)
+    client = FakeClient(
+        patch_proposal_payload(proposed=False, patch="", files_changed=[], rejection_reason="")
+    )
+
+    with pytest.raises(AIResponseError, match="declined without an evidence-backed reason"):
+        PlaidNoxDeepHuntAgent(client).propose_patch(sample_repo, verified)
+
+
+def test_verify_patch_reports_an_unapplied_patch_without_touching_the_repository(sample_repo):
+    verified = _write_reports_fixture(sample_repo)
+    original_source = (sample_repo / "app.js").read_text()
+    broken_patch = patch_proposal_payload(
+        patch=(
+            "--- a/app.js\n"
+            "+++ b/app.js\n"
+            "@@ -1,5 +1,5 @@\n"
+            " this context line does not match the file\n"
+            "-neither does this one\n"
+            "+so the patch cannot apply\n"
+        )
+    )
+    agent = PlaidNoxDeepHuntAgent(FakeClient(broken_patch))
+    proposal = agent.propose_patch(sample_repo, verified)
+
+    verification = agent.verify_patch(sample_repo, verified, proposal)
+    assert verification.applied is False
+    assert verification.verified is False
+    assert (sample_repo / "app.js").read_text() == original_source
+
+
+def test_verify_patch_skips_the_rescan_when_no_patch_was_proposed(sample_repo):
+    verified = _write_reports_fixture(sample_repo)
+    payload = patch_proposal_payload(
+        proposed=False, patch="", files_changed=[], rejection_reason="Not confident enough to fix this safely."
+    )
+    agent = PlaidNoxDeepHuntAgent(FakeClient(payload))
+    declined = agent.propose_patch(sample_repo, verified)
+
+    verification = agent.verify_patch(sample_repo, verified, declined)
+    assert verification.applied is False
+    assert verification.verified is False
 
 
 def test_env_loader_does_not_evaluate_shell_content(tmp_path, monkeypatch):
@@ -308,7 +556,16 @@ app.get("/users/:id", async (req, res) => {
                     {
                         "confirmed": True,
                         "title": "Potential missing ownership check",
-                        "cwe": "CWE-639",
+                        "vulnerability_class": "missing object ownership enforcement",
+                        "classification_references": [
+                            {
+                                "namespace": "CWE",
+                                "identifier": "CWE-639",
+                                "name": "Authorization Bypass Through User-Controlled Key",
+                                "source_url": "https://cwe.mitre.org/data/definitions/639.html",
+                            }
+                        ],
+                        "business_impact": "An authenticated actor may read another actor's object.",
                         "severity": "high",
                         "confidence": 0.82,
                         "category": "authorization",
@@ -349,7 +606,8 @@ app.get("/users/:id", async (req, res) => {
     assert context.to_dict()["applications"][0]["app_name"] == "fixture"
     assert failures == 0
     assert len(candidates) == 1
-    assert candidates[0].vulnerability_class == "CWE-639"
+    assert candidates[0].vulnerability_class == "missing object ownership enforcement"
+    assert candidates[0].metadata["classification_references"][0]["identifier"] == "CWE-639"
     assert candidates[0].metadata["ai_discovery"] is True
     assert client.responses.requests[0]["text"]["format"]["name"] == "plaidnox_recon_search_plan"
     assert client.responses.requests[1]["text"]["format"]["name"] == "plaidnox_repository_context"
@@ -500,6 +758,7 @@ def test_ai_consolidates_only_model_grouped_findings():
 
 def test_ai_rejects_consolidation_that_drops_a_finding():
     import pytest
+
     from plaidnox_sast.ai import AIResponseError
 
     first = finding()

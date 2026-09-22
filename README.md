@@ -89,8 +89,10 @@ PLAIDNOX_DATABASE_URL=postgresql+psycopg://user:password@postgres/code_scanning
 
 The deployable schema is
 `src/plaidnox_sast/assets/migrations/postgresql/0001_code_scanning_core.sql`.
-The SQLite Context Fabric adapter remains for local compatibility while runtime
-repositories are migrated; it is not the production database.
+When the database URL is configured, Security IR, Context Fabric, security
+memory, sourced knowledge, hunt plans/tasks, findings, evidence, and finding
+dependencies use PostgreSQL. The SQLite adapters are retained only for local
+operation and isolated tests.
 
 Production images should install the pinned Tree-sitter language pack during
 the image build and run the parser smoke tests there. Workers must not download

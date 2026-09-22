@@ -128,9 +128,10 @@ def test_local_scan_can_record_a_reusable_snapshot_context(sample_repo, tmp_path
         sample_repo, "owner/repo", deep_hunt_agent=_DeepHunt()
     )
     store_path = tmp_path / "durable-context.sqlite"
-    _record_context_base(store_path, result, sample_repo)
+    store = ContextFabricStore(store_path)
+    _record_context_base(store, result, sample_repo)
     first = result.repository_context["context_fabric"]
-    _record_context_base(store_path, result, sample_repo)
+    _record_context_base(store, result, sample_repo)
 
     assert first["context_id"] == result.repository_context["context_fabric"]["context_id"]
     assert result.repository_context["context_fabric"]["reused"] is True

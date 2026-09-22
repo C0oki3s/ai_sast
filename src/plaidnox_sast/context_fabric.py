@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Protocol
 
 from .assets import load_json, load_text
-from .graph import StructuralGraph
+from .graph import StructuralGraph, Symbol
 
 
 def _sha256(value: str) -> str:
@@ -74,12 +75,53 @@ class SecurityContextPacket:
         return data
 
 
-class ContextFabricStore:
-    """SQLite-backed Context Fabric suitable for a runner-local or shared volume.
+class ContextFabric(Protocol):
+    """Persistence-neutral Context Fabric contract used by the scan agent."""
 
-    SQLite keeps the MVP operationally small. A service deployment can replace
-    this adapter with Postgres/object storage while preserving the public model.
-    """
+    def create_base(
+        self,
+        repository: str,
+        commit: str,
+        root: Path,
+        graph: StructuralGraph,
+    ) -> ContextBase: ...
+
+    def create_overlay(
+        self,
+        base: ContextBase,
+        head_commit: str,
+        root: Path,
+        changed_paths: Iterable[str],
+        graph: StructuralGraph,
+    ) -> ContextOverlay: ...
+
+    def add_memory(
+        self,
+        repository: str,
+        scope: str,
+        category: str,
+        statement: str,
+        source: str,
+    ) -> SecurityMemory: ...
+
+    def link_finding(
+        self,
+        repository: str,
+        fingerprint: str,
+        context_id: str,
+        symbol_ids: Iterable[str],
+    ) -> None: ...
+
+    def compile_packet(
+        self,
+        overlay: ContextOverlay,
+        profile: str,
+        max_slices: int | None = None,
+    ) -> SecurityContextPacket: ...
+
+
+class ContextFabricStore:
+    """SQLite Context Fabric adapter for explicit local operation and tests."""
 
     def __init__(self, database: Path) -> None:
         self.database = database
@@ -181,7 +223,16 @@ class ContextFabricStore:
                 [(repository, fingerprint, symbol_id, context_id) for symbol_id in set(symbol_ids)],
             )
 
-    def compile_packet(self, overlay: ContextOverlay, profile: str, max_slices: int = 12) -> SecurityContextPacket:
+    def compile_packet(
+        self,
+        overlay: ContextOverlay,
+        profile: str,
+        max_slices: int | None = None,
+    ) -> SecurityContextPacket:
+        if max_slices is None:
+            max_slices = int(load_json("runtime/code_intelligence.json")["maximum_context_packet_slices"])
+        if max_slices < 1:
+            raise ValueError("max_slices must be positive")
         relevant = list(dict.fromkeys(overlay.changed_symbols + overlay.affected_symbols))[:max_slices]
         with self._connect() as conn:
             rows = []
@@ -228,7 +279,8 @@ class ContextFabricStore:
     def _reverse_dependencies(conn: sqlite3.Connection, context_id: str, changed_symbols: list[str]) -> list[str]:
         affected = set(changed_symbols)
         frontier = set(changed_symbols)
-        for _ in range(3):
+        maximum_depth = int(load_json("runtime/code_intelligence.json")["maximum_reverse_dependency_depth"])
+        for _ in range(maximum_depth):
             if not frontier:
                 break
             placeholders = ",".join("?" for _ in frontier)
@@ -245,12 +297,15 @@ class ContextFabricStore:
         return sorted(affected)
 
 
-def _snapshot_symbols(root: Path, graph: StructuralGraph, only_paths: set[str] | None = None) -> list[tuple[str, str, str, int, str, str]]:
+def _snapshot_symbols(
+    root: Path,
+    graph: StructuralGraph,
+    only_paths: set[str] | None = None,
+) -> list[tuple[str, str, str, int, str, str]]:
     records: list[tuple[str, str, str, int, str, str]] = []
-    symbols_by_path: dict[str, list[tuple[str, int]]] = {}
+    symbols_by_path: dict[str, list[Symbol]] = {}
     for symbol in graph.symbols + graph.routes:
-        identity = symbol.qualified_name or symbol.name
-        symbols_by_path.setdefault(symbol.path, []).append((identity, symbol.line))
+        symbols_by_path.setdefault(symbol.path, []).append(symbol)
     for file_ir in sorted(graph.files, key=lambda item: item.path):
         relative = file_ir.path
         if only_paths is not None and relative not in only_paths:
@@ -260,16 +315,28 @@ def _snapshot_symbols(root: Path, graph: StructuralGraph, only_paths: set[str] |
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        entries = sorted(symbols_by_path.get(relative, []), key=lambda item: item[1]) or [(path.stem, 1)]
         lines = text.splitlines()
-        name_occurrences: dict[str, int] = {}
-        for index, (name, line) in enumerate(entries):
-            end = entries[index + 1][1] - 1 if index + 1 < len(entries) else len(lines)
-            content = _normalise("\n".join(lines[line - 1 : end]))
+        entries = sorted(symbols_by_path.get(relative, []), key=lambda item: item.line)
+        if not entries:
+            entries = [Symbol(relative, relative, 1, max(1, len(lines)), "file", relative, "")]
+        identity_counts: dict[tuple[str, str], int] = {}
+        for symbol in entries:
+            name = symbol.qualified_name or symbol.name
+            identity_counts[(symbol.kind, name)] = identity_counts.get((symbol.kind, name), 0) + 1
+        duplicate_occurrences: dict[tuple[str, str, str], int] = {}
+        for symbol in entries:
+            name = symbol.qualified_name or symbol.name
+            line = symbol.line
+            end = max(symbol.end_line, line)
+            content = _normalise("\n".join(lines[line - 1 : min(end, len(lines))]))
             content_hash = _sha256(content)
-            occurrence = name_occurrences.get(name, 0)
-            name_occurrences[name] = occurrence + 1
-            stable_key = f"{relative}:{name}:{occurrence}"
+            stable_key = f"{relative}:{symbol.kind}:{name}"
+            if identity_counts[(symbol.kind, name)] > 1:
+                signature_hash = _sha256(_normalise(symbol.signature))[:16]
+                duplicate_key = (symbol.kind, name, signature_hash)
+                occurrence = duplicate_occurrences.get(duplicate_key, 0)
+                duplicate_occurrences[duplicate_key] = occurrence + 1
+                stable_key = f"{stable_key}:{signature_hash}:{occurrence}"
             symbol_id = f"sym-{_sha256(stable_key)[:16]}"
             records.append((symbol_id, relative, name, line, content_hash, content))
     return records

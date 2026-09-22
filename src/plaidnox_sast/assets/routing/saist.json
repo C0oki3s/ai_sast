@@ -6,13 +6,5 @@
     "none": "info"
   },
   "default_level": "medium",
-  "category_terms": [
-    "authentication",
-    "authorization",
-    "ssrf",
-    "injection",
-    "secrets",
-    "business_logic"
-  ],
-  "default_category": "general"
+  "default_category": "external-candidate"
 }

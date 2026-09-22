@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .assets import load_json, load_text
-from .jev import JevClient, JevError
 from .cache_telemetry import LiteLLMCacheTelemetry
+from .jev import JevClient, JevError
 from .prompts import render_operation
+from .redaction import redact_payload
 
 
 def _digest(value: str) -> str:
@@ -36,7 +37,7 @@ class KnowledgeEntry:
     knowledge_id: str = ""
     content_hash: str = ""
 
-    def normalised(self) -> "KnowledgeEntry":
+    def normalised(self) -> KnowledgeEntry:
         content_hash = self.content_hash or _digest(
             "\n".join((self.topic.strip(), self.content.strip(), self.source_url.strip()))
         )
@@ -71,6 +72,34 @@ class KnowledgeDecision:
 
 class KnowledgeResearchProvider(Protocol):
     def research(self, query: str, context: dict[str, Any]) -> list[KnowledgeEntry]: ...
+
+
+class SecurityKnowledgeStore(Protocol):
+    """Persistence-neutral knowledge and hunt-plan contract."""
+
+    def upsert(self, entry: KnowledgeEntry) -> KnowledgeEntry: ...
+
+    def search(self, query: str, limit: int | None = None) -> list[KnowledgeEntry]: ...
+
+    def record_usage(
+        self,
+        repository: str,
+        scan_id: str,
+        task_id: str,
+        query: str,
+        decision: KnowledgeDecision,
+        entries: list[KnowledgeEntry],
+    ) -> None: ...
+
+    def save_plan(
+        self,
+        repository: str,
+        commit: str,
+        strategy: str,
+        tasks: list[dict[str, Any]],
+    ) -> str: ...
+
+    def load_plan(self, repository: str, commit: str) -> dict[str, Any] | None: ...
 
 
 class KnowledgeStore:
@@ -279,7 +308,7 @@ class KnowledgeCoordinator:
 
     def __init__(
         self,
-        store: KnowledgeStore,
+        store: SecurityKnowledgeStore,
         router: JevKnowledgeRouter,
         research_provider: KnowledgeResearchProvider | None = None,
     ) -> None:
@@ -390,7 +419,7 @@ class LiteLLMKnowledgeProvider:
         self.config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
 
     @classmethod
-    def from_environment(cls, cache_telemetry: LiteLLMCacheTelemetry) -> "LiteLLMKnowledgeProvider":
+    def from_environment(cls, cache_telemetry: LiteLLMCacheTelemetry) -> LiteLLMKnowledgeProvider:
         from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
 
         config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
@@ -407,7 +436,7 @@ class LiteLLMKnowledgeProvider:
         schema = load_json("schemas/knowledge_research.json")
         system_prompt, user_prompt = render_operation(
             "knowledge_research",
-            {"query": query, "context": context},
+            redact_payload({"query": query, "context": context}),
         )
         response = self.client.responses.create(
             model=self.model,

@@ -75,7 +75,8 @@ def test_jev_escalates_ssrf_to_deep():
     )
     decision = JevRouter().classify(candidate)
     assert decision.depth is Depth.DEEP
-    assert decision.profile == "ssrf"
+    assert decision.profile == "mixed"
+    assert decision.task_class == "ssrf"
     assert decision.model_tier is ModelTier.DEEP
     assert decision.needs_deep_hunt is True
 
@@ -112,7 +113,7 @@ def test_jev_uses_high_confidence_remote_route(monkeypatch):
         "model": "jev-test",
         "answers": {
             "analysis_depth": {"choice": "deep", "confidence": 0.93},
-            "context_profile": {"choice": "authorization", "confidence": 0.91},
+            "context_profile": {"choice": "cross_file", "confidence": 0.91},
         },
     }
     monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
@@ -121,7 +122,7 @@ def test_jev_uses_high_confidence_remote_route(monkeypatch):
     )
     decision = JevRouter(JevClient("test-key", endpoint="https://example.test")).classify(candidate)
     assert decision.depth is Depth.DEEP
-    assert decision.profile == "authorization"
+    assert decision.profile == "cross_file"
     assert decision.reason.startswith("JEV jev-test")
 
 

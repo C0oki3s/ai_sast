@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from .assets import load_json
+from .errors import AIStageError
 from .graph import StructuralGraph
 from .models import Candidate, Evidence, Severity
+from .redaction import redact as _redact
 
 
-class SAISTError(RuntimeError):
+class SAISTError(AIStageError):
     pass
 
 
@@ -77,8 +79,14 @@ def parse_saist_sarif(payload: dict[str, Any], root: Path, graph: StructuralGrap
             start = int(region.get("startLine", 1))
             end = int(region.get("endLine", start))
             tags = rule.get("properties", {}).get("tags", [])
-            vulnerability_class = next((str(tag).upper() for tag in tags if re.fullmatch(r"CWE-\d+", str(tag).upper())), "CWE-000")
-            category = _category(tags, rule_id)
+            classification_references = _classification_references(tags, rule)
+            properties = rule.get("properties", {})
+            vulnerability_class = str(
+                properties.get("vulnerability_class")
+                or properties.get("weakness_id")
+                or (classification_references[0]["identifier"] if classification_references else rule_id)
+            )
+            category = _category(rule, result)
             symbol = graph.symbol_at(path, start)
             title = str(rule.get("shortDescription", {}).get("text") or rule_id)
             routing = load_json("routing/saist.json")
@@ -92,7 +100,12 @@ def parse_saist_sarif(payload: dict[str, Any], root: Path, graph: StructuralGrap
                 confidence=float(result.get("properties", {}).get("confidence", 0.70)),
                 message=str(result.get("message", {}).get("text", title)),
                 evidence=Evidence(path, start, end, _redact(str(region.get("snippet", {}).get("text", ""))), symbol, rule_id, [symbol, category, rule_id]),
-                metadata={"engine": "datadog-saist", "category": category, "saist_rule_id": rule_id},
+                metadata={
+                    "engine": "datadog-saist",
+                    "category": category,
+                    "saist_rule_id": rule_id,
+                    "classification_references": classification_references,
+                },
             ))
     return candidates
 
@@ -105,15 +118,31 @@ def _relative_path(root: Path, uri: str) -> str:
         return path.as_posix()
 
 
-def _category(tags: list[Any], rule_id: str) -> str:
-    routing = load_json("routing/saist.json")
-    text = " ".join(map(str, tags)).lower() + " " + rule_id.lower()
-    for category in routing["category_terms"]:
-        if category in text:
-            return str(category)
-    return str(routing["default_category"])
+def _category(rule: dict[str, Any], result: dict[str, Any]) -> str:
+    for properties in (result.get("properties", {}), rule.get("properties", {})):
+        for key in ("category", "security_category", "type"):
+            value = str(properties.get(key, "")).strip()
+            if value:
+                return re.sub(r"[^a-z0-9_-]", "-", value.lower()).strip("-")
+    return str(load_json("routing/saist.json")["default_category"])
 
 
-def _redact(value: str) -> str:
-    value = re.sub(r"mongodb(?:\+srv)?://[^\s\"'`]+", "<redacted-mongodb-uri>", value, flags=re.IGNORECASE)
-    return re.sub(r"\b(?:sk|rk)-[A-Za-z0-9_-]{10,}\b", "<redacted-api-key>", value)
+def _classification_references(tags: list[Any], rule: dict[str, Any]) -> list[dict[str, str]]:
+    references: list[dict[str, str]] = []
+    source_url = str(rule.get("helpUri", ""))
+    for raw_tag in tags:
+        identifier = str(raw_tag).strip()
+        if "-" not in identifier:
+            continue
+        namespace, _separator, local_id = identifier.partition("-")
+        if not namespace.isalnum() or not local_id or namespace.upper() != namespace:
+            continue
+        references.append(
+            {
+                "namespace": namespace,
+                "identifier": identifier,
+                "name": "",
+                "source_url": source_url,
+            }
+        )
+    return references

@@ -8,8 +8,9 @@ DDL is stored as ordered SQL files under
 `plaidnox_sast/assets/migrations/postgresql/` and is independently applicable by
 an operator or deployment job.
 
-SQLite remains only for isolated unit tests and the existing local prototype
-while its stores are migrated. New production features must use the ORM layer.
+SQLite remains only for isolated unit tests and explicitly local operation.
+When `PLAIDNOX_DATABASE_URL` is configured, Context Fabric, security knowledge,
+hunt-plan caching, Security IR, and findings all use the ORM layer.
 
 ## Ownership
 

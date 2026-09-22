@@ -1,4 +1,6 @@
 import re
+import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -10,7 +12,17 @@ from plaidnox_sast.persistence.database import (
     DatabaseSettings,
 )
 from plaidnox_sast.persistence.models import Base
-from plaidnox_sast.persistence.repositories import unit_of_work
+from plaidnox_sast.persistence.repositories import (
+    EdgeInput,
+    FindingDependencyInput,
+    FindingEvidenceInput,
+    HuntTaskInput,
+    SourceFileInput,
+    SymbolInput,
+    _hash,
+    security_ir_inputs,
+    unit_of_work,
+)
 
 
 def test_postgresql_configuration_is_external_and_password_is_redacted():
@@ -75,3 +87,205 @@ def test_repository_is_tenant_scoped_and_snapshot_creation_is_idempotent():
 
     assert first.snapshot_id == second.snapshot_id
     assert scan.snapshot_id == "snapshot-1"
+
+
+def test_security_ir_persistence_is_idempotent_and_reveals_callers_via_reverse_dependencies():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    caller = SymbolInput(
+        stable_key="app.js:handleSignin:0",
+        qualified_name="handleSignin",
+        kind="function",
+        path="app.js",
+        start_line=4,
+        end_line=8,
+        content_hash="hash-caller-1",
+        content="function handleSignin() { decodeToken(); }",
+    )
+    callee = SymbolInput(
+        stable_key="app.js:decodeToken:0",
+        qualified_name="decodeToken",
+        kind="function",
+        path="app.js",
+        start_line=1,
+        end_line=3,
+        content_hash="hash-callee-1",
+        content="function decodeToken() { return jwt.decode(token); }",
+    )
+    source_file = SourceFileInput("app.js", "javascript", "file-hash-1", 128)
+    edge = EdgeInput(caller.stable_key, callee.stable_key, "calls", "tree_sitter")
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-hash-1", "context-v1")
+        indexed = repository.save_security_ir(snapshot.snapshot_id, [source_file], [caller, callee], [edge])
+        reindexed = repository.save_security_ir(snapshot.snapshot_id, [source_file], [caller, callee], [edge])
+
+        callee_symbol_id = f"sym-{_hash(callee.stable_key)}"
+        caller_symbol_id = f"sym-{_hash(caller.stable_key)}"
+        affected = repository.reverse_dependencies(snapshot.snapshot_id, [callee_symbol_id])
+
+    assert indexed is True
+    assert reindexed is False
+    assert caller_symbol_id in affected
+
+
+def test_security_ir_symbol_identity_survives_body_and_line_changes(tmp_path):
+    from plaidnox_sast.graph import build_structural_graph
+
+    source = tmp_path / "app.js"
+    source.write_text(
+        "function loadAccount(id) {\n  return database.find(id);\n}\n",
+        encoding="utf-8",
+    )
+    first = security_ir_inputs(tmp_path, build_structural_graph(tmp_path))[1]
+    first_symbol = next(item for item in first if item.qualified_name.endswith("loadAccount"))
+
+    source.write_text(
+        "const moduleVersion = 2;\n\n"
+        "function loadAccount(id) {\n  const normalized = String(id);\n"
+        "  return database.find(normalized);\n}\n",
+        encoding="utf-8",
+    )
+    second = security_ir_inputs(tmp_path, build_structural_graph(tmp_path))[1]
+    second_symbol = next(item for item in second if item.qualified_name.endswith("loadAccount"))
+
+    assert first_symbol.stable_key == second_symbol.stable_key
+    assert first_symbol.content_hash != second_symbol.content_hash
+
+
+def test_hunt_task_leasing_is_concurrency_safe_and_completion_is_idempotent(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'leasing.db'}", connect_args={"timeout": 30})
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-hash-1", "context-v1")
+        scan = repository.start_scan("scan-1", "codebase-1", snapshot.snapshot_id, "deep", "workflow-v1")
+        plan = repository.create_hunt_plan("plan-1", scan.scan_id, "recon", "context-hash-1", "workflow-v1")
+        repository.create_hunt_tasks(
+            plan.plan_id,
+            [HuntTaskInput("task-key-1", "Inspect auth", "Find auth bypass", {"paths": ["app.js"]})],
+        )
+
+    leased = []
+    errors = []
+    lock = threading.Lock()
+
+    def worker(worker_id: str) -> None:
+        try:
+            with unit_of_work(factory, "tenant-a") as repository:
+                task = repository.lease_next_task("plan-1", worker_id, lease_seconds=60)
+                if task is not None:
+                    with lock:
+                        leased.append(task)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(f"worker-{i}",)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert len(leased) == 1
+
+    winner = leased[0]
+    with unit_of_work(factory, "tenant-a") as repository:
+        assert repository.complete_task(winner.task_id, winner.lease_owner) is True
+        assert repository.complete_task(winner.task_id, winner.lease_owner) is False
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        assert repository.lease_next_task("plan-1", "worker-late", lease_seconds=60) is None
+
+
+def test_expired_hunt_task_lease_can_be_reclaimed():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    now = datetime.now(UTC)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-hash-1", "context-v1")
+        scan = repository.start_scan("scan-1", "codebase-1", snapshot.snapshot_id, "deep", "workflow-v1")
+        plan = repository.create_hunt_plan("plan-1", scan.scan_id, "recon", "context-hash-1", "workflow-v1")
+        repository.create_hunt_tasks(
+            plan.plan_id,
+            [HuntTaskInput("task-key-1", "Inspect auth", "Find auth bypass", {})],
+        )
+        first = repository.lease_next_task("plan-1", "worker-1", lease_seconds=1, now=now)
+        second = repository.lease_next_task("plan-1", "worker-2", lease_seconds=60, now=now + timedelta(seconds=5))
+
+    assert first is not None
+    assert second is not None
+    assert second.task_id == first.task_id
+    assert second.lease_owner == "worker-2"
+
+
+def test_finding_round_trips_through_postgresql_shaped_schema():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    evidence = [
+        FindingEvidenceInput("source", "app.js", 5, 5, "const identity = jwt.decode(req.body.token)", "ev-hash-1", "tree_sitter"),
+        FindingEvidenceInput("sink", "app.js", 6, 6, "res.cookie(\"idToken\", req.body.token)", "ev-hash-2", "tree_sitter"),
+    ]
+    dependencies = [FindingDependencyInput("symbol", "app.js:handleSignin:0", "dep-hash-1")]
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-hash-1", "context-v1")
+        scan = repository.start_scan("scan-1", "codebase-1", snapshot.snapshot_id, "deep", "workflow-v1")
+        saved = repository.save_finding(
+            "finding-1",
+            "codebase-1",
+            scan.scan_id,
+            "fingerprint-1",
+            "JWT decoded without verification",
+            "improper-authentication",
+            "high",
+            "validated",
+            0.9,
+            "Token is decoded but never verified before trusting its claims.",
+            "Account takeover via forged tokens.",
+            "Verify the signature before trusting claims.",
+            {"deep_hunt": "supported"},
+            evidence,
+            dependencies,
+        )
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        reloaded = repository.get_finding("finding-1")
+
+    assert reloaded is not None
+    assert [item.evidence_type for item in reloaded.evidence] == ["source", "sink"]
+    assert reloaded.dependencies[0].dependency_key == "app.js:handleSignin:0"
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        updated = repository.save_finding(
+            "finding-1-ignored",
+            "codebase-1",
+            "scan-1",
+            "fingerprint-1",
+            "JWT decoded without verification",
+            "improper-authentication",
+            "high",
+            "false_positive",
+            0.9,
+            "Re-reviewed: the caller re-verifies claims downstream.",
+            "None.",
+            "No action required.",
+            {"deep_hunt": "not-supported"},
+            [],
+            [],
+        )
+
+    assert updated.finding_id == saved.finding_id
+    assert updated.state == "false_positive"
+    assert updated.evidence == []

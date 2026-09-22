@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from sqlalchemy import URL, Engine, create_engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -27,7 +27,7 @@ class DatabaseSettings:
     application_name: str
 
     @classmethod
-    def from_environment(cls, environment: Mapping[str, str] | None = None) -> "DatabaseSettings":
+    def from_environment(cls, environment: Mapping[str, str] | None = None) -> DatabaseSettings:
         runtime = load_json("runtime/database.json")
         values = environment if environment is not None else os.environ
         variable = str(runtime["url_environment_variable"])

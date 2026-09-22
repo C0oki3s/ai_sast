@@ -4,32 +4,40 @@ import fnmatch
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .assets import load_json
-from .context_fabric import ContextFabricStore
+from .cache_telemetry import LiteLLMCacheTelemetry
+from .context_fabric import ContextFabric
+from .errors import AIStageError
 from .graph import (
     RipgrepDiscovery,
     SearchHit,
     StructuralGraph,
+    build_structural_graph,
     readable_source_tree,
     source_files,
 )
 from .knowledge import KnowledgeCoordinator, KnowledgeEntry, LiteLLMKnowledgeProvider
 from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
-from .models import Candidate, Evidence, Finding, Severity
-from .cache_telemetry import LiteLLMCacheTelemetry
+from .models import Candidate, Evidence, Finding, ModelTier, Severity
 from .prompts import render_operation
+from .redaction import redact as _redact
+from .redaction import redact_payload
 
 
-class AIConfigurationError(RuntimeError):
+class AIConfigurationError(AIStageError):
     pass
 
 
-class AIResponseError(RuntimeError):
+class AIResponseError(AIStageError):
     pass
 
 
@@ -51,6 +59,7 @@ class DeepHuntResult:
     severity: str = ""
     message: str = ""
     business_impact: str = ""
+    classification_references: list[dict[str, str]] = field(default_factory=list)
     falsification_attempts: list[str] | None = None
     required_preconditions: list[str] | None = None
     evidence_gaps: list[str] | None = None
@@ -60,6 +69,38 @@ class DeepHuntResult:
     evidence_locations: list[dict[str, Any]] = field(default_factory=list)
     proof_plan: str = ""
     regression_test: str = ""
+    context_requests: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PatchProposal:
+    """An AI-proposed unified diff remediating one already-verified finding."""
+
+    proposed: bool
+    patch: str
+    summary: str
+    files_changed: list[str]
+    risk_notes: str
+    confidence: float
+    rejection_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PatchVerification:
+    """Result of applying a proposed patch to an ephemeral repository copy and rescanning it."""
+
+    applied: bool
+    verified: bool
+    reason: str = ""
+    rescan_supported: bool | None = None
+    rescan_confidence: float | None = None
+    unexpected_failure: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -175,11 +216,14 @@ class PlaidNoxDeepHuntAgent:
         knowledge_coordinator: KnowledgeCoordinator | None = None,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         cache_telemetry: LiteLLMCacheTelemetry | None = None,
-        context_store: ContextFabricStore | None = None,
+        context_store: ContextFabric | None = None,
     ) -> None:
         self.client = client
         model_runtime = load_json("runtime/models.json")
         self.model = model or str(model_runtime["agent_default_model"])
+        self.model_by_tier: dict[str, str] = {
+            str(tier): str(name) for tier, name in model_runtime.get("agent_model_by_tier", {}).items()
+        }
         self.max_output_tokens = max_output_tokens or int(model_runtime["agent_default_max_output_tokens"])
         self.knowledge_coordinator = knowledge_coordinator
         self.event_sink = event_sink
@@ -196,7 +240,7 @@ class PlaidNoxDeepHuntAgent:
         cls,
         model: str | None = None,
         max_output_tokens: int | None = None,
-    ) -> "PlaidNoxDeepHuntAgent":
+    ) -> PlaidNoxDeepHuntAgent:
         try:
             selected_model = model or str(load_json("runtime/models.json")["agent_default_model"])
             client = LiteLLMResponsesClient.from_environment(selected_model)
@@ -218,7 +262,7 @@ class PlaidNoxDeepHuntAgent:
     def configure_knowledge(self, coordinator: KnowledgeCoordinator) -> None:
         self.knowledge_coordinator = coordinator
 
-    def configure_context_fabric(self, store: ContextFabricStore) -> None:
+    def configure_context_fabric(self, store: ContextFabric) -> None:
         self.context_store = store
 
     def configure_source_policy(self, exclude: list[str], max_file_bytes: int) -> None:
@@ -237,6 +281,7 @@ class PlaidNoxDeepHuntAgent:
         candidate: Candidate,
         finding: Finding,
         security_context: str = "",
+        model_tier: ModelTier | None = None,
     ) -> DeepHuntResult:
         self._emit(
             "candidate_verification_started",
@@ -245,63 +290,57 @@ class PlaidNoxDeepHuntAgent:
             line=candidate.evidence.start_line,
         )
         metadata_only = bool(candidate.metadata.get("sensitive_evidence") or candidate.metadata.get("content_read") is False)
-        code_window = "[contents intentionally unavailable]" if metadata_only else _source_window(
-            root, candidate.evidence.path, candidate.evidence.start_line, candidate.evidence.end_line
-        )
-        evidence = {
-            "rule_id": candidate.rule_id,
-            "title": candidate.title,
-            "vulnerability_class": candidate.vulnerability_class,
-            "message": candidate.message,
-            "candidate_confidence": candidate.confidence,
-            "finding_impact": finding.impact,
-            "graph_path": candidate.evidence.graph_path,
-            "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
-            "security_ir_context": {} if metadata_only else _security_ir_context(
-                self.security_graph,
-                candidate.evidence.path,
-                candidate.evidence.start_line,
-            ),
-            "source_window": code_window,
-            "protected_security_context": _redact(
-                security_context[: int(load_json("runtime/agent.json")["security_context_characters"])]
-            ),
-            "metadata_only": metadata_only,
-        }
-        response = self._structured_response(
-            "plaidnox_security_review",
-            load_json("schemas/deep_hunt_review.json"),
-            "metadata_exposure_review" if metadata_only else "security_review",
-            evidence,
-        )
-        try:
-            payload = json.loads(response.output_text)
-            review = DeepHuntResult(
-                supported=bool(payload["supported"]),
-                confidence=float(payload["confidence"]),
-                reasoning=str(payload["reasoning"]),
-                attack_path=str(payload["attack_path"]),
-                remediation_note=str(payload["remediation_note"]),
-                title=str(payload["title"]),
-                vulnerability_class=str(payload["vulnerability_class"]),
-                severity=str(payload["severity"]),
-                message=str(payload["message"]),
-                business_impact=str(payload["business_impact"]),
-                falsification_attempts=[str(item) for item in payload["falsification_attempts"]],
-                required_preconditions=[str(item) for item in payload["required_preconditions"]],
-                evidence_gaps=[str(item) for item in payload["evidence_gaps"]],
-                security_invariant=str(payload["security_invariant"]),
-                rejection_reason=str(payload["rejection_reason"]),
-                gate_results=[dict(item) for item in payload["gate_results"]],
-                evidence_locations=[dict(item) for item in payload["evidence_locations"]],
-                proof_plan=str(payload["proof_plan"]),
-                regression_test=str(payload["regression_test"]),
+        runtime = load_json("runtime/agent.json")
+        max_rounds = int(runtime["context_expansion_max_rounds"])
+        max_requests = int(runtime["context_expansion_max_requests_per_round"])
+        context_expansions: list[dict[str, Any]] = []
+        review: DeepHuntResult | None = None
+        for round_index in range(max_rounds + 1):
+            code_window = "[contents intentionally unavailable]" if metadata_only else _source_window(
+                root, candidate.evidence.path, candidate.evidence.start_line, candidate.evidence.end_line
             )
-        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI review did not match the required schema") from exc
-        if not 0 <= review.confidence <= 1:
-            raise AIResponseError("AI review confidence must be between 0 and 1")
-        _validate_deep_hunt_result(root, candidate, review, metadata_only=metadata_only)
+            evidence = {
+                "rule_id": candidate.rule_id,
+                "title": candidate.title,
+                "vulnerability_class": candidate.vulnerability_class,
+                "message": candidate.message,
+                "candidate_confidence": candidate.confidence,
+                "finding_impact": finding.impact,
+                "graph_path": candidate.evidence.graph_path,
+                "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
+                "security_ir_context": {} if metadata_only else _security_ir_context(
+                    self.security_graph,
+                    candidate.evidence.path,
+                    candidate.evidence.start_line,
+                ),
+                "source_window": code_window,
+                "context_expansions": context_expansions,
+                "protected_security_context": _redact(
+                    security_context[: int(runtime["security_context_characters"])]
+                ),
+                "metadata_only": metadata_only,
+            }
+            response = self._structured_response(
+                "plaidnox_security_review",
+                load_json("schemas/deep_hunt_review.json"),
+                "metadata_exposure_review" if metadata_only else "security_review",
+                evidence,
+                model_tier=model_tier,
+            )
+            review = _deep_hunt_result_from_response(response)
+            _validate_deep_hunt_result(root, candidate, review, metadata_only=metadata_only)
+            if metadata_only and review.context_requests:
+                raise AIResponseError("Metadata-only review requested on-demand source or Security IR expansion")
+            if round_index >= max_rounds or not review.context_requests:
+                break
+            self._emit(
+                "candidate_context_expansion_requested",
+                rule_id=candidate.rule_id,
+                requests=len(review.context_requests),
+                round=round_index + 1,
+            )
+            for request in review.context_requests[:max_requests]:
+                context_expansions.append(_resolve_context_request(root, self.security_graph, request))
         self._emit(
             "candidate_verification_completed",
             rule_id=candidate.rule_id,
@@ -312,8 +351,155 @@ class PlaidNoxDeepHuntAgent:
         return review
 
     # Compatibility with integrations built before the dedicated Deep Hunt name.
-    def review(self, root: Path, candidate: Candidate, finding: Finding, security_context: str = "") -> AIReview:
-        return self.hunt(root, candidate, finding, security_context)
+    def review(
+        self,
+        root: Path,
+        candidate: Candidate,
+        finding: Finding,
+        security_context: str = "",
+        model_tier: ModelTier | None = None,
+    ) -> AIReview:
+        return self.hunt(root, candidate, finding, security_context, model_tier=model_tier)
+
+    def propose_patch(
+        self,
+        root: Path,
+        finding: Finding,
+        model_tier: ModelTier | None = None,
+    ) -> PatchProposal:
+        """Propose the smallest safe unified diff remediating an already-verified finding."""
+        self._emit("patch_proposal_started", fingerprint=finding.fingerprint, path=finding.evidence.path)
+        deep_hunt = finding.metadata.get("deep_hunt", {})
+        evidence_locations = list(deep_hunt.get("evidence_locations", [])) or [
+            {
+                "path": finding.evidence.path,
+                "start_line": finding.evidence.start_line,
+                "end_line": finding.evidence.end_line,
+                "role": "origin",
+            }
+        ]
+        sources = [
+            {
+                "path": str(location.get("path", finding.evidence.path)),
+                "start_line": int(location.get("start_line", finding.evidence.start_line) or 1),
+                "end_line": int(location.get("end_line", finding.evidence.start_line) or 1),
+                "role": str(location.get("role", "")),
+                "content": _source_window(
+                    root,
+                    str(location.get("path", finding.evidence.path)),
+                    int(location.get("start_line", finding.evidence.start_line) or 1),
+                    int(location.get("end_line", finding.evidence.start_line) or 1),
+                ),
+            }
+            for location in evidence_locations
+        ]
+        payload = {
+            "title": finding.title,
+            "vulnerability_class": finding.vulnerability_class,
+            "severity": finding.severity.value,
+            "message": finding.message,
+            "business_impact": finding.impact,
+            "attack_path": str(deep_hunt.get("attack_path", "")),
+            "security_invariant": str(deep_hunt.get("security_invariant", "")),
+            "remediation_note": str(deep_hunt.get("remediation_note", finding.remediation)),
+            "proof_plan": str(deep_hunt.get("proof_plan", "")),
+            "regression_test": str(deep_hunt.get("regression_test", "")),
+            "evidence_sources": sources,
+        }
+        response = self._structured_response(
+            "plaidnox_patch_proposal",
+            load_json("schemas/patch_proposal.json"),
+            "patch_proposal",
+            payload,
+            model_tier=model_tier,
+        )
+        proposal = _patch_proposal_from_response(response)
+        _validate_patch_proposal(root, proposal)
+        self._emit(
+            "patch_proposal_completed",
+            fingerprint=finding.fingerprint,
+            proposed=proposal.proposed,
+            files_changed=len(proposal.files_changed),
+        )
+        return proposal
+
+    def verify_patch(
+        self,
+        root: Path,
+        finding: Finding,
+        proposal: PatchProposal,
+        security_context: str = "",
+        model_tier: ModelTier | None = None,
+    ) -> PatchVerification:
+        """Apply a proposed patch to an ephemeral repository copy and rescan it; never writes to `root`."""
+        if not proposal.proposed:
+            return PatchVerification(applied=False, verified=False, reason="no patch was proposed")
+        self._emit("patch_verification_started", fingerprint=finding.fingerprint)
+        with tempfile.TemporaryDirectory(prefix="plaidnox-patch-") as workspace:
+            tmp_root = Path(workspace) / "snapshot"
+            shutil.copytree(root, tmp_root)
+            result = subprocess.run(
+                ["patch", "-p1", "--forward", "--batch", "--no-backup-if-mismatch"],
+                cwd=tmp_root,
+                input=proposal.patch,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                self._emit("patch_verification_apply_failed", fingerprint=finding.fingerprint)
+                return PatchVerification(
+                    applied=False,
+                    verified=False,
+                    reason=f"patch did not apply cleanly: {(result.stderr or result.stdout).strip()[:400]}",
+                )
+            try:
+                patched_graph = build_structural_graph(
+                    tmp_root, exclude=self.source_excludes, max_file_bytes=self.max_file_bytes
+                )
+            except OSError as exc:
+                return PatchVerification(
+                    applied=True, verified=False, reason=f"could not analyze the patched snapshot: {exc}"
+                )
+            candidate = Candidate(
+                rule_id=finding.rule_id,
+                title=finding.title,
+                vulnerability_class=finding.vulnerability_class,
+                severity=finding.severity,
+                confidence=finding.confidence,
+                message=finding.message,
+                evidence=finding.evidence,
+                metadata={},
+            )
+            previous_graph = self.security_graph
+            self.security_graph = patched_graph
+            try:
+                rescan = self.hunt(tmp_root, candidate, finding, security_context, model_tier=model_tier)
+            except Exception as exc:
+                unexpected = not isinstance(exc, AIStageError)
+                self._emit(
+                    "patch_verification_rescan_failed",
+                    fingerprint=finding.fingerprint,
+                    error_type=type(exc).__name__,
+                )
+                return PatchVerification(
+                    applied=True,
+                    verified=False,
+                    reason=f"rescan failed: {exc}"[:400],
+                    unexpected_failure=unexpected,
+                )
+            finally:
+                self.security_graph = previous_graph
+        verified = not rescan.supported
+        self._emit("patch_verification_completed", fingerprint=finding.fingerprint, verified=verified)
+        return PatchVerification(
+            applied=True,
+            verified=verified,
+            reason="" if verified else "the vulnerability still verified against the patched snapshot",
+            rescan_supported=rescan.supported,
+            rescan_confidence=rescan.confidence,
+        )
 
     def build_repository_context(
         self,
@@ -549,6 +735,7 @@ class PlaidNoxDeepHuntAgent:
         failures = 0
         self.discovery_error_types = []
         self.discovery_errors = []
+        self.discovery_unexpected_failures = 0
         runtime = load_json("runtime/agent.json")
         queries = self._create_search_plan(context, plan)
         segments = _search_segments(
@@ -614,6 +801,9 @@ class PlaidNoxDeepHuntAgent:
                 failures += len(errors)
                 self.discovery_error_types.extend(type(error).__name__ for error in errors)
                 self.discovery_errors.extend(str(error)[:240] for error in errors)
+                self.discovery_unexpected_failures += sum(
+                    1 for error in errors if not isinstance(error, AIStageError)
+                )
         return candidates, failures
 
     def sweep_variants(
@@ -627,6 +817,7 @@ class PlaidNoxDeepHuntAgent:
         runtime = load_json("runtime/agent.json")
         variants: list[Candidate] = []
         failures = 0
+        self.variant_unexpected_failures = 0
         if not verified:
             return [], 0
 
@@ -670,9 +861,10 @@ class PlaidNoxDeepHuntAgent:
             ],
         }
 
-        def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], int]:
+        def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], int, int]:
             segment_variants: list[Candidate] = []
             segment_failures = 0
+            segment_unexpected = 0
             self._emit("variant_segment_started", path=segment["path"], start_line=segment["start_line"])
             next_focus = ""
             for _continuation in range(int(runtime["discovery_max_continuations"]) + 1):
@@ -704,8 +896,10 @@ class PlaidNoxDeepHuntAgent:
                     next_focus = str(payload["next_focus"])
                     if not next_focus:
                         raise AIResponseError("AI variant sweep was incomplete without a continuation focus")
-                except Exception:
+                except Exception as exc:
                     segment_failures += 1
+                    if not isinstance(exc, AIStageError):
+                        segment_unexpected += 1
                     break
             self._emit(
                 "variant_segment_completed",
@@ -714,12 +908,13 @@ class PlaidNoxDeepHuntAgent:
                 candidates=len(segment_variants),
                 errors=segment_failures,
             )
-            return segment_variants, segment_failures
+            return segment_variants, segment_failures, segment_unexpected
 
         try:
             queries = self._create_search_plan(context, plan, verified_payload)
         except Exception as exc:
             self._emit("variant_search_plan_failed", error_type=type(exc).__name__)
+            self.variant_unexpected_failures += int(not isinstance(exc, AIStageError))
             return [], 1
         segments = _search_segments(
             root,
@@ -732,9 +927,10 @@ class PlaidNoxDeepHuntAgent:
         if not segments:
             raise AIResponseError("AI variant-search plan produced no reviewable context")
         with ThreadPoolExecutor(max_workers=int(runtime["sweep_max_workers"])) as executor:
-            for segment_variants, segment_failures in executor.map(analyze, segments):
+            for segment_variants, segment_failures, segment_unexpected in executor.map(analyze, segments):
                 variants.extend(segment_variants)
                 failures += segment_failures
+                self.variant_unexpected_failures += segment_unexpected
         self._emit("variant_sweep_completed", candidates=len(variants), errors=failures)
         return variants, failures
 
@@ -935,6 +1131,11 @@ class PlaidNoxDeepHuntAgent:
         self._emit("finding_consolidation_completed", findings=len(consolidated))
         return consolidated
 
+    def _model_for_tier(self, model_tier: ModelTier | None) -> str:
+        if model_tier is None:
+            return self.model
+        return self.model_by_tier.get(model_tier.value, self.model)
+
     def _structured_response(
         self,
         name: str,
@@ -942,10 +1143,11 @@ class PlaidNoxDeepHuntAgent:
         prompt_operation: str,
         payload: dict[str, Any],
         max_output_tokens: int | None = None,
+        model_tier: ModelTier | None = None,
     ) -> Any:
-        system_prompt, user_prompt = render_operation(prompt_operation, payload)
+        system_prompt, user_prompt = render_operation(prompt_operation, redact_payload(payload))
         response = self.client.responses.create(
-            model=self.model,
+            model=self._model_for_tier(model_tier),
             reasoning={"effort": "low"},
             input=[
                 {"role": "system", "content": system_prompt},
@@ -1037,6 +1239,121 @@ def _security_ir_context(
     }
 
 
+def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
+    try:
+        payload = json.loads(response.output_text)
+        review = DeepHuntResult(
+            supported=bool(payload["supported"]),
+            confidence=float(payload["confidence"]),
+            reasoning=str(payload["reasoning"]),
+            attack_path=str(payload["attack_path"]),
+            remediation_note=str(payload["remediation_note"]),
+            title=str(payload["title"]),
+            vulnerability_class=str(payload["vulnerability_class"]),
+            severity=str(payload["severity"]),
+            message=str(payload["message"]),
+            business_impact=str(payload["business_impact"]),
+            classification_references=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in payload["classification_references"]
+            ],
+            falsification_attempts=[str(item) for item in payload["falsification_attempts"]],
+            required_preconditions=[str(item) for item in payload["required_preconditions"]],
+            evidence_gaps=[str(item) for item in payload["evidence_gaps"]],
+            security_invariant=str(payload["security_invariant"]),
+            rejection_reason=str(payload["rejection_reason"]),
+            gate_results=[dict(item) for item in payload["gate_results"]],
+            evidence_locations=[dict(item) for item in payload["evidence_locations"]],
+            proof_plan=str(payload["proof_plan"]),
+            regression_test=str(payload["regression_test"]),
+            context_requests=[dict(item) for item in payload["context_requests"]],
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AIResponseError("AI review did not match the required schema") from exc
+    if not 0 <= review.confidence <= 1:
+        raise AIResponseError("AI review confidence must be between 0 and 1")
+    return review
+
+
+def _resolve_context_request(
+    root: Path,
+    security_graph: StructuralGraph | None,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Answer one AI-named Tree-sitter-backed context request from the already-built Security IR."""
+    kind = str(request.get("kind", ""))
+    path = str(request.get("path", ""))
+    symbol = str(request.get("symbol", ""))
+    start_line = int(request.get("start_line", 1) or 1)
+    end_line = int(request.get("end_line", start_line) or start_line)
+
+    if kind == "window":
+        try:
+            content = _source_window(root, path, start_line, end_line)
+        except (AIResponseError, OSError) as exc:
+            return {"kind": kind, "path": path, "resolved": False, "reason": str(exc)}
+        return {
+            "kind": kind,
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "resolved": True,
+            "content": content,
+        }
+
+    if security_graph is None:
+        return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no Security IR is available"}
+
+    if kind == "definition":
+        match = next(
+            (item for item in security_graph.symbols if symbol in {item.name, item.qualified_name}),
+            None,
+        )
+        if match is None:
+            return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "symbol not found in the Security IR"}
+        try:
+            content = _source_window(root, match.path, match.line, match.end_line or match.line)
+        except (AIResponseError, OSError) as exc:
+            return {"kind": kind, "symbol": symbol, "resolved": False, "reason": str(exc)}
+        return {
+            "kind": kind,
+            "symbol": symbol,
+            "path": match.path,
+            "start_line": match.line,
+            "end_line": match.end_line or match.line,
+            "resolved": True,
+            "content": content,
+        }
+
+    if kind in {"callers", "callees"}:
+        edges = [
+            {"caller": call.caller, "callee": call.callee, "path": call.path, "line": call.line}
+            for call in security_graph.calls
+            if (call.callee == symbol if kind == "callers" else call.caller == symbol)
+        ][:5]
+        if not edges:
+            return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no matching edges in the Security IR"}
+        return {"kind": kind, "symbol": symbol, "resolved": True, "edges": edges}
+
+    if kind == "imports":
+        file_ir = next((item for item in security_graph.files if item.path == path), None)
+        if file_ir is None:
+            return {"kind": kind, "path": path, "resolved": False, "reason": "path not found in the Security IR"}
+        return {"kind": kind, "path": path, "resolved": True, "imports": list(file_ir.imports)}
+
+    if kind == "route":
+        routes = [
+            {"name": route.name, "path": route.path, "line": route.line}
+            for route in security_graph.routes
+            if symbol == route.name or path == route.path
+        ][:5]
+        if not routes:
+            return {"kind": kind, "symbol": symbol, "resolved": False, "reason": "no matching route in the Security IR"}
+        return {"kind": kind, "symbol": symbol, "resolved": True, "routes": routes}
+
+    return {"kind": kind, "resolved": False, "reason": "unsupported context request kind"}
+
+
 def _validate_deep_hunt_result(
     root: Path,
     candidate: Candidate,
@@ -1087,10 +1404,46 @@ def _validate_deep_hunt_result(
             raise AIResponseError("AI review cited an invalid evidence line range")
 
 
-def _redact(value: str) -> str:
-    value = re.sub(r"mongodb(?:\+srv)?://[^\s\"'`]+", "<redacted-mongodb-uri>", value, flags=re.IGNORECASE)
-    value = re.sub(r"\b(?:sk|rk)-[A-Za-z0-9_-]{10,}\b", "<redacted-api-key>", value)
-    return value
+def _patch_proposal_from_response(response: Any) -> PatchProposal:
+    try:
+        payload = json.loads(response.output_text)
+        proposal = PatchProposal(
+            proposed=bool(payload["proposed"]),
+            patch=str(payload["patch"]),
+            summary=str(payload["summary"]),
+            files_changed=[str(item) for item in payload["files_changed"]],
+            risk_notes=str(payload["risk_notes"]),
+            confidence=float(payload["confidence"]),
+            rejection_reason=str(payload["rejection_reason"]),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AIResponseError("AI patch proposal did not match the required schema") from exc
+    return proposal
+
+
+def _unified_diff_target_paths(patch_text: str) -> set[str]:
+    paths = set()
+    for line in patch_text.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        target = line[4:].strip().split("\t", 1)[0].removeprefix("b/")
+        paths.add(target)
+    return paths
+
+
+def _validate_patch_proposal(root: Path, proposal: PatchProposal) -> None:
+    if not proposal.proposed:
+        if not proposal.rejection_reason:
+            raise AIResponseError("AI patch proposal declined without an evidence-backed reason")
+        return
+    if not proposal.patch.strip() or not proposal.files_changed:
+        raise AIResponseError("AI patch proposal was missing a diff or the files it changes")
+    if _unified_diff_target_paths(proposal.patch) != set(proposal.files_changed):
+        raise AIResponseError("AI patch proposal's declared files did not match the diff it produced")
+    for relative_path in proposal.files_changed:
+        target = (root / relative_path).resolve()
+        if root.resolve() not in target.parents or not target.is_file():
+            raise AIResponseError("AI patch proposal referenced a file outside the supplied repository")
 
 
 def _is_sensitive_path(path: Path) -> bool:
@@ -1360,7 +1713,7 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
     if end > len(source_lines):
         return None
     severity = Severity(str(item["severity"]))
-    category = re.sub(r"[^a-z0-9_-]", "-", str(item["category"]).lower()).strip("-") or "general"
+    category = re.sub(r"[^a-z0-9_-]", "-", str(item["category"]).lower()).strip("-") or "unclassified"
     title = str(item["title"]).strip()
     if not title:
         return None
@@ -1368,7 +1721,7 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
     return Candidate(
         rule_id=f"plaidnox.ai.{category}",
         title=title,
-        vulnerability_class=str(item["cwe"]),
+        vulnerability_class=str(item["vulnerability_class"]),
         severity=severity,
         confidence=float(item["confidence"]),
         message=str(item["message"]),
@@ -1386,6 +1739,8 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
             "engine": "plaidnox-litellm-discovery",
             "ai_discovery": True,
             "ai_remediation": str(item["remediation"]),
+            "ai_business_impact": str(item["business_impact"]),
+            "classification_references": [dict(reference) for reference in item["classification_references"]],
             "evidence_basis": dict(item.get("evidence_basis", {})),
         },
     )

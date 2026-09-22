@@ -1,6 +1,8 @@
 {% include "_partials/core_contract.md" %}
 {% include "_partials/verification_gates.md" %}
 {% include "_partials/evidence_protocol.md" %}
+{% include "_partials/classification_protocol.md" %}
+{% include "_partials/context_expansion_protocol.md" %}
 
 ## Verification result
 

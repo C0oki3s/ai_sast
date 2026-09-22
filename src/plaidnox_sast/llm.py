@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from .assets import load_json
 
@@ -28,7 +28,7 @@ class LiteLLMSettings:
         model: str,
         environment: Mapping[str, str] | None = None,
         prefer_direct: bool = False,
-    ) -> "LiteLLMSettings":
+    ) -> LiteLLMSettings:
         runtime = load_json("runtime/litellm.json")
         values = environment if environment is not None else os.environ
         api_base = values.get(str(runtime["api_base_environment"]), "").strip() or None
@@ -117,7 +117,7 @@ class LiteLLMResponsesClient:
         cls,
         model: str,
         prefer_direct: bool = False,
-    ) -> "LiteLLMResponsesClient":
+    ) -> LiteLLMResponsesClient:
         try:
             import litellm
         except ImportError as exc:

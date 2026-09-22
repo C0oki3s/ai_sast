@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .assets import load_json
+from .errors import AIStageError
 from .models import Candidate, Depth, ModelTier, RouteDecision, Severity
 
 
-class JevError(RuntimeError):
+class JevError(AIStageError):
     pass
 
 
@@ -42,7 +43,7 @@ class JevClient:
     def from_environment(
         cls,
         model: str | None = None,
-    ) -> "JevClient":
+    ) -> JevClient:
         api_key = os.environ.get("JEV_API_KEY")
         if not api_key:
             raise JevError("JEV_API_KEY is required when --jev is enabled")
@@ -77,7 +78,7 @@ class JevClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.request_timeout_seconds) as response:  # noqa: S310
+            with urlopen(request, timeout=self.request_timeout_seconds) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise JevError("JEV routing request failed") from exc
@@ -103,19 +104,22 @@ class JevRouter:
         try:
             depth, profile = self.client.decide(_jev_state(candidate))
         except JevError:
-            return RouteDecision(fallback.depth, fallback.profile, f"{fallback.reason}; JEV unavailable")
+            return replace(fallback, reason=f"{fallback.reason}; JEV unavailable")
         if min(depth.confidence, profile.confidence) < self.confidence_threshold:
-            return RouteDecision(fallback.depth, fallback.profile, f"{fallback.reason}; JEV low confidence")
+            return replace(fallback, reason=f"{fallback.reason}; JEV low confidence")
         try:
             selected_depth = Depth(depth.choice)
         except ValueError:
-            return RouteDecision(fallback.depth, fallback.profile, f"{fallback.reason}; JEV unsupported depth")
+            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported depth")
+        profiles = load_json("routing/jev.json")["questions"]["context_profile"]["criteria"]
+        if profile.choice not in profiles:
+            return replace(fallback, reason=f"{fallback.reason}; JEV unsupported context strategy")
         model_tier = {
             Depth.FAST: ModelTier.FAST,
             Depth.STANDARD: ModelTier.STANDARD,
             Depth.DEEP: ModelTier.DEEP,
         }[selected_depth]
-        task_class = _task_class(profile.choice)
+        task_class = _task_class(str(candidate.metadata.get("category", "unclassified")))
         return RouteDecision(
             selected_depth,
             profile.choice,
@@ -123,22 +127,21 @@ class JevRouter:
             task_class,
             model_tier,
             True,
-            selected_depth is Depth.DEEP,
+            True,
         )
 
     def _local_classify(self, candidate: Candidate) -> RouteDecision:
-        category = str(candidate.metadata.get("category", "general"))
+        category = str(candidate.metadata.get("category", "unclassified"))
         task_class = _task_class(category)
-        deep_categories = set(load_json("routing/jev.json")["deep_categories"])
-        if category in deep_categories or candidate.severity in {Severity.CRITICAL, Severity.HIGH}:
-            return RouteDecision(Depth.DEEP, category, "deep scan escalation", task_class, ModelTier.DEEP, True, True)
-        return RouteDecision(Depth.FAST, category, "localized candidate", task_class, ModelTier.FAST, True, False)
+        if candidate.severity in {Severity.CRITICAL, Severity.HIGH}:
+            return RouteDecision(Depth.DEEP, "mixed", "severity-safe routing fallback", task_class, ModelTier.DEEP)
+        return RouteDecision(Depth.STANDARD, "mixed", "provider-neutral routing fallback", task_class, ModelTier.STANDARD)
 
 
 def _task_class(category: str) -> str:
-    """Collapse scanner-specific labels into the stable Context Fabric vocabulary."""
-    category = category.lower()
-    return str(load_json("routing/jev.json")["task_classes"].get(category, "generic"))
+    """Normalize an open task label without imposing a vulnerability taxonomy."""
+    normalized = "".join(character if character.isalnum() else "_" for character in category.lower())
+    return normalized.strip("_") or "unclassified"
 
 
 def _jev_state(candidate: Candidate) -> dict[str, Any]:

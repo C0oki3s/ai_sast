@@ -3,6 +3,7 @@
 {% include "_partials/variant_method.md" %}
 {% include "_partials/evidence_protocol.md" %}
 {% include "_partials/coverage_protocol.md" %}
+{% include "_partials/classification_protocol.md" %}
 
 ## Sweep result
 

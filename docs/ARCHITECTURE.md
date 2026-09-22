@@ -73,13 +73,13 @@ chooses the knowledge action. It never decides to bypass Deep Hunt.
 
 ## Persistence
 
-PostgreSQL is the production store through SQLAlchemy repositories. It persists
-snapshots, Security IR, threat context, memories, knowledge, scan/task state,
-model/cache audit, findings, evidence, and exact dependencies. Full snapshots
-and large artifacts stay in encrypted object storage.
+PostgreSQL is the production store through SQLAlchemy repositories. The live
+runtime persists snapshots, Security IR, memories, knowledge, hunt plans/tasks,
+findings, evidence, and exact symbol dependencies. The schema reserves typed
+model/cache audit and threat-context tables for their later runtime writers.
+Full snapshots and large artifacts stay in encrypted object storage.
 
-The current SQLite adapter is local compatibility code while the ORM migration
-is completed.
+The SQLite adapters are limited to explicit local operation and isolated tests.
 
 ## Finding lifecycle
 
