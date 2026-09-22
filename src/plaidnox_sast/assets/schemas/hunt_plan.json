@@ -1,0 +1,131 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "strategy": {
+      "type": "string",
+      "maxLength": 5000
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{2,80}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "objective": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "focus_paths": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "entry_points": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          },
+          "vulnerability_themes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 240
+            }
+          },
+          "evidence_requirements": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          },
+          "knowledge_queries": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          },
+          "business_invariants": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "coverage_obligations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "falsification_requirements": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "inventory_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "sensitive_effect_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "authentication_path_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          }
+        },
+        "required": [
+          "task_id",
+          "title",
+          "objective",
+          "focus_paths",
+          "entry_points",
+          "vulnerability_themes",
+          "evidence_requirements",
+          "knowledge_queries",
+          "business_invariants",
+          "coverage_obligations",
+          "falsification_requirements",
+          "inventory_refs",
+          "sensitive_effect_refs",
+          "authentication_path_refs"
+        ]
+      }
+    }
+  },
+  "required": [
+    "strategy",
+    "tasks"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "levels": {
+    "error": "high",
+    "warning": "medium",
+    "note": "low",
+    "none": "info"
+  },
+  "default_level": "medium",
+  "category_terms": [
+    "authentication",
+    "authorization",
+    "ssrf",
+    "injection",
+    "secrets",
+    "business_logic"
+  ],
+  "default_category": "general"
+}

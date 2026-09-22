@@ -1,0 +1,11 @@
+{
+  "cache_managed_by": "litellm_gateway",
+  "application_response_cache": false,
+  "api_base_environment": "LITELLM_API_BASE",
+  "api_key_environment": "LITELLM_API_KEY",
+  "request_timeout_seconds": 90,
+  "request_max_retries": 3,
+  "direct_provider_key_environment_by_model_prefix": {
+    "perplexity/": "IFRIT_PERPLEXITY_API_KEY"
+  }
+}

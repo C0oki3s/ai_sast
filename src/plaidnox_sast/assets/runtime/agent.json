@@ -1,0 +1,25 @@
+{
+  "workflow_version": "2026-09-22.1",
+  "source_segment_characters": 8000,
+  "discovery_max_workers": 4,
+  "sweep_max_workers": 2,
+  "discovery_max_continuations": 8,
+  "repository_entrypoint_limit": 100,
+  "repository_route_limit": 1000,
+  "repository_symbol_limit": 5000,
+  "repository_ir_file_limit": 2000,
+  "security_context_characters": 12000,
+  "business_context_characters": 12000,
+  "knowledge_result_limit": 50,
+  "knowledge_excerpt_characters": 4000,
+  "knowledge_search_min_token_characters": 4,
+  "knowledge_search_stop_words": [
+    "about", "against", "code", "could", "does", "from", "have", "into",
+    "more", "should", "that", "their", "this", "through", "using", "what",
+    "when", "where", "which", "with"
+  ],
+  "request_timeout_seconds": 60,
+  "request_max_retries": 3,
+  "consolidation_max_output_tokens": 12000,
+  "research_max_output_tokens": 8000
+}

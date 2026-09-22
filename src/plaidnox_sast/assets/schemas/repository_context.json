@@ -1,0 +1,709 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "architecture": {
+      "type": "string",
+      "maxLength": 8000
+    },
+    "applications": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "app_name": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "app_root_path": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "architecture": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "entry_points": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "trust_boundaries": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "data_stores": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "authentication": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "authorization": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "sensitive_operations": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "external_services": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            }
+          },
+          "business_workflows": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 1200
+            }
+          }
+        },
+        "required": [
+          "app_name",
+          "app_root_path",
+          "architecture",
+          "entry_points",
+          "trust_boundaries",
+          "data_stores",
+          "authentication",
+          "authorization",
+          "sensitive_operations",
+          "external_services",
+          "business_workflows"
+        ]
+      }
+    },
+    "actors": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "sensitive_assets": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "input_surfaces": {
+      "type": "array",
+      "maxItems": 300,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "trust_boundaries": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "security_invariants": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "string",
+        "maxLength": 1200
+      }
+    },
+    "coverage_gaps": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "string",
+        "maxLength": 1200
+      }
+    },
+    "production_areas": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "root_path": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "runtime_role": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "coverage_state": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "incomplete",
+              "unknown"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "name",
+          "root_path",
+          "runtime_role",
+          "coverage_state",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "entry_points": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "entry_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "application": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "entry_type": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "location": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "operation": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "trust_level": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 200
+          },
+          "no_input": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "entry_id",
+          "application",
+          "entry_type",
+          "location",
+          "operation",
+          "trust_level",
+          "inputs",
+          "no_input",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "sensitive_effects": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "effect_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "effect_type": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "location": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "operation": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "effect_id",
+          "effect_type",
+          "location",
+          "operation",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "authentication_paths": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "entry_points": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "maxItems": 200
+          },
+          "identity_source": {
+            "type": "string",
+            "maxLength": 1200
+          },
+          "controls": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 200
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "name",
+          "entry_points",
+          "identity_source",
+          "controls",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "authorization_decisions": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "actor": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "resource": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "decision_location": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "tenant_or_owner_control": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "name",
+          "actor",
+          "resource",
+          "decision_location",
+          "tenant_or_owner_control",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "indirect_dispatch": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "location": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "dispatch_behavior": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 200
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "name",
+          "location",
+          "dispatch_behavior",
+          "targets",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "build_time_variants": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "selection_mechanism": {
+            "type": "string",
+            "maxLength": 1600
+          },
+          "affected_paths": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 200
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "name",
+          "selection_mechanism",
+          "affected_paths",
+          "evidence",
+          "gaps"
+        ]
+      }
+    },
+    "coverage_ledger": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "obligation": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "incomplete",
+              "unknown"
+            ]
+          },
+          "next_focus": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            },
+            "maxItems": 100
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "obligation",
+          "status",
+          "next_focus",
+          "evidence",
+          "gaps"
+        ]
+      }
+    }
+  },
+  "required": [
+    "architecture",
+    "applications",
+    "actors",
+    "sensitive_assets",
+    "input_surfaces",
+    "trust_boundaries",
+    "security_invariants",
+    "coverage_gaps",
+    "production_areas",
+    "entry_points",
+    "sensitive_effects",
+    "authentication_paths",
+    "authorization_decisions",
+    "indirect_dispatch",
+    "build_time_variants",
+    "coverage_ledger"
+  ]
+}

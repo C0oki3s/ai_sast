@@ -1,0 +1,40 @@
+{
+  "questions": {
+    "analysis_depth": {
+      "type": "choice",
+      "instructions": "Choose the minimum analysis depth needed for this security candidate.",
+      "criteria": {
+        "fast": "A localized security signal with no cross-boundary reasoning required.",
+        "standard": "A security-relevant candidate needing nearby control-flow or configuration review.",
+        "deep": "A potentially high-impact, attacker-controlled, cross-function, authorization, SSRF, or business-logic path requiring adversarial validation."
+      }
+    },
+    "context_profile": {
+      "type": "choice",
+      "instructions": "Choose the security context profile that best fits the candidate.",
+      "criteria": {
+        "injection": "Untrusted data can reach an interpreter, query, template, or command sink.",
+        "authentication": "Identity, token, session, or credential handling.",
+        "authorization": "Access control, tenancy, object ownership, or privilege checks.",
+        "ssrf": "Server-side requests or browser-backed renderers can reach remote or internal resources.",
+        "business_logic": "Security impact depends on workflow state, values, or domain invariants.",
+        "secrets": "Credential or sensitive configuration exposure.",
+        "general": "A security candidate outside the named profiles."
+      }
+    }
+  },
+  "confidence_threshold": 0.85,
+  "deep_categories": ["authorization", "business_logic", "ssrf"],
+  "task_classes": {
+    "injection": "injection",
+    "ssrf": "ssrf",
+    "authorization": "authorization",
+    "authentication": "authentication",
+    "business_logic": "business_logic",
+    "crypto": "crypto",
+    "secrets": "secrets",
+    "dependency": "dependency",
+    "infrastructure": "infrastructure",
+    "data_exposure": "data_exposure"
+  }
+}

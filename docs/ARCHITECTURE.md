@@ -1,0 +1,92 @@
+# Code Scanning architecture
+
+## Trust boundary
+
+The engine receives an immutable local source snapshot, codebase identity,
+revision, and protected context. Repository contents and model/scanner outputs
+are untrusted data. The worker never executes target code or reads tracked
+secret containers. All context is size bounded and redacted before it reaches a
+model, cache, log, database evidence row, or report.
+
+SCM acquisition and feedback are outside this architecture.
+
+## Runtime
+
+```mermaid
+flowchart LR
+    SNAP[Immutable source snapshot] --> RG[AI-directed ripgrep discovery]
+    SNAP --> TS[Tree-sitter compact Security IR]
+    RG --> CTX[Context Compiler]
+    TS --> CTX
+    MEM[Threat context / memory / sourced knowledge] --> CTX
+    CTX --> PLAN[AI hunt-task plan]
+    PLAN --> DISC[AI candidate discovery]
+    SAIST[Optional DataDog SAIST candidate adapter] --> DISC
+    DISC --> JEV[JEV profile and model tier]
+    JEV --> VERIFY[PlaidNox Deep Hunt falsification]
+    VERIFY --> FIND[Verified findings + dependencies]
+    FIND --> SWEEP[Recursive root-cause variant sweep]
+    SWEEP --> CONSOLIDATE[AI evidence consolidation]
+    CONSOLIDATE --> POLICY[Policy engine]
+    POLICY --> OUT[JSON / SARIF / Markdown]
+    FIND --> PG[(PostgreSQL ORM)]
+```
+
+## Discovery and code reading
+
+`rg` is the primary discovery/navigation mechanism. The LLM creates bounded
+queries from the codebase architecture, hunt task, business context, threat
+context, and retrieved knowledge. Query definitions and response schemas are
+versioned assets; they are not embedded in orchestration code.
+
+Tree-sitter maintains a compact Security IR containing only files, stable
+symbols, imports, calls, routes, and security facts required for context
+expansion and invalidation. The system does not persist a complete AST. When a
+question requires stronger flow proof, the agent requests targeted semantic or
+taint analysis for the relevant path instead of analyzing the whole codebase.
+
+```text
+rg hit
+  -> enclosing symbol
+  -> relevant imports/definitions
+  -> callers and callees
+  -> route, guard, source, sink, and control facts
+  -> bounded code slice
+  -> AI reasoning
+  -> optional targeted flow proof
+```
+
+## Verdict ownership
+
+`PlaidNoxDeepHuntAgent` performs attacker-first analysis: establish an attacker
+controlled entry point, trace the path, inspect controls and sanitization,
+attempt to disprove exploitability, and retain only evidence that survives.
+Every candidate receives this review. A parser, text hit, imported scanner, web
+search, memory, or confidence threshold cannot promote a candidate to a finding.
+
+Verified root causes trigger variant sweeps until no new evidence is found. A
+strict-schema model pass may consolidate only equivalent findings, and every
+input fingerprint must remain represented exactly once.
+
+JEV records a provider-neutral task class and FAST/STANDARD/DEEP model tier and
+chooses the knowledge action. It never decides to bypass Deep Hunt.
+
+## Persistence
+
+PostgreSQL is the production store through SQLAlchemy repositories. It persists
+snapshots, Security IR, threat context, memories, knowledge, scan/task state,
+model/cache audit, findings, evidence, and exact dependencies. Full snapshots
+and large artifacts stay in encrypted object storage.
+
+The current SQLite adapter is local compatibility code while the ORM migration
+is completed.
+
+## Finding lifecycle
+
+```text
+DISCOVERED -> VALIDATED -> OPEN -> IN_PROGRESS -> FIXED -> VERIFIED -> CLOSED
+                      \-> FALSE_POSITIVE | ACCEPTED_RISK | DUPLICATE
+```
+
+`VALIDATED` requires a complete PlaidNox Deep Hunt verdict and evidence. Policy
+is applied after validation and cannot convert incomplete analysis into a pass.

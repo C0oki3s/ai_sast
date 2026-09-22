@@ -1,0 +1,10 @@
+{
+  "url_environment_variable": "PLAIDNOX_DATABASE_URL",
+  "allowed_production_drivers": ["postgresql+psycopg"],
+  "pool_size": 10,
+  "max_overflow": 20,
+  "pool_timeout_seconds": 30,
+  "pool_recycle_seconds": 1800,
+  "statement_timeout_milliseconds": 30000,
+  "application_name": "plaidnox-code-scanning"
+}

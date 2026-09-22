@@ -1,0 +1,253 @@
+# PlaidNox Code Scanning implementation plan
+
+## Product boundary
+
+This repository is currently building **Code Scanning only**: static source-code
+understanding, AI-created hunt tasks, contextual vulnerability discovery,
+adversarial validation, evidence, findings, and reports.
+
+The scanner accepts an immutable local source snapshot plus an explicit codebase
+identity and revision. It does not own GitHub, GitLab, pull requests, merge
+requests, comments, checks, webhooks, cloning, or CI installation. Those belong
+to the later SCM Integration workstream described in
+`docs/PRODUCT_WORKSTREAMS.md`.
+
+Dependency scanning, secret scanning, cloud and container scanning, IaC,
+license risk, outdated-software management, DAST, and IDE plugins are also
+separate products. They may reuse shared evidence and policy contracts after
+Code Scanning reaches its end-to-end exit condition, but none is part of the
+current scanner runtime.
+
+## Engineering rules
+
+These rules are mandatory for every PlaidNox Code Scanning change.
+
+1. **No inline model assets.** Markdown prompt templates, JSON response schemas, JEV questions,
+   model-tier mappings, classification criteria, and remediation instructions
+   live in versioned assets under `src/plaidnox_sast/assets/`.
+2. **PostgreSQL is the production database.** Runtime persistence uses
+   SQLAlchemy 2.x ORM repositories. Ordered PostgreSQL DDL remains in standalone
+   migration files so operators can review and apply it independently. SQLite
+   is a temporary local/test adapter and is not the production architecture.
+3. **No secrets in context or model input.** Secrets stay in a secret manager or
+   process environment and are redacted before code is stored, cached, logged,
+   or sent to any model.
+4. **Production naming and boundaries.** Domain names describe Code Scanning,
+   not a provider or an SCM: `Codebase`, `CodeSnapshot`, `ContextBase`,
+   `ContextOverlay`, `SecurityContextPacket`, `HuntTask`,
+   `PlaidNoxDeepHuntAgent`, and `VerifiedFinding`.
+5. **Stable code identity.** A symbol identity cannot include its content hash.
+   Identity is stable across edits; the content hash is a separate version
+   property used for invalidation and caching.
+6. **Readable code intelligence.** Persist a deterministic source tree, symbols,
+   definitions, references, calls, entry points, controls, sources, and sinks.
+   Agents receive an AI-selected Security IR slice and readable tree before source.
+7. **No deterministic vulnerability verdicts.** Parsers, metadata scanners,
+   SAIST imports, ripgrep discovery, and Tree-sitter Security IR produce
+   candidates and context. Every
+   reportable source-code vulnerability must survive independent AI-based
+   attacker-path review, falsification, and evidence validation.
+8. **Open-ended vulnerability discovery.** No allowlist limits the hunt to a few
+   CWE categories. The LLM creates tasks from architecture, business workflows,
+   trust boundaries, data, code, previous evidence, and sourced knowledge.
+9. **Memory is evidence, not authority.** Threat statements, security memories,
+   earlier verdicts, and web research are scoped, versioned, sourced, auditable,
+   and reversible. None can silently confirm or close a finding.
+10. **JEV controls knowledge retrieval.** For every hunt question, JEV chooses
+    exact stored reuse, broader database retrieval, or current web research.
+    Its prompts, confidence thresholds, and fallbacks remain versioned assets.
+11. **All generative model calls use LiteLLM.** Stable Markdown templates rendered with Jinja
+    instructions and schemas form the cacheable prefix. Dynamic task and source
+    context comes last. Prompt caching is owned by LiteLLM, cache metrics are
+    recorded, and security verdicts are never reused merely because the prompt
+    was cached.
+12. **Safe static operation.** Code Scanning does not install dependencies,
+    execute repository scripts, run builds, or import target code. Any later
+    execution-based validation must use an isolated product/runtime boundary.
+13. **ORM-owned runtime queries.** Product code uses typed ORM repositories and
+    transactions. It does not concatenate SQL or embed ad-hoc schema/query text.
+    Database migrations remain separate deployable files.
+14. **Every stage is observable.** Stage failures have typed errors, scan and
+    task identifiers, bounded retries, and redacted telemetry. Broad exception
+    handling cannot silently downgrade a required review.
+15. **No Graphify dependency.** Code discovery and navigation use AI-planned
+    ripgrep, the readable source tree, Tree-sitter Security IR, and persisted
+    Context Fabric relationships. This rule applies to every PlaidNox project.
+
+## Code Scanning architecture
+
+```text
+immutable source snapshot + codebase/revision + business/security context
+  -> safe source inventory and readable tree
+  -> Tree-sitter extracts a compact symbol and security relationship index
+  -> LLM creates repository-specific reconnaissance searches from observed structure
+  -> bounded search execution returns evidence without built-in security patterns
+  -> create or incrementally update Context Fabric
+  -> LLM reconnaissance and architecture model
+  -> LLM hunt-task plan with complete source/path ownership
+  -> JEV knowledge action per task
+       -> reuse exact knowledge | retrieve broader knowledge | research current web
+  -> Context Compiler selects minimum complete evidence slice
+  -> broad AI-native candidate discovery
+  -> recursive continuation until assigned coverage is complete
+  -> PlaidNox Deep Hunt for every candidate
+       -> attacker-controlled source and reachable entry point
+       -> source-to-sink/control path
+       -> missing or bypassable control
+       -> adversarial falsification
+       -> safe reproduction reasoning
+       -> impact and remediation evidence
+  -> recursive root-cause/variant sweep to a fixed point
+  -> model-driven consolidation without losing fingerprints
+  -> verified findings + finding dependencies
+  -> policy decision and JSON/SARIF/Markdown report
+```
+
+DataDog SAIST can supply broad AI-native candidates through an adapter. It does
+not own the PlaidNox verdict and it does not replace the custom Deep Hunt agent.
+Tree-sitter Security IR and targeted semantic/dataflow adapters provide code
+relationships and context; they do not decide that a vulnerability exists.
+
+## Durable Context Fabric
+
+The system persists expensive understanding rather than duplicating raw Git
+storage:
+
+1. **Code intelligence** — snapshots, file/blob hashes, stable symbols, content
+   hashes, definitions/references, calls, routes, data stores, and boundaries.
+2. **Security relationships** — attacker control, exposure, authentication,
+   authorization, tenancy, validators, sanitizers, dangerous operations,
+   sensitive data, and dependency reachability.
+3. **Threat context** — versioned assets, actors, trust boundaries, data classes,
+   security invariants, integrations, and business abuse paths with provenance.
+4. **Security memory** — explicit or confirmed reusable context scoped to a
+   tenant, application, codebase, framework, or vulnerability class.
+5. **Finding memory** — stable fingerprints, exact symbol/path dependencies,
+   assumptions, evidence, falsification, lifecycle, and fix verification.
+6. **Security knowledge** — source-backed framework behavior, advisories,
+   weakness research, and business-abuse techniques with retrieval history.
+
+A new source snapshot creates a generic `ContextOverlay`, independent of an SCM.
+Changed symbol content and relationship edges invalidate affected paths, controls,
+tasks, and findings. Unaffected context is reused. Once accepted as the current
+codebase state, the overlay is reconciled into a new immutable base.
+
+## PostgreSQL and ORM boundary
+
+The production persistence design is specified in
+`docs/POSTGRESQL_ORM_PLAN.md`. Code Scanning owns only tables prefixed
+with `code_scanning_`. Future SCM, SCA, secrets, DAST, cloud/IaC, license, and IDE
+products must use their own schemas/tables and cannot add provider fields to the
+Code Scanning core.
+
+The production data model covers:
+
+- codebases and immutable snapshots;
+- source files, stable symbols, relationship edges, and threat statements;
+- context memories and sourced security knowledge;
+- scan runs, hunt plans, hunt tasks, model invocations, and cache metrics;
+- findings, evidence, and exact context dependencies.
+
+Large raw artifacts and full source archives belong in encrypted object storage;
+PostgreSQL keeps identities, hashes, structured context, evidence, provenance,
+and artifact references.
+
+## Ordered delivery phases
+
+### Phase 1 — secure local vertical slice
+
+Status: foundation implemented; production hardening remains.
+
+- Safe local source snapshot intake.
+- Readable tree and compact Tree-sitter Security IR.
+- External prompts, schemas, routing, runtime settings, and migrations.
+- AI-generated hunt plan and broad open-taxonomy discovery.
+- JEV knowledge decisions, sourced Perplexity research, and durable RAG.
+- Mandatory PlaidNox Deep Hunt and recursive variant sweeps.
+- JSON, SARIF, Markdown, and repository-context outputs.
+
+Exit: a local snapshot can be scanned without executing target code; every
+reported finding has redacted code evidence and a completed Deep Hunt verdict.
+
+### Phase 2 — Code Intelligence correctness
+
+Status: current implementation phase.
+
+- Replace content-derived symbol identifiers with stable semantic identities.
+- Expand source/configuration recognition across supported languages and common
+  manifests while respecting explicit excludes and maximum file sizes.
+- Use model-planned `rg` for primary discovery, Tree-sitter for the cached Security IR,
+  and targeted dataflow only when a task needs it. Search expressions are generated from
+  observed repository evidence; the runtime contains no baked-in vulnerability queries.
+- Persist edge deltas and dependency-aware snapshot overlays.
+- Propagate changes through callers, callees, routes, controls, data stores,
+  threat assumptions, and prior finding dependencies.
+- Compile the minimum complete context packet before any discovery or hunt call.
+
+Exit: mutation tests prove that a changed callee revalidates its callers and
+linked findings, while an unrelated change does not spend model tokens on them.
+
+### Phase 3 — PostgreSQL ORM persistence
+
+Status: schema, ORM model, tenant-scoped repository, and transaction foundation
+implemented; runtime store migration and worker concurrency remain.
+
+- Establish SQLAlchemy models, scoped sessions, typed repositories, and unit of
+  work boundaries for Code Scanning.
+- Apply independently reviewable PostgreSQL migrations.
+- Move Context Fabric, knowledge, hunt plans/tasks, findings, and model audit
+  records from runner-local SQLite adapters into PostgreSQL repositories.
+- Add tenant isolation keys, optimistic concurrency, timestamps, retention
+  state, indexes, transaction tests, and backup/restore verification.
+- Keep SQLite only for isolated unit tests or an explicitly labelled local mode.
+
+Exit: two scanner workers can safely process independent tasks against the same
+PostgreSQL database, retry without duplicates, and recover after interruption.
+
+### Phase 4 — complete AI hunt and evidence lifecycle
+
+- Ensure the planner owns every eligible source segment and reachable attack
+  surface; incomplete coverage makes the scan incomplete.
+- Route FAST/STANDARD/DEEP to actual LiteLLM model policies rather than metadata.
+- Expand secret redaction before every provider boundary.
+- Persist exact finding dependencies on symbols, paths, controls, memories,
+  threat statements, knowledge entries, prompts, and model executions.
+- Add reviewer-independent evidence quality checks, safe PoC narratives,
+  remediation suggestions, and fix-rescan verification.
+- Keep every candidate AI-tested; no category or confidence shortcut bypasses
+  Deep Hunt.
+
+Exit: each finding can be reconstructed from immutable evidence and all context
+that influenced it; every rejected candidate has a falsification record.
+
+### Phase 5 — end-to-end product validation
+
+- Run repeatable acceptance scans against `C0oki3s/NSTCTF` and additional
+  multi-language fixtures with seeded and non-seeded weaknesses.
+- Measure discovery coverage, validated recall, false-positive rate, duplicate
+  rate, context reuse, cache reuse, tokens, latency, and cost by stage.
+- Test prompt-injection resistance, secret redaction, malformed model output,
+  provider outages, stale research, interrupted scans, and database recovery.
+- Package a worker image and migrations; document configuration and operations.
+
+Exit: a clean environment can migrate PostgreSQL, start a worker, scan an
+immutable snapshot, resume an interrupted scan, and produce reviewable findings
+and reports with no SCM dependency.
+
+### Phase 6 — production controls
+
+- Sandboxed read-only workers with blocked default egress and explicit research
+  gateway access.
+- Queue leases, task timeouts, quotas, tenant isolation, encryption, retention,
+  deletion, audit logs, and disaster recovery.
+- OpenTelemetry traces and metrics with redacted logs and per-model cost limits.
+- Signed and versioned policy/config bundles independent of scanner releases.
+
+Exit: isolation, replay safety, recovery, audit provenance, performance, and
+cost ceilings are demonstrated in staging.
+
+## Deferred work
+
+Only after Phase 5 is complete do we start the independent SCM Integration
+workstream. SCA, secrets, cloud/IaC, license risk, outdated software, DAST, and
+IDE plugins remain separately planned products and do not block Code Scanning.

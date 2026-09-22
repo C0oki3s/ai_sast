@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "primary_fingerprint": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "maxLength": 240},
+    "vulnerability_class": {"type": "string", "maxLength": 120},
+    "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "message": {"type": "string", "maxLength": 2000},
+    "business_impact": {"type": "string", "maxLength": 2000},
+    "remediation": {"type": "string", "maxLength": 2000},
+    "reasoning": {"type": "string", "maxLength": 1200}
+  },
+  "required": [
+    "primary_fingerprint",
+    "title",
+    "vulnerability_class",
+    "severity",
+    "confidence",
+    "message",
+    "business_impact",
+    "remediation",
+    "reasoning"
+  ]
+}

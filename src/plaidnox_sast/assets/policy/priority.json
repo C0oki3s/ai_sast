@@ -1,0 +1,15 @@
+{
+  "severity_base": {
+    "info": 10,
+    "low": 25,
+    "medium": 50,
+    "high": 75,
+    "critical": 95
+  },
+  "depth_bonus": {
+    "fast": 0,
+    "standard": 2,
+    "deep": 5
+  },
+  "maximum_score": 100
+}

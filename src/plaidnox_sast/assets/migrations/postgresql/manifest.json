@@ -1,0 +1,7 @@
+{
+  "database": "postgresql",
+  "product": "code-scanning",
+  "migrations": [
+    "migrations/postgresql/0001_code_scanning_core.sql"
+  ]
+}

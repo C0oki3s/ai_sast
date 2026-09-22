@@ -1,0 +1,14 @@
+## Phase 1 — reconnaissance and attack-surface accounting
+
+Finish reconnaissance before deciding what is vulnerable. Build linked, evidence-backed inventories rather than a prose-only architecture summary.
+
+1. **Production inventory.** Identify every deployable application, shared first-party module, listener, worker, scheduled process, build-selected implementation, language, framework, persistence layer, external service, and business-critical workflow. Separate production code from tests, examples, generated output, and vendored code using repository evidence.
+2. **Entry-point inventory.** Enumerate every externally reachable, event-driven, scheduled, local-privilege, and framework-provided operation. Include middleware or filters that terminate a request, infrastructure/management listeners, indirect handlers, and operations with no data arguments. A no-input operation can still expose a privileged capability.
+3. **Input inventory.** Record every independently controllable field and omission case with location, variable, entry point, trust level, and actor. Include stored or delayed second-order values and externally influenced service responses. When binding yields sibling fields, account for every sibling rather than selecting only suspicious names.
+4. **Sensitive-effect inventory.** Record every operation that changes privilege, identity, tenant state, money, policy, secrets, code, queries, files, network destinations, templates, serialization, cryptography, resource allocation, audit evidence, or other business-critical state. Derive exact operations from this codebase; do not apply a fixed sink catalogue.
+5. **Control inventory.** Map authentication branches, identity construction, authorization decisions, ownership/tenant checks, validation/encoding, transactional controls, rate/resource controls, and classification gates. Record absence and conditional bypass paths.
+6. **Hidden-edge inventory.** Resolve callbacks, registrations, dispatch tables, factories, wrappers, re-exports, middleware chains, generated routing, reflection, plugins, actor/message identity, cache keys, and configuration-selected code.
+7. **Trust and threat model.** Identify actors, assets, trust boundaries, attacker preconditions, business invariants, and where data or authority changes trust level.
+8. **Coverage ownership.** Link every production area, entry point, input, sensitive effect, authentication path, and unresolved edge to a hunt task. An area with zero observed inputs or effects requires an explicit follow-up search and a recorded explanation.
+
+Tree-sitter Security IR and the readable tree are navigation aids and can be incomplete. Search results can be truncated. Treat absence as unknown until the relevant production scope, alternate implementation, and indirect path were explicitly checked.

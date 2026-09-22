@@ -1,0 +1,49 @@
+{
+  "version": "2026-09-22.3",
+  "operations": {
+    "recon_search_plan": {
+      "system": "operations/recon_search_plan/system.md",
+      "user": "operations/recon_search_plan/user.md"
+    },
+    "repository_context": {
+      "system": "operations/repository_context/system.md",
+      "user": "operations/repository_context/user.md"
+    },
+    "hunt_plan": {
+      "system": "operations/hunt_plan/system.md",
+      "user": "operations/hunt_plan/user.md"
+    },
+    "search_query_plan": {
+      "system": "operations/search_query_plan/system.md",
+      "user": "operations/search_query_plan/user.md"
+    },
+    "vulnerability_discovery": {
+      "system": "operations/vulnerability_discovery/system.md",
+      "user": "operations/vulnerability_discovery/user.md"
+    },
+    "security_review": {
+      "system": "operations/security_review/system.md",
+      "user": "operations/security_review/user.md"
+    },
+    "metadata_exposure_review": {
+      "system": "operations/metadata_exposure_review/system.md",
+      "user": "operations/metadata_exposure_review/user.md"
+    },
+    "variant_sweep": {
+      "system": "operations/variant_sweep/system.md",
+      "user": "operations/variant_sweep/user.md"
+    },
+    "finding_consolidation": {
+      "system": "operations/finding_consolidation/system.md",
+      "user": "operations/finding_consolidation/user.md"
+    },
+    "finding_group_narratives": {
+      "system": "operations/finding_group_narratives/system.md",
+      "user": "operations/finding_group_narratives/user.md"
+    },
+    "knowledge_research": {
+      "system": "operations/knowledge_research/system.md",
+      "user": "operations/knowledge_research/user.md"
+    }
+  }
+}

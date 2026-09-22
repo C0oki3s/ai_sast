@@ -1,0 +1,26 @@
+{
+  "questions": {
+    "knowledge_action": {
+      "type": "choice",
+      "instructions": "Choose how PlaidNox should obtain knowledge needed for this hunt task.",
+      "criteria": {
+        "use_database": "Stored knowledge directly answers the question, has adequate provenance, and is current for the supplied ecosystem and version.",
+        "retrieve_database": "Relevant knowledge exists but broader or differently scoped database retrieval is needed before analysis.",
+        "research_web": "Stored knowledge is absent, stale, weakly sourced, version-mismatched, or insufficient for a material security decision."
+      }
+    },
+    "knowledge_scope": {
+      "type": "choice",
+      "instructions": "Choose the most useful retrieval scope.",
+      "criteria": {
+        "repository": "The answer depends primarily on known repository or application context.",
+        "business_domain": "The answer depends on workflow, asset, tenant, regulatory, or business abuse context.",
+        "framework": "The answer depends on framework or library behavior and version.",
+        "vulnerability_class": "The answer depends on exploit mechanics, mitigations, or variants of a security weakness.",
+        "advisory": "The answer depends on a current vendor advisory or newly published vulnerability."
+      }
+    }
+  },
+  "confidence_threshold": 0.8,
+  "low_confidence_action": "research_web"
+}

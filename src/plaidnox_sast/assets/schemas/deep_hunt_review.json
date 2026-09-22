@@ -1,0 +1,196 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "supported": {
+      "type": "boolean"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "vulnerability_class": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 1600
+    },
+    "business_impact": {
+      "type": "string",
+      "maxLength": 1600
+    },
+    "reasoning": {
+      "type": "string",
+      "maxLength": 1200
+    },
+    "attack_path": {
+      "type": "string",
+      "maxLength": 1200
+    },
+    "remediation_note": {
+      "type": "string",
+      "maxLength": 1600
+    },
+    "falsification_attempts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 800
+      }
+    },
+    "required_preconditions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 800
+      }
+    },
+    "evidence_gaps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 800
+      }
+    },
+    "security_invariant": {
+      "type": "string",
+      "maxLength": 1600
+    },
+    "rejection_reason": {
+      "type": "string",
+      "maxLength": 1600
+    },
+    "gate_results": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "gate": {
+            "type": "string",
+            "enum": [
+              "design_invariant",
+              "reachability",
+              "attacker_control",
+              "effective_defense",
+              "new_capability",
+              "falsification",
+              "reproduction",
+              "remediation_invariant"
+            ]
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "unknown"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 800
+            }
+          },
+          "explanation": {
+            "type": "string",
+            "maxLength": 1200
+          }
+        },
+        "required": [
+          "gate",
+          "verdict",
+          "evidence",
+          "explanation"
+        ]
+      }
+    },
+    "evidence_locations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "origin",
+              "propagation",
+              "boundary",
+              "defense",
+              "effect"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "start_line",
+          "end_line",
+          "role"
+        ]
+      }
+    },
+    "proof_plan": {
+      "type": "string",
+      "maxLength": 2400
+    },
+    "regression_test": {
+      "type": "string",
+      "maxLength": 2400
+    }
+  },
+  "required": [
+    "supported",
+    "confidence",
+    "title",
+    "vulnerability_class",
+    "severity",
+    "message",
+    "business_impact",
+    "reasoning",
+    "attack_path",
+    "remediation_note",
+    "falsification_attempts",
+    "required_preconditions",
+    "evidence_gaps",
+    "security_invariant",
+    "rejection_reason",
+    "gate_results",
+    "evidence_locations",
+    "proof_plan",
+    "regression_test"
+  ]
+}

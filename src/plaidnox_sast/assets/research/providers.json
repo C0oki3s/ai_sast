@@ -1,0 +1,11 @@
+{
+  "default_provider": "perplexity_sonar",
+  "providers": {
+    "perplexity_sonar": {
+      "model_environment": "IFRIT_RESEARCH_SONAR_MODEL",
+      "default_model": "sonar",
+      "litellm_model_prefix": "perplexity/perplexity/",
+      "provenance": "perplexity-sonar-via-litellm"
+    }
+  }
+}
