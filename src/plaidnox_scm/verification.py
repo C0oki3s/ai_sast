@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
-from plaidnox_sast.ai import PlaidNoxDeepHuntAgent
-from plaidnox_sast.graph import build_structural_graph
+from plaidnox_sast.ai import AIResponseError, PlaidNoxDeepHuntAgent
+from plaidnox_sast.graph import build_structural_graph, source_file_is_admitted
 from plaidnox_sast.jev import JevRouter
 from plaidnox_sast.models import (
     Candidate,
@@ -113,6 +113,22 @@ class SastDeepHuntVerifier:
                         )
                     )
                     continue
+                if not source_file_is_admitted(
+                    root,
+                    target,
+                    exclude=self._agent.source_excludes,
+                    max_file_bytes=self._agent.max_file_bytes,
+                ):
+                    results.append(
+                        _unresolved(
+                            hypothesis,
+                            route,
+                            "Changed path is not a source file admitted by the project source "
+                            "policy; hypothesis cannot be independently verified",
+                            expansion,
+                        )
+                    )
+                    continue
                 finding = self._validator.validate(repository_name, root, candidate, route)
                 if finding is None:
                     results.append(
@@ -124,14 +140,25 @@ class SastDeepHuntVerifier:
                         )
                     )
                     continue
-                review = self._agent.hunt(
-                    root,
-                    candidate,
-                    finding,
-                    security_context=_security_context(application_context, expansion),
-                    model_tier=route.model_tier,
-                    route=route,
-                )
+                try:
+                    review = self._agent.hunt(
+                        root,
+                        candidate,
+                        finding,
+                        security_context=_security_context(application_context, expansion),
+                        model_tier=route.model_tier,
+                        route=route,
+                    )
+                except AIResponseError as exc:
+                    results.append(
+                        _unresolved(
+                            hypothesis,
+                            route,
+                            f"Deep Hunt verification response failed validation: {exc}",
+                            expansion,
+                        )
+                    )
+                    continue
                 pending = bool(review.context_requests) or not expansion.complete
                 if pending:
                     state: VerificationState = "unresolved"

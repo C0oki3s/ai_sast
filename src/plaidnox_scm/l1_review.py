@@ -206,12 +206,32 @@ def _serialize_ir(value: FileSecurityIR | None) -> dict[str, Any] | None:
     }
 
 
+def _response_text(response: Any) -> str:
+    """Return the model's structured answer text.
+
+    Some reasoning models occasionally place the final structured answer in a
+    ``reasoning``-typed output item instead of a ``message``-typed one, which
+    leaves the SDK's ``output_text`` convenience property empty even though a
+    valid answer was produced. Fall back to scanning every output item's
+    content blocks for text in that case.
+    """
+    text = getattr(response, "output_text", "")
+    if text:
+        return str(text)
+    for item in getattr(response, "output", None) or []:
+        for block in getattr(item, "content", None) or []:
+            block_text = getattr(block, "text", None)
+            if block_text:
+                return str(block_text)
+    return ""
+
+
 def _parse_response(
     response: Any,
     changed_file: ChangedFile,
 ) -> tuple[list[L1Candidate], bool, list[str]]:
     try:
-        payload = json.loads(str(response.output_text))
+        payload = json.loads(_response_text(response))
         raw_candidates = list(payload["candidates"])
         coverage_complete = bool(payload["coverage_complete"])
         coverage_gaps = [str(item) for item in payload["coverage_gaps"]]

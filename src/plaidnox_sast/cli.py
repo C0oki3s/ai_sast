@@ -61,7 +61,8 @@ def _add_ai_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        default=int(runtime["agent_default_max_output_tokens"]),
+        default=None,
+        help="cap the AI response's output tokens; unset lets the model use its own limit",
     )
     parser.add_argument(
         "--env-file",

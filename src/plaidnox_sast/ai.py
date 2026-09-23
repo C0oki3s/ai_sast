@@ -237,7 +237,7 @@ class PlaidNoxDeepHuntAgent:
         self.model_by_tier: dict[str, str] = {
             str(tier): str(name) for tier, name in model_runtime.get("agent_model_by_tier", {}).items()
         }
-        self.max_output_tokens = max_output_tokens or int(model_runtime["agent_default_max_output_tokens"])
+        self.max_output_tokens = max_output_tokens
         self.knowledge_coordinator = knowledge_coordinator
         self.event_sink = event_sink
         self.cache_telemetry = cache_telemetry or LiteLLMCacheTelemetry()
@@ -905,6 +905,7 @@ class PlaidNoxDeepHuntAgent:
             load_json("schemas/recon_search_plan.json"),
             "recon_search_plan",
             manifest,
+            model_tier=ModelTier.FAST,
         )
         try:
             payload = json.loads(response.output_text)
@@ -1621,19 +1622,26 @@ class PlaidNoxDeepHuntAgent:
             load_json("runtime/agent.json")["reasoning_effort_by_operation"].get(prompt_operation, "low")
         )
         effort = _stronger_effort(configured_effort, reasoning_effort_override)
-        response = self.client.responses.create(
-            model=self._model_for_tier(model_tier),
-            reasoning={"effort": effort},
-            input=[
+        effective_max_output_tokens = max_output_tokens or self.max_output_tokens
+        request_kwargs: dict[str, Any] = {
+            "model": self._model_for_tier(model_tier),
+            "reasoning": {"effort": effort},
+            "input": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            text={
+            "text": {
                 "verbosity": "low",
                 "format": {"type": "json_schema", "name": name, "strict": True, "schema": schema},
             },
-            max_output_tokens=max_output_tokens or self.max_output_tokens,
-        )
+        }
+        if effective_max_output_tokens is not None:
+            # Only impose a cap when the caller explicitly wants one -- an
+            # unset cap here previously defaulted to a fixed value too low
+            # for reasoning models, which spend part of the budget on
+            # chain-of-thought before the final structured answer.
+            request_kwargs["max_output_tokens"] = effective_max_output_tokens
+        response = self.client.responses.create(**request_kwargs)
         self.cache_telemetry.record_response(response)
         if getattr(response, "status", "completed") != "completed":
             detail = getattr(response, "incomplete_details", None)

@@ -21,6 +21,8 @@ class _Agent:
     def __init__(self) -> None:
         self.graph = None
         self.calls = []
+        self.source_excludes: list[str] = []
+        self.max_file_bytes: int | None = None
 
     def configure_security_graph(self, graph) -> None:
         self.graph = graph

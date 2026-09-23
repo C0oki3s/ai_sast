@@ -1,10 +1,9 @@
 {
   "agent_default_model": "kimi-k2.7-code",
-  "agent_default_max_output_tokens": 6000,
   "agent_model_by_tier": {
-    "fast": "plaidnox-code-fast",
+    "fast": "glm-5.3-flash",
     "standard": "kimi-k2.7-code",
-    "deep": "plaidnox-code-deep"
+    "deep": "kimi-k3"
   },
   "jev_default_model": "jev-latest",
   "saist_detection_model": "plaidnox-code-fast",

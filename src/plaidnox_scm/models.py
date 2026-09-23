@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, func
+from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -34,7 +34,7 @@ class ApplicationContextRecord(Base):
     baseline_revision: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_tree_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     builder_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    application_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    application_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
     entry_points: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     components: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     security_controls: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)

@@ -92,7 +92,7 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
         "review_id": response.json()["review_id"],
         "head_sha": head,
         "action": "allow",
-        "summary": "No new verified finding requires merge action. Policy decision: PASS.",
+        "summary": "No security findings found.",
         "findings": [],
         "incomplete_reason": None,
         "counters": response.json()["counters"],

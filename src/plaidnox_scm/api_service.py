@@ -454,10 +454,9 @@ def _summary(result: ReviewResult, finding_count: int) -> str:
     decision = result.policy.decision
     counts = result.counters
     if decision == "INCOMPLETE":
-        return "PlaidNox Security review is incomplete. No PASS was issued."
-    if finding_count:
-        return (
-            f"{finding_count} verified finding(s): {counts.blocking} blocking, "
-            f"{counts.in_triage} requiring triage. Policy decision: {decision}."
-        )
-    return f"No new verified finding requires merge action. Policy decision: {decision}."
+        return "Security review could not be completed with full confidence in the available context."
+    if not finding_count:
+        return "No security findings found."
+    if counts.blocking or counts.in_triage:
+        return f"{finding_count} verified finding(s): {counts.blocking} blocking, {counts.in_triage} requiring triage."
+    return f"{finding_count} verified finding(s) reported; none require merge action."

@@ -339,7 +339,7 @@ def test_ai_review_stops_requesting_context_at_the_configured_round_limit(sample
     # evidence gap is still open, since JevRetryRouter's local fallback escalates
     # the model tier when the candidate has never been routed to DEEP.
     assert len(client.responses.requests) == 4
-    assert client.responses.requests[3]["model"] == "plaidnox-code-deep"
+    assert client.responses.requests[3]["model"] == "kimi-k3"
 
 
 def test_ai_review_retry_route_does_not_add_a_second_extra_round(sample_repo):
