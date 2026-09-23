@@ -12,7 +12,9 @@ from plaidnox_sast.ai import (
     HuntPlan,
     HuntTask,
     PlaidNoxDeepHuntAgent,
+    _execute_recon_search_plan,
     _resolve_context_request,
+    _search_segments,
     load_env_file,
 )
 from plaidnox_sast.graph import build_structural_graph
@@ -82,6 +84,84 @@ class FakeResponse:
 
     def __init__(self, payload=None):
         self.output_text = json.dumps(payload or review_payload())
+
+
+def test_recon_skips_invalid_model_pattern_and_keeps_other_query_evidence(sample_repo) -> None:
+    errors = []
+    queries = [
+        {
+            "query_id": "invalid-lookbehind",
+            "objective": "Locate evaluator calls.",
+            "pattern": r"(?<!\.)eval\(",
+            "include_globs": ["*.js"],
+            "coverage_targets": ["runtime-evaluation"],
+        },
+        {
+            "query_id": "request-input",
+            "objective": "Locate request inputs.",
+            "pattern": r"req\.body",
+            "include_globs": ["*.js"],
+            "coverage_targets": ["input-surface"],
+        },
+    ]
+
+    evidence, hits = _execute_recon_search_plan(
+        sample_repo,
+        queries,
+        [],
+        None,
+        error_sink=errors.append,
+    )
+
+    assert len(errors) == 1
+    assert errors[0].query_id == "invalid-lookbehind"
+    assert evidence[0]["query_failed"] is True
+    assert evidence[0]["failure"]["pattern_hash"] == errors[0].pattern_hash
+    assert evidence[1]["query_failed"] is False
+    assert any(hit.query_id == "request-input" for hit in hits)
+
+
+def test_search_plan_skips_invalid_pattern_and_falls_back_to_task_focus(sample_repo) -> None:
+    plan = HuntPlan(
+        "plan-test",
+        "Review the focused source.",
+        [
+            HuntTask(
+                "task-1",
+                "Review request handling",
+                "Trace attacker input.",
+                ["app.js"],
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
+        ],
+    )
+    errors = []
+
+    segments = _search_segments(
+        sample_repo,
+        [
+            {
+                "query_id": "invalid-lookbehind",
+                "pattern": r"(?<!\.)eval\(",
+                "include_globs": ["*.js"],
+                "task_ids": ["task-1"],
+            }
+        ],
+        plan,
+        build_structural_graph(sample_repo),
+        [],
+        None,
+        error_sink=errors.append,
+    )
+
+    assert len(errors) == 1
+    assert segments
+    assert {item["path"] for item in segments} == {"app.js"}
+    assert all(item["task_ids"] == ["task-1"] for item in segments)
 
 
 class FakeResponses:
@@ -1952,6 +2032,31 @@ def test_validate_hunt_plan_references_accepts_refs_present_in_the_repository_co
     _validate_hunt_plan_references(_referenceable_context(), [task])
 
 
+def test_validate_hunt_plan_references_resolves_directory_and_relative_refs_to_inventory_files():
+    from plaidnox_sast.ai import _validate_hunt_plan_references
+
+    context = _referenceable_context()
+    context.source_inventory = [
+        {"path": "app.js", "language": "js", "lines": 10},
+        {"path": "views/read.ejs", "language": "ejs", "lines": 5},
+        {"path": "views/flag.ejs", "language": "ejs", "lines": 5},
+    ]
+    task = _referenceable_task(inventory_refs=["views", "./app.js", "views/"])
+
+    _validate_hunt_plan_references(context, [task])
+
+    assert task.inventory_refs == ["views/flag.ejs", "views/read.ejs", "app.js"]
+
+
+def test_validate_hunt_plan_references_rejects_a_directory_with_no_inventory_files():
+    from plaidnox_sast.ai import _validate_hunt_plan_references
+
+    task = _referenceable_task(inventory_refs=["views"])
+
+    with pytest.raises(AIResponseError, match="inventory path not in the repository context"):
+        _validate_hunt_plan_references(_referenceable_context(), [task])
+
+
 def test_validate_hunt_plan_references_rejects_an_unknown_inventory_ref():
     from plaidnox_sast.ai import _validate_hunt_plan_references
 
@@ -2014,3 +2119,105 @@ def test_plan_tasks_rejects_a_hunt_plan_with_a_hallucinated_inventory_ref(sample
 
     with pytest.raises(AIResponseError, match="inventory path not in the repository context"):
         agent.plan_tasks(context)
+
+
+class ScriptedResponses:
+    """Returns raw answer text per schema name, consuming a script in order."""
+
+    def __init__(self, scripts):
+        self.scripts = {name: list(texts) for name, texts in scripts.items()}
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        name = kwargs["text"]["format"]["name"]
+        return type("Response", (), {"status": "completed", "output_text": self.scripts[name].pop(0)})()
+
+
+def _recon_plan_text() -> str:
+    return json.dumps(
+        {
+            "strategy": "Locate Express entry points.",
+            "queries": [
+                {
+                    "query_id": "express-entrypoints",
+                    "pattern": "app\\.get",
+                    "include_globs": ["*.js"],
+                    "objective": "Locate Express entry points.",
+                    "coverage_targets": ["application entry points"],
+                }
+            ],
+            "coverage_notes": "One source file.",
+        }
+    )
+
+
+_REPOSITORY_CONTEXT = {
+    "architecture": "Express API serving a user lookup route.",
+    "applications": [
+        {
+            "app_name": "fixture",
+            "app_root_path": ".",
+            "architecture": "Express route handler.",
+            "entry_points": ["app.js"],
+            "trust_boundaries": ["HTTP request"],
+            "data_stores": ["User model"],
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        json.dumps([_REPOSITORY_CONTEXT]),
+        json.dumps({"repository_context": _REPOSITORY_CONTEXT}),
+        "Context below, see [app.js] and [\"routes\"]:\n" + json.dumps(_REPOSITORY_CONTEXT),
+    ],
+    ids=["array", "envelope", "prose-with-brackets"],
+)
+def test_repository_context_reshapes_a_wrapped_answer_without_retrying(sample_repo, answer):
+    (sample_repo / "app.js").write_text('const app = require("express")();\napp.get("/u", (req, res) => {});\n')
+    responses = ScriptedResponses(
+        {"plaidnox_recon_search_plan": [_recon_plan_text()], "plaidnox_repository_context": [answer]}
+    )
+    agent = PlaidNoxDeepHuntAgent(type("Client", (), {"responses": responses})(), model="test-model")
+
+    context = agent.build_repository_context(sample_repo, "org/repo", "abc123", build_structural_graph(sample_repo))
+
+    assert context.architecture == _REPOSITORY_CONTEXT["architecture"]
+    assert context.to_dict()["applications"][0]["app_name"] == "fixture"
+    assert len(responses.requests) == 2
+
+
+def test_repository_context_retries_once_when_the_answer_has_the_wrong_shape(sample_repo):
+    (sample_repo / "app.js").write_text('const app = require("express")();\napp.get("/u", (req, res) => {});\n')
+    responses = ScriptedResponses(
+        {
+            "plaidnox_recon_search_plan": [_recon_plan_text()],
+            "plaidnox_repository_context": [json.dumps(["app.js", "routes"]), json.dumps(_REPOSITORY_CONTEXT)],
+        }
+    )
+    events = []
+    agent = PlaidNoxDeepHuntAgent(
+        type("Client", (), {"responses": responses})(), model="test-model", event_sink=events.append
+    )
+
+    context = agent.build_repository_context(sample_repo, "org/repo", "abc123", build_structural_graph(sample_repo))
+
+    assert context.architecture == _REPOSITORY_CONTEXT["architecture"]
+    assert [item["event"] for item in events].count("structured_response_shape_mismatch") == 1
+
+
+def test_repository_context_still_fails_typed_after_exhausting_shape_retries(sample_repo):
+    (sample_repo / "app.js").write_text('const app = require("express")();\napp.get("/u", (req, res) => {});\n')
+    responses = ScriptedResponses(
+        {
+            "plaidnox_recon_search_plan": [_recon_plan_text()],
+            "plaidnox_repository_context": [json.dumps(["app.js"]), json.dumps(["still wrong"])],
+        }
+    )
+    agent = PlaidNoxDeepHuntAgent(type("Client", (), {"responses": responses})(), model="test-model")
+
+    with pytest.raises(AIResponseError, match="repository context did not match"):
+        agent.build_repository_context(sample_repo, "org/repo", "abc123", build_structural_graph(sample_repo))

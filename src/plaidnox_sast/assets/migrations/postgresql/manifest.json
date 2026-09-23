@@ -3,6 +3,7 @@
   "product": "code-scanning",
   "migrations": [
     "migrations/postgresql/0001_code_scanning_core.sql",
-    "migrations/postgresql/0002_incremental_repository_context.sql"
+    "migrations/postgresql/0002_incremental_repository_context.sql",
+    "migrations/postgresql/0003_production_controls.sql"
   ]
 }

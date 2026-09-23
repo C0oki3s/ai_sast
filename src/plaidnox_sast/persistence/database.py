@@ -42,6 +42,14 @@ class DatabaseSettings:
             )
         if not url.database:
             raise DatabaseConfigurationError("The production database URL must name a database")
+        production_mode = values.get(str(runtime["production_mode_environment_variable"]), "").strip().lower()
+        if production_mode in {"1", "true", "yes", "on"} and bool(runtime["require_tls_in_production"]):
+            ssl_mode = str(dict(url.query).get("sslmode", "")).lower()
+            accepted = {str(mode) for mode in runtime["accepted_tls_modes"]}
+            if ssl_mode not in accepted:
+                raise DatabaseConfigurationError(
+                    "Production PostgreSQL requires sslmode=require, verify-ca, or verify-full"
+                )
         return cls(
             url=url,
             pool_size=int(runtime["pool_size"]),

@@ -6,5 +6,8 @@
   "pool_timeout_seconds": 30,
   "pool_recycle_seconds": 1800,
   "statement_timeout_milliseconds": 30000,
-  "application_name": "plaidnox-code-scanning"
+  "application_name": "plaidnox-code-scanning",
+  "production_mode_environment_variable": "PLAIDNOX_PRODUCTION_MODE",
+  "require_tls_in_production": true,
+  "accepted_tls_modes": ["require", "verify-ca", "verify-full"]
 }

@@ -1,0 +1,72 @@
+services:
+  migrate:
+    build:
+      context: ../..
+      dockerfile: docker/code-scanning/Dockerfile
+    command: ["migrate"]
+    environment:
+      PLAIDNOX_DATABASE_URL_FILE: /run/secrets/database_url
+      PLAIDNOX_PRODUCTION_MODE: "true"
+    secrets:
+      - database_url
+    networks: [scanner_backend]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=64m,mode=1777]
+    restart: "no"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: docker/code-scanning/Dockerfile
+    command: ["worker", "--tenant-id", "${PLAIDNOX_TENANT_ID:?set tenant id}"]
+    environment:
+      PLAIDNOX_DATABASE_URL_FILE: /run/secrets/database_url
+      LITELLM_API_KEY_FILE: /run/secrets/litellm_api_key
+      LITELLM_API_BASE: http://litellm:4000
+      PLAIDNOX_PRODUCTION_MODE: "true"
+      PLAIDNOX_REQUIRE_SIGNED_ASSETS: "true"
+      PLAIDNOX_ASSET_BUNDLE_PATH: /run/config/plaidnox-assets.json
+      PLAIDNOX_ASSET_BUNDLE_SIGNING_KEY_FILE: /run/secrets/asset_signing_key
+      PLAIDNOX_SNAPSHOT_ROOT: /var/lib/plaidnox/snapshots
+      PLAIDNOX_OUTPUT_ROOT: /var/lib/plaidnox/output
+      PLAIDNOX_WORKER_ID: ${PLAIDNOX_WORKER_ID:?set worker id}
+    secrets:
+      - database_url
+      - litellm_api_key
+      - asset_signing_key
+    configs:
+      - source: signed_asset_bundle
+        target: /run/config/plaidnox-assets.json
+    volumes:
+      - type: bind
+        source: ${PLAIDNOX_SNAPSHOT_ROOT:?set snapshot root}
+        target: /var/lib/plaidnox/snapshots
+        read_only: true
+      - type: bind
+        source: ${PLAIDNOX_OUTPUT_ROOT:?set output root}
+        target: /var/lib/plaidnox/output
+    networks: [scanner_backend]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=256m,mode=1777]
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+networks:
+  scanner_backend:
+    internal: true
+
+secrets:
+  database_url:
+    file: ${PLAIDNOX_DATABASE_URL_SECRET:?set database URL secret file}
+  litellm_api_key:
+    file: ${LITELLM_API_KEY_SECRET:?set LiteLLM key secret file}
+  asset_signing_key:
+    file: ${PLAIDNOX_ASSET_SIGNING_KEY_SECRET:?set asset signing key secret file}
+
+configs:
+  signed_asset_bundle:
+    file: ${PLAIDNOX_ASSET_BUNDLE_PATH:?set signed asset bundle path}

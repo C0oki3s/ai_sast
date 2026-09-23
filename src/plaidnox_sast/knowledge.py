@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from .assets import load_json, load_text
 from .cache_telemetry import LiteLLMCacheTelemetry
+from .controls import ModelUsageBudget
 from .jev import JevClient, JevError
 from .prompts import render_operation
 from .redaction import redact_payload
@@ -449,14 +450,25 @@ class KnowledgeCoordinator:
 class LiteLLMKnowledgeProvider:
     """Structured, source-validated research routed only through LiteLLM."""
 
-    def __init__(self, client: Any, model: str, cache_telemetry: LiteLLMCacheTelemetry) -> None:
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        cache_telemetry: LiteLLMCacheTelemetry,
+        model_budget: ModelUsageBudget | None = None,
+    ) -> None:
         self.client = client
         self.model = model
         self.cache_telemetry = cache_telemetry
+        self.model_budget = model_budget or ModelUsageBudget()
         self.config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
 
     @classmethod
-    def from_environment(cls, cache_telemetry: LiteLLMCacheTelemetry) -> LiteLLMKnowledgeProvider:
+    def from_environment(
+        cls,
+        cache_telemetry: LiteLLMCacheTelemetry,
+        model_budget: ModelUsageBudget | None = None,
+    ) -> LiteLLMKnowledgeProvider:
         from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
 
         config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
@@ -467,28 +479,40 @@ class LiteLLMKnowledgeProvider:
             client = LiteLLMResponsesClient.from_environment(model, prefer_direct=True)
         except LiteLLMConfigurationError as exc:
             raise RuntimeError(str(exc)) from exc
-        return cls(client, model, cache_telemetry)
+        return cls(client, model, cache_telemetry, model_budget)
 
     def research(self, query: str, context: dict[str, Any]) -> list[KnowledgeEntry]:
         schema = load_json("schemas/knowledge_research.json")
         system_prompt, user_prompt = render_operation(
             "knowledge_research",
             redact_payload({"query": query, "context": context}),
+            output_schema=schema,
         )
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=system_prompt,
-            input=user_prompt,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "plaidnox_security_knowledge",
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-            max_output_tokens=int(load_json("runtime/agent.json")["research_max_output_tokens"]),
+        maximum_output_tokens = int(load_json("runtime/agent.json")["research_max_output_tokens"])
+        reservation = self.model_budget.reserve(
+            self.model,
+            len(system_prompt) + len(user_prompt),
+            maximum_output_tokens,
         )
+        try:
+            response = self.client.responses.create(
+                model=self.model,
+                instructions=system_prompt,
+                input=user_prompt,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "plaidnox_security_knowledge",
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+                max_output_tokens=maximum_output_tokens,
+            )
+        except BaseException:
+            self.model_budget.cancel(reservation)
+            raise
+        self.model_budget.complete(reservation, response)
         self.cache_telemetry.record_response(response)
         if getattr(response, "status", "completed") != "completed":
             raise RuntimeError("LiteLLM security research did not complete")
@@ -532,11 +556,12 @@ class LiteLLMKnowledgeProvider:
 
 def research_provider_from_environment(
     cache_telemetry: LiteLLMCacheTelemetry,
+    model_budget: ModelUsageBudget | None = None,
 ) -> KnowledgeResearchProvider:
     providers = load_json("research/providers.json")
     selected = os.environ.get("IFRIT_RESEARCH_PROVIDER", str(providers["default_provider"]))
     if selected == "perplexity_sonar":
-        return LiteLLMKnowledgeProvider.from_environment(cache_telemetry)
+        return LiteLLMKnowledgeProvider.from_environment(cache_telemetry, model_budget)
     raise RuntimeError(f"Unsupported IFRIT research provider: {selected}")
 
 

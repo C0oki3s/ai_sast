@@ -17,9 +17,11 @@ from typing import Any, Protocol
 from .assets import load_json
 from .cache_telemetry import LiteLLMCacheTelemetry
 from .context_fabric import ContextFabric, PreparedContext
+from .controls import ModelUsageBudget
 from .errors import AIStageError
 from .graph import (
     RipgrepDiscovery,
+    RipgrepQueryError,
     SearchHit,
     StructuralGraph,
     build_structural_graph,
@@ -34,7 +36,14 @@ from .knowledge import (
     KnowledgeStore,
     LiteLLMKnowledgeProvider,
 )
-from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient, response_text
+from .llm import (
+    LiteLLMConfigurationError,
+    LiteLLMResponsesClient,
+    StructuredResponse,
+    parse_structured,
+    response_json,
+    response_text,
+)
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
 from .prompts import render_operation
 from .redaction import redact as _redact
@@ -230,6 +239,7 @@ class PlaidNoxDeepHuntAgent:
         context_store: ContextFabric | None = None,
         frontier_router: JevFrontierRouter | None = None,
         retry_router: JevRetryRouter | None = None,
+        model_budget: ModelUsageBudget | None = None,
     ) -> None:
         self.client = client
         model_runtime = load_json("runtime/models.json")
@@ -244,12 +254,14 @@ class PlaidNoxDeepHuntAgent:
         self.context_store = context_store
         self.frontier_router = frontier_router or JevFrontierRouter()
         self.retry_router = retry_router or JevRetryRouter()
+        self.model_budget = model_budget or ModelUsageBudget()
         self.discovery_error_types: list[str] = []
         self.discovery_errors: list[str] = []
         self.security_graph: StructuralGraph | None = None
         self.source_excludes: list[str] = []
         self.max_file_bytes: int | None = None
         self._model_input_audit: list[dict[str, Any]] = []
+        self.search_query_errors: list[dict[str, Any]] = []
 
     @classmethod
     def from_environment(
@@ -296,6 +308,23 @@ class PlaidNoxDeepHuntAgent:
 
         self.security_graph = graph
 
+    def _record_search_query_errors(
+        self,
+        phase: str,
+        context: AIRepositoryContext | None,
+        errors: list[RipgrepQueryError],
+    ) -> None:
+        for error in errors:
+            record = {"phase": phase, **error.to_dict()}
+            self.search_query_errors.append(record)
+            gap = (
+                f"{phase} query {error.query_id} could not execute; "
+                f"pattern {error.pattern_hash[:12]} remains an unresolved coverage obligation"
+            )
+            if context is not None and gap not in context.coverage_gaps:
+                context.coverage_gaps.append(gap)
+            self._emit("ripgrep_query_failed", **record)
+
     def prompt_cache_metrics(self) -> dict[str, int | float]:
         return self.cache_telemetry.snapshot().to_metrics()
 
@@ -308,6 +337,17 @@ class PlaidNoxDeepHuntAgent:
         """Start a new scan-scoped model-input audit."""
 
         self._model_input_audit.clear()
+
+    def reset_search_query_errors(self) -> None:
+        """Start a new scan-scoped AI search-query audit."""
+
+        self.search_query_errors.clear()
+
+    def reset_model_budget(self) -> None:
+        self.model_budget.reset()
+
+    def model_budget_metrics(self) -> dict[str, int | float]:
+        return self.model_budget.metrics()
 
     def model_input_metrics(self) -> dict[str, int]:
         return {
@@ -322,7 +362,7 @@ class PlaidNoxDeepHuntAgent:
         }
 
     def web_knowledge_provider(self) -> LiteLLMKnowledgeProvider:
-        return LiteLLMKnowledgeProvider.from_environment(self.cache_telemetry)
+        return LiteLLMKnowledgeProvider.from_environment(self.cache_telemetry, self.model_budget)
 
     def hunt(
         self,
@@ -838,12 +878,14 @@ class PlaidNoxDeepHuntAgent:
             manifest["source_inventory"] = manifest_inventory
             manifest["source_tree"] = manifest_tree
         recon_queries = self._create_recon_search_plan(manifest)
+        recon_errors: list[RipgrepQueryError] = []
         recon_evidence, recon_hits = _execute_recon_search_plan(
             root,
             recon_queries,
             self.source_excludes,
             self.max_file_bytes,
             include_paths=scope_paths if incremental else None,
+            error_sink=recon_errors.append,
         )
         graph.search_hits.extend(recon_hits)
         graph.rg_queries += len(recon_queries)
@@ -863,11 +905,11 @@ class PlaidNoxDeepHuntAgent:
             manifest,
         )
         try:
-            payload = json.loads(response_text(response))
+            payload = response_json(response)
             architecture = str(payload["architecture"])
             applications = list(payload["applications"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI repository context did not match the required schema") from exc
+            raise AIResponseError(f"AI repository context did not match the required schema: {_schema_failure(exc)}") from exc
         context = AIRepositoryContext(
             codebase=codebase,
             revision=revision,
@@ -898,6 +940,7 @@ class PlaidNoxDeepHuntAgent:
             coverage_ledger=[dict(item) for item in payload.get("coverage_ledger", [])],
             analysis_scope_paths=sorted(scope_paths) if scope_paths else source_tree,
         )
+        self._record_search_query_errors("recon", context, recon_errors)
         if self.context_store is not None and preparation is not None:
             self.context_store.save_repository_context(
                 preparation.current.context_id,
@@ -916,10 +959,10 @@ class PlaidNoxDeepHuntAgent:
             model_tier=ModelTier.FAST,
         )
         try:
-            payload = json.loads(response_text(response))
+            payload = response_json(response)
             queries = [dict(item) for item in payload["queries"]]
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI reconnaissance search plan did not match the required schema") from exc
+            raise AIResponseError(f"AI reconnaissance search plan did not match the required schema: {_schema_failure(exc)}") from exc
         runtime = load_json("runtime/code_intelligence.json")
         if len(queries) > int(runtime["maximum_recon_queries"]):
             raise AIResponseError("AI reconnaissance search plan exceeded the configured query limit")
@@ -955,11 +998,11 @@ class PlaidNoxDeepHuntAgent:
             request,
         )
         try:
-            payload = json.loads(response_text(response))
+            payload = response_json(response)
             task_values = list(payload["tasks"])
             strategy = str(payload["strategy"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI hunt plan did not match the required schema") from exc
+            raise AIResponseError(f"AI hunt plan did not match the required schema: {_schema_failure(exc)}") from exc
 
         tasks: list[HuntTask] = []
         self._emit("hunt_plan_generated", codebase=context.codebase, tasks=len(task_values))
@@ -1017,6 +1060,7 @@ class PlaidNoxDeepHuntAgent:
         self.discovery_unexpected_failures = 0
         runtime = load_json("runtime/agent.json")
         queries = self._create_search_plan(context, plan)
+        search_errors: list[RipgrepQueryError] = []
         segments = _search_segments(
             root,
             queries,
@@ -1025,7 +1069,9 @@ class PlaidNoxDeepHuntAgent:
             self.source_excludes,
             self.max_file_bytes,
             include_paths=set(context.analysis_scope_paths) or None,
+            error_sink=search_errors.append,
         )
+        self._record_search_query_errors("candidate_discovery", context, search_errors)
         if not segments:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
 
@@ -1056,7 +1102,7 @@ class PlaidNoxDeepHuntAgent:
                         "vulnerability_discovery",
                         request,
                     )
-                    payload = json.loads(response_text(response))
+                    payload = response_json(response)
                     for item in payload["candidates"]:
                         candidate = _candidate_from_ai_item(root, item, segment)
                         if candidate is not None:
@@ -1168,7 +1214,7 @@ class PlaidNoxDeepHuntAgent:
                         "variant_sweep",
                         request,
                     )
-                    payload = json.loads(response_text(response))
+                    payload = response_json(response)
                     for item in payload["candidates"]:
                         variant = _candidate_from_ai_item(root, item, segment)
                         if variant is not None:
@@ -1202,6 +1248,7 @@ class PlaidNoxDeepHuntAgent:
             self._emit("variant_search_plan_failed", error_type=type(exc).__name__)
             self.variant_unexpected_failures += int(not isinstance(exc, AIStageError))
             return [], 1
+        search_errors: list[RipgrepQueryError] = []
         segments = _search_segments(
             root,
             queries,
@@ -1210,7 +1257,9 @@ class PlaidNoxDeepHuntAgent:
             self.source_excludes,
             self.max_file_bytes,
             include_paths=set(context.analysis_scope_paths) or None,
+            error_sink=search_errors.append,
         )
+        self._record_search_query_errors("variant_sweep", context, search_errors)
         if not segments:
             raise AIResponseError("AI variant-search plan produced no reviewable context")
         with ThreadPoolExecutor(max_workers=int(runtime["sweep_max_workers"])) as executor:
@@ -1333,7 +1382,7 @@ class PlaidNoxDeepHuntAgent:
                         "capability_chain",
                         request,
                     )
-                    payload = json.loads(response_text(response))
+                    payload = response_json(response)
                     for item in payload["candidates"]:
                         pivot = _candidate_from_ai_item(root, item, segment)
                         if pivot is not None:
@@ -1367,6 +1416,7 @@ class PlaidNoxDeepHuntAgent:
             self._emit("capability_chain_search_plan_failed", error_type=type(exc).__name__)
             self.capability_chain_unexpected_failures += int(not isinstance(exc, AIStageError))
             return [], 1
+        search_errors: list[RipgrepQueryError] = []
         segments = _search_segments(
             root,
             queries,
@@ -1374,7 +1424,9 @@ class PlaidNoxDeepHuntAgent:
             self.security_graph,
             self.source_excludes,
             self.max_file_bytes,
+            error_sink=search_errors.append,
         )
+        self._record_search_query_errors("capability_chain", context, search_errors)
         if not segments:
             raise AIResponseError("AI capability-chain search plan produced no reviewable context")
         with ThreadPoolExecutor(max_workers=int(runtime["sweep_max_workers"])) as executor:
@@ -1444,13 +1496,13 @@ class PlaidNoxDeepHuntAgent:
             request,
         )
         try:
-            payload = json.loads(response_text(response))
+            payload = response_json(response)
             queries = list(payload["queries"])
             task_ids = {task.task_id for task in plan.tasks}
             covered = {str(task_id) for query in queries for task_id in query["task_ids"]}
             covered_refs = {str(ref) for query in queries for ref in query.get("coverage_refs", [])}
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI search plan did not match the required schema") from exc
+            raise AIResponseError(f"AI search plan did not match the required schema: {_schema_failure(exc)}") from exc
         missing = task_ids - covered
         if missing:
             raise AIResponseError("AI search plan did not cover every hunt task")
@@ -1523,10 +1575,10 @@ class PlaidNoxDeepHuntAgent:
             max_output_tokens=int(load_json("runtime/agent.json")["consolidation_max_output_tokens"]),
         )
         try:
-            consolidation = json.loads(response_text(response))
+            consolidation = response_json(response)
             assignments = {str(key): str(value) for key, value in consolidation["assignments"].items()}
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI finding consolidation did not match the required schema") from exc
+            raise AIResponseError(f"AI finding consolidation did not match the required schema: {_schema_failure(exc)}") from exc
 
         by_fingerprint = {finding.fingerprint: finding for finding in findings}
         expected = set(by_fingerprint)
@@ -1550,9 +1602,9 @@ class PlaidNoxDeepHuntAgent:
             max_output_tokens=int(load_json("runtime/agent.json")["consolidation_max_output_tokens"]),
         )
         try:
-            groups = dict(json.loads(response_text(narrative_response))["groups"])
+            groups = dict(response_json(narrative_response)["groups"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError("AI finding group narratives did not match the required schema") from exc
+            raise AIResponseError(f"AI finding group narratives did not match the required schema: {_schema_failure(exc)}") from exc
         if set(groups) != set(members_by_group):
             raise AIResponseError("AI finding narratives did not cover every assigned group")
         consolidated: list[Finding] = []
@@ -1625,7 +1677,7 @@ class PlaidNoxDeepHuntAgent:
                 "repository_wide_context": _contains_repository_wide_context(safe_payload),
             }
         )
-        system_prompt, user_prompt = render_operation(prompt_operation, safe_payload)
+        system_prompt, user_prompt = render_operation(prompt_operation, safe_payload, output_schema=schema)
         configured_effort = str(
             load_json("runtime/agent.json")["reasoning_effort_by_operation"].get(prompt_operation, "low")
         )
@@ -1649,13 +1701,43 @@ class PlaidNoxDeepHuntAgent:
             # for reasoning models, which spend part of the budget on
             # chain-of-thought before the final structured answer.
             request_kwargs["max_output_tokens"] = effective_max_output_tokens
-        response = self.client.responses.create(**request_kwargs)
-        self.cache_telemetry.record_response(response)
-        if getattr(response, "status", "completed") != "completed":
-            detail = getattr(response, "incomplete_details", None)
-            reason = getattr(detail, "reason", "unknown") if detail else "unknown"
-            raise AIResponseError(f"AI request was incomplete: {reason}")
-        return response
+        shape_retries = int(load_json("runtime/agent.json")["structured_shape_retries"])
+        best: Any = None
+        for attempt in range(shape_retries + 1):
+            reservation = self.model_budget.reserve(
+                str(request_kwargs["model"]),
+                len(system_prompt) + len(user_prompt),
+                effective_max_output_tokens,
+            )
+            try:
+                response = self.client.responses.create(**request_kwargs)
+            except BaseException:
+                self.model_budget.cancel(reservation)
+                raise
+            self.model_budget.complete(reservation, response)
+            self.cache_telemetry.record_response(response)
+            if getattr(response, "status", "completed") != "completed":
+                detail = getattr(response, "incomplete_details", None)
+                reason = getattr(detail, "reason", "unknown") if detail else "unknown"
+                raise AIResponseError(f"AI request was incomplete: {reason}")
+            try:
+                payload, matches = parse_structured(response_text(response), schema)
+            except json.JSONDecodeError:
+                payload, matches = None, False
+            if matches:
+                return StructuredResponse(response, payload)
+            if payload is not None:
+                best = payload
+            self._emit(
+                "structured_response_shape_mismatch",
+                operation=prompt_operation,
+                attempt=attempt + 1,
+                decodable=payload is not None,
+            )
+        # Out of retries: hand callers the closest reshaped answer (or the raw
+        # one when nothing decoded) so their own schema check raises the
+        # stage-specific AIResponseError.
+        return StructuredResponse(response, best) if best is not None else response
 
 
 # Kept for artifact and test compatibility with the first MVP. New code uses
@@ -1665,19 +1747,14 @@ AIReview = DeepHuntResult
 
 def load_env_file(path: Path) -> None:
     """Load only KEY=VALUE pairs without evaluating shell syntax."""
+
+    allowed = {str(key) for key in load_json("runtime/environment.json")["allowed_env_file_keys"]}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key in {
-            "JEV_API_KEY",
-            "LITELLM_API_KEY",
-            "LITELLM_API_BASE",
-            "IFRIT_RESEARCH_PROVIDER",
-            "IFRIT_PERPLEXITY_API_KEY",
-            "IFRIT_RESEARCH_SONAR_MODEL",
-        } and value:
+        if key in allowed and value:
             os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
@@ -1814,7 +1891,7 @@ def _security_ir_context(
 
 def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
     try:
-        payload = json.loads(response_text(response))
+        payload = response_json(response)
         review = DeepHuntResult(
             supported=bool(payload["supported"]),
             confidence=float(payload["confidence"]),
@@ -1843,7 +1920,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             context_requests=[dict(item) for item in payload["context_requests"]],
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise AIResponseError("AI review did not match the required schema") from exc
+        raise AIResponseError(f"AI review did not match the required schema: {_schema_failure(exc)}") from exc
     if not 0 <= review.confidence <= 1:
         raise AIResponseError("AI review confidence must be between 0 and 1")
     return review
@@ -2189,7 +2266,7 @@ def _evidence_paths(
 
 def _patch_proposal_from_response(response: Any) -> PatchProposal:
     try:
-        payload = json.loads(response_text(response))
+        payload = response_json(response)
         proposal = PatchProposal(
             proposed=bool(payload["proposed"]),
             patch=str(payload["patch"]),
@@ -2200,7 +2277,7 @@ def _patch_proposal_from_response(response: Any) -> PatchProposal:
             rejection_reason=str(payload["rejection_reason"]),
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise AIResponseError("AI patch proposal did not match the required schema") from exc
+        raise AIResponseError(f"AI patch proposal did not match the required schema: {_schema_failure(exc)}") from exc
     return proposal
 
 
@@ -2308,6 +2385,7 @@ def _execute_recon_search_plan(
     exclude: list[str] | None,
     max_file_bytes: int | None,
     include_paths: set[str] | None = None,
+    error_sink: Callable[[RipgrepQueryError], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SearchHit]]:
     """Execute only model-produced recon searches and return bounded evidence."""
 
@@ -2329,12 +2407,29 @@ def _execute_recon_search_plan(
     executor_cap = int(runtime["maximum_hits_per_query"])
 
     for query in queries:
-        hits = discovery.search(
-            str(query["query_id"]),
-            str(query["pattern"]),
-            include_globs=[str(item) for item in query.get("include_globs", [])],
-            exclude_globs=[str(item) for item in (exclude or [])],
-        )
+        try:
+            hits = discovery.search(
+                str(query["query_id"]),
+                str(query["pattern"]),
+                include_globs=[str(item) for item in query.get("include_globs", [])],
+                exclude_globs=[str(item) for item in (exclude or [])],
+            )
+        except RipgrepQueryError as exc:
+            if error_sink is not None:
+                error_sink(exc)
+            evidence.append(
+                {
+                    "query_id": str(query["query_id"]),
+                    "objective": str(query["objective"]),
+                    "coverage_targets": [str(item) for item in query["coverage_targets"]],
+                    "matches_returned": 0,
+                    "results_truncated": False,
+                    "query_failed": True,
+                    "failure": exc.to_dict(),
+                    "evidence": [],
+                }
+            )
+            continue
         safe_hits = [hit for hit in hits if hit.path in eligible]
         all_hits.extend(safe_hits)
         query_evidence: list[dict[str, Any]] = []
@@ -2366,6 +2461,7 @@ def _execute_recon_search_plan(
                 "coverage_targets": [str(item) for item in query["coverage_targets"]],
                 "matches_returned": len(safe_hits),
                 "results_truncated": len(safe_hits) >= executor_cap or len(safe_hits) > len(query_evidence),
+                "query_failed": False,
                 "evidence": query_evidence,
             }
         )
@@ -2414,6 +2510,7 @@ def _search_segments(
     exclude: list[str] | None,
     max_file_bytes: int | None,
     include_paths: set[str] | None = None,
+    error_sink: Callable[[RipgrepQueryError], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run AI-created rg queries and expand hits with Tree-sitter Security IR."""
 
@@ -2430,12 +2527,17 @@ def _search_segments(
     tasks_with_hits: set[str] = set()
     for query in queries:
         task_ids = {str(item) for item in query["task_ids"]}
-        hits = rg.search(
-            str(query["query_id"]),
-            str(query["pattern"]),
-            include_globs=[str(item) for item in query["include_globs"]],
-            exclude_globs=exclude or [],
-        )
+        try:
+            hits = rg.search(
+                str(query["query_id"]),
+                str(query["pattern"]),
+                include_globs=[str(item) for item in query["include_globs"]],
+                exclude_globs=exclude or [],
+            )
+        except RipgrepQueryError as exc:
+            if error_sink is not None:
+                error_sink(exc)
+            continue
         for hit in hits:
             if hit.path in eligible:
                 hits_with_tasks.append((hit, task_ids))
@@ -2590,6 +2692,14 @@ def _analysis_scope_paths(
     paths = set(preparation.changed_paths)
     paths.update(str(item.get("path", "")) for item in preparation.packet.code_slices)
     return sorted(path for path in paths if path in available)
+
+
+def _schema_failure(exc: BaseException) -> str:
+    """Name why a model answer was rejected without echoing the answer itself."""
+
+    if isinstance(exc, json.JSONDecodeError):
+        return f"JSONDecodeError: {exc.msg} at char {exc.pos} of {len(exc.doc)}"
+    return f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
 def _repository_context_from_saved(
@@ -2815,11 +2925,15 @@ def _validate_hunt_plan_references(context: AIRepositoryContext, tasks: list[Hun
     valid_effect_ids = {str(item.get("effect_id", "")) for item in context.sensitive_effects}
     valid_authentication_paths = {str(item.get("name", "")) for item in context.authentication_paths}
     for task in tasks:
+        resolved_refs: list[str] = []
         for ref in task.inventory_refs:
-            if ref not in valid_inventory_paths:
+            paths = _resolve_inventory_ref(ref, valid_inventory_paths)
+            if not paths:
                 raise AIResponseError(
                     f"AI hunt plan task {task.task_id!r} referenced an inventory path not in the repository context: {ref!r}"
                 )
+            resolved_refs.extend(path for path in paths if path not in resolved_refs)
+        task.inventory_refs = resolved_refs
         for ref in task.sensitive_effect_refs:
             if ref not in valid_effect_ids:
                 raise AIResponseError(
@@ -2830,6 +2944,23 @@ def _validate_hunt_plan_references(context: AIRepositoryContext, tasks: list[Hun
                 raise AIResponseError(
                     f"AI hunt plan task {task.task_id!r} referenced an authentication path not in the repository context: {ref!r}"
                 )
+
+
+def _resolve_inventory_ref(ref: str, valid_paths: set[str]) -> list[str]:
+    """Map a planner reference to inventory files; a directory names the files under it.
+
+    Planners routinely cite ``views`` or ``./app.js`` for files that do exist.
+    Rejecting those discarded the entire hunt plan, so the scan analysed
+    nothing. A path matching no inventory file still resolves to nothing and
+    fails closed.
+    """
+
+    normalized = ref.strip().removeprefix("./").rstrip("/")
+    if normalized in valid_paths:
+        return [normalized]
+    if not normalized:
+        return []
+    return sorted(path for path in valid_paths if path.startswith(f"{normalized}/"))
 
 
 def _knowledge_excerpts(entries: list[KnowledgeEntry], decision: str) -> list[dict[str, Any]]:

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "case_id": "language-fixture-confirmed-positive",
+      "report_path": "reports/language-fixture/report.json",
+      "expected_findings": [
+        {
+          "expectation_id": "fixture-authz-001",
+          "path": "src/fixture/example.py",
+          "vulnerability_class": "CWE-862",
+          "start_line": 20,
+          "end_line": 40
+        }
+      ]
+    },
+    {
+      "case_id": "language-fixture-clean-control",
+      "report_path": "reports/clean-control/report.json",
+      "expected_findings": []
+    }
+  ],
+  "thresholds": {
+    "minimum_recall": 0.8,
+    "minimum_precision": 0.7,
+    "maximum_duplicate_rate": 0.05,
+    "require_complete_scans": true
+  }
+}

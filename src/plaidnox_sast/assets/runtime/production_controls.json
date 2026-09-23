@@ -1,0 +1,36 @@
+{
+  "model_budget": {
+    "maximum_calls_per_scan": 500,
+    "maximum_inflight_calls": 16,
+    "maximum_input_characters_per_scan": 50000000,
+    "maximum_requested_output_tokens_per_scan": 5000000,
+    "maximum_cost_usd_per_scan": 50.0,
+    "maximum_cost_usd_by_model": {}
+  },
+  "worker": {
+    "lease_seconds": 1800,
+    "heartbeat_seconds": 60,
+    "maximum_attempts": 3,
+    "idle_poll_seconds": 5,
+    "scan_timeout_seconds": 10800,
+    "snapshot_root_environment_variable": "PLAIDNOX_SNAPSHOT_ROOT",
+    "output_root_environment_variable": "PLAIDNOX_OUTPUT_ROOT",
+    "worker_id_environment_variable": "PLAIDNOX_WORKER_ID",
+    "maximum_concurrent_jobs": 4,
+    "maximum_daily_jobs": 100,
+    "maximum_monthly_model_cost_usd": 1000.0
+  },
+  "retention": {
+    "completed_scan_days": 90,
+    "failed_scan_days": 30,
+    "audit_event_days": 365
+  },
+  "asset_bundle": {
+    "signature_algorithm": "hmac-sha256",
+    "key_environment_variable": "PLAIDNOX_ASSET_BUNDLE_SIGNING_KEY",
+    "path_environment_variable": "PLAIDNOX_ASSET_BUNDLE_PATH",
+    "required_environment_variable": "PLAIDNOX_REQUIRE_SIGNED_ASSETS",
+    "minimum_key_bytes": 32,
+    "maximum_validity_days": 90
+  }
+}

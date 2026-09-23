@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -24,12 +25,47 @@ OPERATIONS = (
     "patch_proposal",
 )
 
+# Consolidation and narrative schemas are built at call time; every other
+# operation sends the packaged schema of the same (or a shared) name.
+SCHEMA_FILES = {
+    "security_review": "deep_hunt_review",
+    "metadata_exposure_review": "deep_hunt_review",
+}
+DYNAMIC_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["dynamic_marker"],
+    "properties": {"dynamic_marker": {"type": "string"}},
+}
+
+
+def _schema(operation: str) -> dict:
+    if operation in {"finding_consolidation", "finding_group_narratives"}:
+        return DYNAMIC_SCHEMA
+    return load_json(f"schemas/{SCHEMA_FILES.get(operation, operation)}.json")
+
 
 def test_every_agent_operation_has_a_renderable_jinja_prompt_pair():
     for operation in OPERATIONS:
-        system, user = render_operation(operation, {"operation": operation})
+        system, user = render_operation(operation, {"operation": operation}, output_schema=_schema(operation))
         assert "PlaidNox Deep Hunt operating contract" in system
         assert f'"operation": "{operation}"' in user
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_every_operation_states_the_exact_output_schema_it_is_sent(operation):
+    schema = _schema(operation)
+    system, user = render_operation(operation, {"operation": operation}, output_schema=schema)
+
+    assert "## Output contract" in system
+    assert "exactly one JSON object" in system
+    assert json.dumps(schema, ensure_ascii=False, sort_keys=True) in system
+    assert "Output contract" not in user
+
+
+def test_output_contract_is_required_for_every_render():
+    with pytest.raises(TypeError):
+        render_operation("security_review", {"path": "first.py"})  # type: ignore[call-arg]
 
 
 def test_prompt_manifest_declares_every_supported_operation():
@@ -56,8 +92,9 @@ def test_prompt_corpus_uses_markdown_templates_only():
 
 
 def test_dynamic_evidence_is_separate_from_stable_system_prompt():
-    first_system, first_user = render_operation("security_review", {"path": "first.py"})
-    second_system, second_user = render_operation("security_review", {"path": "second.py"})
+    schema = _schema("security_review")
+    first_system, first_user = render_operation("security_review", {"path": "first.py"}, output_schema=schema)
+    second_system, second_user = render_operation("security_review", {"path": "second.py"}, output_schema=schema)
 
     assert first_system == second_system
     assert first_user != second_user
@@ -71,4 +108,4 @@ def test_jinja_uses_strict_undefined_values():
 
 def test_unknown_prompt_operation_fails_closed():
     with pytest.raises(PromptTemplateError, match="Unknown prompt operation"):
-        render_operation("unregistered_operation", {})
+        render_operation("unregistered_operation", {}, output_schema=DYNAMIC_SCHEMA)

@@ -1,7 +1,8 @@
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.models import PolicyDecision
@@ -159,6 +160,34 @@ class FakeUnexpectedFailingDiscoveryAI(FakeContextualAI):
 
     def discover_candidates(self, root, context, plan=None):
         return [], 1
+
+
+class FakeInvalidSearchQueryAI(FakeAIValidator):
+    search_query_errors: list[dict] = []
+
+    def discover_candidates(self, root, context, plan=None):
+        self.search_query_errors = [
+            {
+                "phase": "candidate_discovery",
+                "query_id": "invalid-query",
+                "pattern_hash": "a" * 64,
+                "exit_code": 2,
+                "diagnostic": "regex parse error",
+            }
+        ]
+        return [], 0
+
+
+def test_pipeline_marks_invalid_ai_search_query_as_incomplete_without_crashing(sample_repo) -> None:
+    result = SastPipeline().scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeInvalidSearchQueryAI(),
+    )
+
+    assert result.policy.decision is PolicyDecision.INCOMPLETE
+    assert result.metrics["ai_search_query_failures"] == 1
+    assert result.metrics["ai_search_query_errors"][0]["query_id"] == "invalid-query"
 
 
 class FakeCrashingContextAI(FakeAIValidator):
@@ -615,3 +644,30 @@ def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_o
     )
     assert second.metrics["persistence_indexed"] is True
     assert second.metrics["persistence_findings_flagged_for_revalidation"] >= 1
+
+
+def test_pipeline_records_model_usage_for_the_tenant_cost_quota(sample_repo):
+    from plaidnox_sast.controls import ModelUsageBudget
+    from plaidnox_sast.persistence.models import UsageEventRecord
+
+    factory = _sqlite_session_factory()
+    agent = FakeContextualAI()
+    budget = ModelUsageBudget()
+    reservation = budget.reserve("deep", 10, 10)
+    budget.complete(
+        reservation,
+        SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=3), _hidden_params={"response_cost": 0.2}),
+    )
+    agent.model_budget = budget
+    pipeline = SastPipeline(session_factory=factory, tenant_id="tenant-a")
+
+    for _ in range(2):  # a rescan of the same revision really spends again
+        pipeline.scan_snapshot(sample_repo, "plaidnox/test-fixture", deep_hunt_agent=agent)
+
+    with factory() as session:
+        events = session.scalars(select(UsageEventRecord)).all()
+    assert [(event.model_alias, event.input_tokens, event.output_tokens) for event in events] == [
+        ("deep", 12, 3),
+        ("deep", 12, 3),
+    ]
+    assert all(event.tenant_id == "tenant-a" for event in events)

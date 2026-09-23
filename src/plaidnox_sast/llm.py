@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -169,6 +171,113 @@ def response_text(response: Any) -> str:
                 message_values.append(value)
     values = output_values or message_values or fallback_values
     return "\n".join(values)
+
+
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def response_json(response: Any) -> Any:
+    """Decode a structured model answer, tolerating wrappers some gateways add.
+
+    Providers behind LiteLLM do not all honour ``json_schema`` strictly: some
+    wrap the object in a Markdown fence or add a sentence around it. Strict
+    ``json.loads`` then failed the whole scan stage. A truncated or otherwise
+    malformed answer still raises ``json.JSONDecodeError``.
+    """
+
+    return parse_json_text(response_text(response))
+
+
+def parse_json_text(text: str) -> Any:
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as strict_error:
+        candidates = [match.group(1).strip() for match in _JSON_FENCE.finditer(stripped)]
+        start = min((index for index in (stripped.find("{"), stripped.find("[")) if index >= 0), default=-1)
+        if start >= 0:
+            candidates.append(stripped[start:])
+        decoder = json.JSONDecoder()
+        for candidate in candidates:
+            try:
+                value, _ = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            return value
+        raise strict_error
+
+
+class StructuredResponse:
+    """A model response whose answer text was reshaped into the requested schema."""
+
+    def __init__(self, response: Any, payload: Any) -> None:
+        self._response = response
+        self.output_text = json.dumps(payload, ensure_ascii=False)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+
+_MAX_JSON_START_POSITIONS = 64
+_MAX_UNWRAP_DEPTH = 2
+_MAX_UNWRAP_ITEMS = 50
+
+
+def parse_structured(text: str, schema: Mapping[str, Any]) -> tuple[Any, bool]:
+    """Decode the answer value that best fits an object ``schema``.
+
+    Gateways that ignore ``json_schema`` may return the object wrapped in a
+    one-key envelope (``{"repository_context": {...}}``), inside an array
+    (``[{...}]``), or after prose that itself contains brackets. Every JSON
+    value in the text is considered, single-key envelopes and arrays are
+    unwrapped, and the first object (in text order, outermost first) that
+    carries any required key wins. Ranking by key count instead would pick a
+    nested item that happens to reuse top-level field names. Returns
+    ``(value, shaped)``; a sparse but correctly shaped object is left for the
+    caller's own field checks, since only a wrong shape is worth a retry.
+    Raises ``json.JSONDecodeError`` when no JSON value can be decoded at all.
+    """
+
+    required = {str(key) for key in schema.get("required", ())}
+    decoded = _decoded_values(text.strip())
+    if schema.get("type") != "object" or not required:
+        return decoded[0], True
+    for value in decoded:
+        for candidate in _unwrapped(value, 0):
+            if isinstance(candidate, dict) and required.intersection(candidate):
+                return candidate, True
+    return decoded[0], False
+
+
+def _decoded_values(text: str) -> list[Any]:
+    try:
+        return [json.loads(text)]
+    except json.JSONDecodeError as strict_error:
+        sources = [match.group(1).strip() for match in _JSON_FENCE.finditer(text)]
+        starts = [index for index, char in enumerate(text) if char in "{["][:_MAX_JSON_START_POSITIONS]
+        sources.extend(text[index:] for index in starts)
+        decoder = json.JSONDecoder()
+        values: list[Any] = []
+        for source in sources:
+            try:
+                value, _ = decoder.raw_decode(source)
+            except json.JSONDecodeError:
+                continue
+            values.append(value)
+        if not values:
+            raise strict_error
+        return values
+
+
+def _unwrapped(value: Any, depth: int) -> Iterator[Any]:
+    yield value
+    if depth >= _MAX_UNWRAP_DEPTH:
+        return
+    if isinstance(value, list):
+        for item in value[:_MAX_UNWRAP_ITEMS]:
+            yield from _unwrapped(item, depth + 1)
+    elif isinstance(value, dict) and len(value) == 1:
+        yield from _unwrapped(next(iter(value.values())), depth + 1)
 
 
 def _object_dict(value: Any) -> dict[str, Any]:

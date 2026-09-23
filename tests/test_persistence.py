@@ -40,6 +40,29 @@ def test_production_database_rejects_non_postgresql_driver():
         DatabaseSettings.from_environment({"PLAIDNOX_DATABASE_URL": "sqlite:///context.sqlite"})
 
 
+def test_production_database_requires_tls() -> None:
+    with pytest.raises(DatabaseConfigurationError, match="requires sslmode"):
+        DatabaseSettings.from_environment(
+            {
+                "PLAIDNOX_DATABASE_URL": "postgresql+psycopg://scanner:secret@db/code_scanning",
+                "PLAIDNOX_PRODUCTION_MODE": "true",
+            }
+        )
+
+
+def test_production_database_accepts_verified_tls_mode() -> None:
+    settings = DatabaseSettings.from_environment(
+        {
+            "PLAIDNOX_DATABASE_URL": (
+                "postgresql+psycopg://scanner:secret@db/code_scanning?sslmode=verify-full"
+            ),
+            "PLAIDNOX_PRODUCTION_MODE": "true",
+        }
+    )
+
+    assert settings.url.query["sslmode"] == "verify-full"
+
+
 def test_code_scanning_orm_matches_deployable_postgresql_tables():
     manifest = load_json("migrations/postgresql/manifest.json")
     ddl = "\n".join(load_text(path) for path in manifest["migrations"])

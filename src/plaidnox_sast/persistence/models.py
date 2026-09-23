@@ -33,6 +33,131 @@ class TimestampMixin:
     )
 
 
+class SchemaMigrationRecord(Base):
+    __tablename__ = "code_scanning_schema_migrations"
+
+    version: Mapped[str] = mapped_column(String(64), primary_key=True)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class TenantControlRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_tenant_controls"
+    __table_args__ = (
+        CheckConstraint(
+            "maximum_concurrent_jobs > 0 AND maximum_daily_jobs > 0 "
+            "AND maximum_monthly_model_cost_usd >= 0 "
+            "AND completed_scan_retention_days > 0 AND failed_scan_retention_days > 0",
+            name="ck_code_scanning_tenant_controls_nonnegative",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    maximum_concurrent_jobs: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_daily_jobs: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_monthly_model_cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    completed_scan_retention_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed_scan_retention_days: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ScanJobRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_scan_jobs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "request_key", name="uq_code_scanning_scan_job_request"),
+        CheckConstraint(
+            "attempt_count >= 0 AND maximum_attempts > 0 AND priority >= 0",
+            name="ck_code_scanning_scan_job_attempts",
+        ),
+        Index("ix_code_scanning_scan_job_lease", "tenant_id", "state", "priority", "lease_expires_at", "created_at"),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    codebase_external_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    snapshot_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    output_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    job_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    maximum_attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class UsageEventRecord(Base):
+    __tablename__ = "code_scanning_usage_events"
+    __table_args__ = (
+        CheckConstraint(
+            "input_tokens >= 0 AND output_tokens >= 0 AND cost_usd >= 0",
+            name="ck_code_scanning_usage_nonnegative",
+        ),
+        Index("ix_code_scanning_usage_tenant_time", "tenant_id", "created_at"),
+    )
+
+    usage_event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scan_id: Mapped[str | None] = mapped_column(ForeignKey("code_scanning_scan_runs.scan_id", ondelete="SET NULL"))
+    model_alias: Mapped[str] = mapped_column(String(255), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AuditEventRecord(Base):
+    __tablename__ = "code_scanning_audit_events"
+    __table_args__ = (Index("ix_code_scanning_audit_tenant_time", "tenant_id", "created_at"),)
+
+    audit_event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ArtifactRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_artifacts"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "storage_uri", name="uq_code_scanning_artifact_uri"),
+        Index("ix_code_scanning_artifact_expiry", "tenant_id", "expires_at", "deleted_at"),
+    )
+
+    artifact_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scan_id: Mapped[str | None] = mapped_column(ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"))
+    artifact_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    encryption_key_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DeletionRequestRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_deletion_requests"
+    __table_args__ = (Index("ix_code_scanning_deletion_state", "tenant_id", "state", "created_at"),)
+
+    deletion_request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CodebaseRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_codebases"
     __table_args__ = (UniqueConstraint("tenant_id", "external_key", name="uq_code_scanning_codebase_key"),)

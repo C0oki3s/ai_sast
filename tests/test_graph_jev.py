@@ -1,7 +1,10 @@
 import json
 
+import pytest
+
 from plaidnox_sast.graph import (
     RipgrepDiscovery,
+    RipgrepQueryError,
     build_structural_graph,
     readable_source_tree,
     source_files,
@@ -62,6 +65,18 @@ def test_ripgrep_discovery_returns_bounded_structured_hits(sample_repo):
     assert hits[0].query_id == "signin"
     assert hits[0].path == "app.js"
     assert hits[0].line > 0
+
+
+def test_ripgrep_discovery_preserves_a_redacted_diagnostic_for_invalid_model_pattern(sample_repo):
+    with pytest.raises(RipgrepQueryError) as raised:
+        RipgrepDiscovery(sample_repo).search("model-query-1", r"(?<!\.)eval\(")
+
+    error = raised.value
+    assert error.query_id == "model-query-1"
+    assert error.exit_code == 2
+    assert len(error.pattern_hash) == 64
+    assert error.diagnostic
+    assert "exit code 2" in str(error)
 
 
 def test_ripgrep_discovery_never_searches_unlisted_file_types(tmp_path):

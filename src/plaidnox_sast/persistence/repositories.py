@@ -17,9 +17,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import load_json
 from ..graph import StructuralGraph, Symbol
+from ..redaction import redact_payload
 from .models import (
+    ArtifactRecord,
+    AuditEventRecord,
     CodebaseRecord,
     CodeEdgeRecord,
+    DeletionRequestRecord,
     FindingDependencyRecord,
     FindingEvidenceRecord,
     FindingRecord,
@@ -27,17 +31,24 @@ from .models import (
     HuntTaskRecord,
     KnowledgeUsageRecord,
     RepositoryContextRecord,
+    ScanJobRecord,
     ScanRunRecord,
     SecurityKnowledgeRecord,
     SecurityMemoryRecord,
     SnapshotRecord,
     SourceFileRecord,
     SymbolRecord,
+    TenantControlRecord,
+    UsageEventRecord,
 )
 
 
 class PersistenceConflictError(RuntimeError):
     """Raised when an immutable record is reused with conflicting data."""
+
+
+class ProductionControlError(RuntimeError):
+    """Raised when a queue, quota, retention, or artifact invariant is violated."""
 
 
 def _hash(*parts: str) -> str:
@@ -100,6 +111,36 @@ class ScanRunValue:
     state: str
     mode: str
     workflow_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class TenantControlValue:
+    tenant_id: str
+    maximum_concurrent_jobs: int
+    maximum_daily_jobs: int
+    maximum_monthly_model_cost_usd: float
+    completed_scan_retention_days: int
+    failed_scan_retention_days: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScanJobValue:
+    job_id: str
+    tenant_id: str
+    request_key: str
+    codebase_external_key: str
+    revision: str
+    snapshot_uri: str
+    output_uri: str
+    job_data: dict[str, Any]
+    state: str
+    priority: int
+    attempt_count: int
+    maximum_attempts: int
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    failure_code: str
+    result_summary: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +319,269 @@ class CodeScanningRepository:
         self.session = session
         self.tenant_id = tenant_id
 
+    def upsert_tenant_controls(
+        self,
+        *,
+        maximum_concurrent_jobs: int,
+        maximum_daily_jobs: int,
+        maximum_monthly_model_cost_usd: float,
+        completed_scan_retention_days: int,
+        failed_scan_retention_days: int,
+    ) -> TenantControlValue:
+        values = (
+            maximum_concurrent_jobs,
+            maximum_daily_jobs,
+            maximum_monthly_model_cost_usd,
+            completed_scan_retention_days,
+            failed_scan_retention_days,
+        )
+        if any(value <= 0 for value in (values[0], values[1], values[3], values[4])) or values[2] < 0:
+            raise ProductionControlError("tenant control limits must be positive and cost must be nonnegative")
+        record = self.session.get(TenantControlRecord, self.tenant_id)
+        if record is None:
+            record = TenantControlRecord(
+                tenant_id=self.tenant_id,
+                maximum_concurrent_jobs=maximum_concurrent_jobs,
+                maximum_daily_jobs=maximum_daily_jobs,
+                maximum_monthly_model_cost_usd=maximum_monthly_model_cost_usd,
+                completed_scan_retention_days=completed_scan_retention_days,
+                failed_scan_retention_days=failed_scan_retention_days,
+            )
+            self.session.add(record)
+        else:
+            record.maximum_concurrent_jobs = maximum_concurrent_jobs
+            record.maximum_daily_jobs = maximum_daily_jobs
+            record.maximum_monthly_model_cost_usd = maximum_monthly_model_cost_usd
+            record.completed_scan_retention_days = completed_scan_retention_days
+            record.failed_scan_retention_days = failed_scan_retention_days
+        self.session.flush()
+        return _tenant_control_value(record)
+
+    def tenant_controls(self) -> TenantControlValue:
+        record = self.session.get(TenantControlRecord, self.tenant_id)
+        if record is None:
+            runtime = load_json("runtime/production_controls.json")
+            worker = runtime["worker"]
+            retention = runtime["retention"]
+            return self.upsert_tenant_controls(
+                maximum_concurrent_jobs=int(worker["maximum_concurrent_jobs"]),
+                maximum_daily_jobs=int(worker["maximum_daily_jobs"]),
+                maximum_monthly_model_cost_usd=float(worker["maximum_monthly_model_cost_usd"]),
+                completed_scan_retention_days=int(retention["completed_scan_days"]),
+                failed_scan_retention_days=int(retention["failed_scan_days"]),
+            )
+        return _tenant_control_value(record)
+
+    def enqueue_scan_job(
+        self,
+        request_key: str,
+        codebase_external_key: str,
+        revision: str,
+        snapshot_uri: str,
+        output_uri: str,
+        *,
+        job_data: dict[str, Any] | None = None,
+        priority: int = 100,
+        maximum_attempts: int | None = None,
+        now: datetime | None = None,
+    ) -> ScanJobValue:
+        existing = self.session.scalar(
+            select(ScanJobRecord).where(
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.request_key == request_key,
+            )
+        )
+        if existing is not None:
+            return _scan_job_value(existing)
+        if not all(value.strip() for value in (request_key, codebase_external_key, revision, snapshot_uri, output_uri)):
+            raise ProductionControlError("scan job identity, revision, snapshot URI, and output URI are required")
+        if priority < 0:
+            raise ProductionControlError("scan job priority must be nonnegative")
+        controls = self._lock_tenant_controls()
+        moment = now or datetime.now(UTC)
+        if self._monthly_model_cost(moment) >= controls.maximum_monthly_model_cost_usd:
+            raise ProductionControlError("tenant monthly model-cost quota exceeded")
+        daily_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ScanJobRecord)
+                .where(
+                    ScanJobRecord.tenant_id == self.tenant_id,
+                    ScanJobRecord.created_at >= moment - timedelta(days=1),
+                )
+            )
+            or 0
+        )
+        if daily_count >= controls.maximum_daily_jobs:
+            raise ProductionControlError("tenant daily scan-job quota exceeded")
+        configured_attempts = maximum_attempts or int(
+            load_json("runtime/production_controls.json")["worker"]["maximum_attempts"]
+        )
+        record = ScanJobRecord(
+            job_id=stable_id("job", self.tenant_id, request_key),
+            tenant_id=self.tenant_id,
+            request_key=request_key,
+            codebase_external_key=codebase_external_key,
+            revision=revision,
+            snapshot_uri=snapshot_uri,
+            output_uri=output_uri,
+            job_data=redact_payload(job_data or {}),
+            state="queued",
+            priority=priority,
+            attempt_count=0,
+            maximum_attempts=configured_attempts,
+            failure_code="",
+            result_summary={},
+        )
+        self.session.add(record)
+        self.session.flush()
+        return _scan_job_value(record)
+
+    def lease_next_scan_job(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> ScanJobValue | None:
+        if not worker_id.strip() or lease_seconds <= 0:
+            raise ProductionControlError("worker_id and a positive lease are required")
+        moment = now or datetime.now(UTC)
+        controls = self._lock_tenant_controls()
+        # A worker that died holding a job's final attempt leaves it "leased" with
+        # an expired lease; the lease query below skips exhausted jobs, so without
+        # this the job would stay leased forever instead of reaching "failed".
+        self.session.execute(
+            update(ScanJobRecord)
+            .where(
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.state == "leased",
+                ScanJobRecord.lease_expires_at <= moment,
+                ScanJobRecord.attempt_count >= ScanJobRecord.maximum_attempts,
+            )
+            .values(
+                state="failed",
+                lease_owner=None,
+                lease_expires_at=None,
+                failure_code="lease_expired_attempts_exhausted",
+            )
+        )
+        if self._monthly_model_cost(moment) >= controls.maximum_monthly_model_cost_usd:
+            return None
+        active = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ScanJobRecord)
+                .where(
+                    ScanJobRecord.tenant_id == self.tenant_id,
+                    ScanJobRecord.state == "leased",
+                    ScanJobRecord.lease_expires_at > moment,
+                )
+            )
+            or 0
+        )
+        if active >= controls.maximum_concurrent_jobs:
+            return None
+        considered: set[str] = set()
+        while True:
+            filters = [
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.state.in_(("queued", "leased")),
+                ScanJobRecord.attempt_count < ScanJobRecord.maximum_attempts,
+                or_(ScanJobRecord.lease_expires_at.is_(None), ScanJobRecord.lease_expires_at <= moment),
+            ]
+            if considered:
+                filters.append(ScanJobRecord.job_id.not_in(considered))
+            candidate_id = self.session.scalar(
+                select(ScanJobRecord.job_id)
+                .where(*filters)
+                .order_by(ScanJobRecord.priority, ScanJobRecord.created_at, ScanJobRecord.job_id)
+                .limit(1)
+            )
+            if candidate_id is None:
+                return None
+            considered.add(candidate_id)
+            result = self.session.execute(
+                update(ScanJobRecord)
+                .where(
+                    ScanJobRecord.job_id == candidate_id,
+                    ScanJobRecord.tenant_id == self.tenant_id,
+                    ScanJobRecord.state.in_(("queued", "leased")),
+                    ScanJobRecord.attempt_count < ScanJobRecord.maximum_attempts,
+                    or_(ScanJobRecord.lease_expires_at.is_(None), ScanJobRecord.lease_expires_at <= moment),
+                )
+                .values(
+                    state="leased",
+                    lease_owner=worker_id,
+                    lease_expires_at=moment + timedelta(seconds=lease_seconds),
+                    attempt_count=ScanJobRecord.attempt_count + 1,
+                    failure_code="",
+                )
+            )
+            if result.rowcount == 1:
+                self.session.flush()
+                return _scan_job_value(self.session.get(ScanJobRecord, candidate_id))
+
+    def renew_scan_job_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        moment = now or datetime.now(UTC)
+        result = self.session.execute(
+            update(ScanJobRecord)
+            .where(
+                ScanJobRecord.job_id == job_id,
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.state == "leased",
+                ScanJobRecord.lease_owner == worker_id,
+                ScanJobRecord.lease_expires_at > moment,
+            )
+            .values(lease_expires_at=moment + timedelta(seconds=lease_seconds))
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def complete_scan_job(self, job_id: str, worker_id: str, result_summary: dict[str, Any]) -> bool:
+        result = self.session.execute(
+            update(ScanJobRecord)
+            .where(
+                ScanJobRecord.job_id == job_id,
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.state == "leased",
+                ScanJobRecord.lease_owner == worker_id,
+            )
+            .values(
+                state="completed",
+                lease_owner=None,
+                lease_expires_at=None,
+                result_summary=redact_payload(result_summary),
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def fail_scan_job(self, job_id: str, worker_id: str, failure_code: str) -> bool:
+        record = self.session.scalar(
+            select(ScanJobRecord).where(
+                ScanJobRecord.job_id == job_id,
+                ScanJobRecord.tenant_id == self.tenant_id,
+                ScanJobRecord.state == "leased",
+                ScanJobRecord.lease_owner == worker_id,
+            )
+        )
+        if record is None:
+            return False
+        record.state = "failed" if record.attempt_count >= record.maximum_attempts else "queued"
+        record.lease_owner = None
+        record.lease_expires_at = None
+        record.failure_code = failure_code.strip()[:128] or "worker_error"
+        self.session.flush()
+        return True
+
     def get_codebase(self, codebase_id: str) -> CodebaseValue | None:
         record = self.session.scalar(
             select(CodebaseRecord).where(
@@ -443,6 +747,10 @@ class CodeScanningRepository:
         if existing:
             if existing.snapshot_id != snapshot_id:
                 raise PersistenceConflictError("scan_id already identifies another snapshot")
+            if existing.state != "completed":
+                existing.state = "running"
+                existing.failure_code = ""
+                self.session.flush()
             return _scan_value(existing)
         snapshot = self.get_snapshot(snapshot_id)
         if snapshot is None or snapshot.codebase_id != codebase_id:
@@ -452,7 +760,7 @@ class CodeScanningRepository:
             tenant_id=self.tenant_id,
             codebase_id=codebase_id,
             snapshot_id=snapshot_id,
-            state="pending",
+            state="running",
             mode=mode,
             workflow_version=workflow_version,
             coverage_complete=False,
@@ -461,6 +769,216 @@ class CodeScanningRepository:
         self.session.add(record)
         self.session.flush()
         return _scan_value(record)
+
+    def finish_scan(self, scan_id: str, *, coverage_complete: bool, failure_code: str = "") -> bool:
+        state = "completed" if coverage_complete else "incomplete"
+        result = self.session.execute(
+            update(ScanRunRecord)
+            .where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+            .values(
+                state=state,
+                coverage_complete=coverage_complete,
+                failure_code=failure_code.strip()[:128],
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def record_model_usage(
+        self,
+        usage_event_id: str,
+        scan_id: str | None,
+        model_alias: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        if min(input_tokens, output_tokens) < 0 or cost_usd < 0:
+            raise ProductionControlError("model usage values must be nonnegative")
+        # Spend has already been incurred by the time it is reported, so it is
+        # always recorded; the monthly quota is enforced before new work starts
+        # (enqueue_scan_job / lease_next_scan_job), where refusing still helps.
+        if self.session.get(UsageEventRecord, usage_event_id) is not None:
+            return
+        moment = now or datetime.now(UTC)
+        self.session.add(
+            UsageEventRecord(
+                usage_event_id=usage_event_id,
+                tenant_id=self.tenant_id,
+                scan_id=scan_id,
+                model_alias=model_alias,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
+                created_at=moment,
+            )
+        )
+        self.session.flush()
+
+    def monthly_model_cost_exceeded(self, *, now: datetime | None = None) -> bool:
+        controls = self.tenant_controls()
+        return self._monthly_model_cost(now or datetime.now(UTC)) >= controls.maximum_monthly_model_cost_usd
+
+    def _monthly_model_cost(self, moment: datetime) -> float:
+        month_start = datetime(moment.year, moment.month, 1, tzinfo=UTC)
+        return float(
+            self.session.scalar(
+                select(func.coalesce(func.sum(UsageEventRecord.cost_usd), 0.0)).where(
+                    UsageEventRecord.tenant_id == self.tenant_id,
+                    UsageEventRecord.created_at >= month_start,
+                )
+            )
+            or 0.0
+        )
+
+    def _lock_tenant_controls(self) -> TenantControlValue:
+        """Serialize quota check-then-act per tenant (no-op lock on SQLite)."""
+
+        self.tenant_controls()
+        record = self.session.scalar(
+            select(TenantControlRecord)
+            .where(TenantControlRecord.tenant_id == self.tenant_id)
+            .with_for_update()
+        )
+        return _tenant_control_value(record)
+
+    def append_audit_event(
+        self,
+        audit_event_id: str,
+        event_type: str,
+        actor_type: str,
+        actor_id: str,
+        resource_type: str,
+        resource_id: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> str:
+        existing = self.session.get(AuditEventRecord, audit_event_id)
+        if existing is not None:
+            return existing.event_hash
+        safe_details = redact_payload(details)
+        canonical = json.dumps(
+            {
+                "tenant_id": self.tenant_id,
+                "event_type": event_type,
+                "actor_type": actor_type,
+                "actor_id": actor_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "outcome": outcome,
+                "details": safe_details,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        event_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.session.add(
+            AuditEventRecord(
+                audit_event_id=audit_event_id,
+                tenant_id=self.tenant_id,
+                event_type=event_type,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                outcome=outcome,
+                details=safe_details,
+                event_hash=event_hash,
+            )
+        )
+        self.session.flush()
+        return event_hash
+
+    def register_artifact(
+        self,
+        artifact_id: str,
+        scan_id: str | None,
+        artifact_kind: str,
+        storage_uri: str,
+        content_hash: str,
+        encryption_key_ref: str,
+        expires_at: datetime,
+    ) -> None:
+        if not encryption_key_ref.strip():
+            raise ProductionControlError("artifact encryption key reference is required")
+        if expires_at.tzinfo is None:
+            raise ProductionControlError("artifact expiry must include a timezone")
+        existing = self.session.get(ArtifactRecord, artifact_id)
+        if existing is not None:
+            if existing.content_hash != content_hash or existing.storage_uri != storage_uri:
+                raise PersistenceConflictError("artifact_id already identifies different content")
+            return
+        self.session.add(
+            ArtifactRecord(
+                artifact_id=artifact_id,
+                tenant_id=self.tenant_id,
+                scan_id=scan_id,
+                artifact_kind=artifact_kind,
+                storage_uri=storage_uri,
+                content_hash=content_hash,
+                encryption_key_ref=encryption_key_ref,
+                expires_at=expires_at,
+            )
+        )
+        self.session.flush()
+
+    def artifacts_due_for_deletion(self, *, now: datetime | None = None) -> list[str]:
+        moment = now or datetime.now(UTC)
+        return list(
+            self.session.scalars(
+                select(ArtifactRecord.artifact_id)
+                .where(
+                    ArtifactRecord.tenant_id == self.tenant_id,
+                    ArtifactRecord.deleted_at.is_(None),
+                    ArtifactRecord.expires_at <= moment,
+                )
+                .order_by(ArtifactRecord.expires_at, ArtifactRecord.artifact_id)
+            ).all()
+        )
+
+    def mark_artifact_deleted(self, artifact_id: str, *, now: datetime | None = None) -> bool:
+        result = self.session.execute(
+            update(ArtifactRecord)
+            .where(
+                ArtifactRecord.artifact_id == artifact_id,
+                ArtifactRecord.tenant_id == self.tenant_id,
+                ArtifactRecord.deleted_at.is_(None),
+            )
+            .values(deleted_at=now or datetime.now(UTC))
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def request_deletion(
+        self,
+        deletion_request_id: str,
+        resource_type: str,
+        resource_id: str,
+        requested_by: str,
+        reason: str,
+    ) -> None:
+        if not reason.strip():
+            raise ProductionControlError("deletion requests require an auditable reason")
+        if self.session.get(DeletionRequestRecord, deletion_request_id) is not None:
+            return
+        self.session.add(
+            DeletionRequestRecord(
+                deletion_request_id=deletion_request_id,
+                tenant_id=self.tenant_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                requested_by=requested_by,
+                reason=reason,
+                state="pending",
+            )
+        )
+        self.session.flush()
 
     def save_security_ir(
         self,
@@ -1454,6 +1972,38 @@ def _scan_value(record: ScanRunRecord) -> ScanRunValue:
         record.state,
         record.mode,
         record.workflow_version,
+    )
+
+
+def _tenant_control_value(record: TenantControlRecord) -> TenantControlValue:
+    return TenantControlValue(
+        record.tenant_id,
+        record.maximum_concurrent_jobs,
+        record.maximum_daily_jobs,
+        record.maximum_monthly_model_cost_usd,
+        record.completed_scan_retention_days,
+        record.failed_scan_retention_days,
+    )
+
+
+def _scan_job_value(record: ScanJobRecord) -> ScanJobValue:
+    return ScanJobValue(
+        record.job_id,
+        record.tenant_id,
+        record.request_key,
+        record.codebase_external_key,
+        record.revision,
+        record.snapshot_uri,
+        record.output_uri,
+        dict(record.job_data),
+        record.state,
+        record.priority,
+        record.attempt_count,
+        record.maximum_attempts,
+        record.lease_owner,
+        record.lease_expires_at,
+        record.failure_code,
+        dict(record.result_summary),
     )
 
 

@@ -6,7 +6,11 @@ from plaidnox_sast.prompts import render_operation, render_prompt
 
 
 def test_model_prompts_and_schemas_are_versioned_runtime_assets():
-    system, user = render_operation("security_review", {"candidate": "example"})
+    system, user = render_operation(
+        "security_review",
+        {"candidate": "example"},
+        output_schema=load_json("schemas/deep_hunt_review.json"),
+    )
     assert "attacker-first" in system
     assert "adversarial verification gates" in system.lower()
     assert '"candidate": "example"' in user
@@ -25,6 +29,7 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert load_json("runtime/code_intelligence.json")["maximum_dynamic_queries_per_task"] > 0
     assert load_json("runtime/models.json")["agent_default_model"]
     assert load_json("runtime/jev.json")["request_timeout_seconds"] > 0
+    assert load_json("runtime/production_controls.json")["model_budget"]["maximum_calls_per_scan"] > 0
     assert load_json("schemas/search_query_plan.json")["properties"]["queries"]["minItems"] == 1
     assert "Rust-compatible ripgrep" in render_prompt("operations/search_query_plan/system.md")
     assert "perplexity_sonar" in load_json("research/providers.json")["providers"]

@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
+import threading
 from pathlib import Path
 
+from .acceptance import evaluate_acceptance_manifest, write_acceptance_result
 from .ai import PlaidNoxDeepHuntAgent, load_env_file
+from .asset_bundle import (
+    create_asset_bundle,
+    load_asset_bundle,
+    verify_asset_bundle,
+    verify_configured_asset_bundle,
+    write_asset_bundle,
+)
 from .assets import load_json
 from .config import load_local_project_config
 from .context_fabric import ContextFabric, ContextFabricStore
+from .environment import load_mounted_secrets
 from .graph import build_structural_graph
 from .jev import JevClient, JevFrontierRouter, JevRetryRouter
 from .knowledge import (
@@ -18,16 +30,22 @@ from .knowledge import (
     research_provider_from_environment,
 )
 from .models import PolicyDecision
+from .observability import ScanTelemetry
 from .persistence import (
     DatabaseConfigurationError,
     DatabaseSettings,
     PostgresContextFabricStore,
     PostgresKnowledgeStore,
+    apply_migrations,
+    snapshot_tree_hash,
+    stable_id,
+    unit_of_work,
 )
 from .persistence import session_factory as build_session_factory
 from .pipeline import SastPipeline
 from .reporters import write_json, write_markdown, write_repository_context, write_sarif
 from .saist import DatadogSAISTDetector
+from .worker import LocalScanExecutor, ScanWorker, WorkerPaths
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -48,6 +66,49 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_ai_arguments(local)
     _add_engine_arguments(local)
+
+    acceptance = sub.add_parser("evaluate-acceptance", help="evaluate immutable scan reports against expectations")
+    acceptance.add_argument("manifest", type=Path)
+    acceptance.add_argument("--output", type=Path, required=True)
+
+    migrate = sub.add_parser("migrate", help="apply ordered Code Scanning PostgreSQL migrations")
+    migrate.add_argument("--env-file", type=Path)
+
+    create_bundle = sub.add_parser("create-asset-bundle", help="sign the installed policy/runtime assets")
+    create_bundle.add_argument("--bundle-version", required=True)
+    create_bundle.add_argument("--key-id", required=True)
+    create_bundle.add_argument("--validity-days", type=int, default=30)
+    create_bundle.add_argument("--output", type=Path, required=True)
+    create_bundle.add_argument("--env-file", type=Path)
+
+    verify_bundle = sub.add_parser("verify-asset-bundle", help="verify a signed policy/runtime asset bundle")
+    verify_bundle.add_argument("bundle", type=Path)
+    verify_bundle.add_argument("--env-file", type=Path)
+
+    enqueue = sub.add_parser("enqueue-local", help="enqueue an immutable local snapshot for a worker")
+    enqueue.add_argument("path", type=Path)
+    enqueue.add_argument("--codebase", required=True)
+    enqueue.add_argument("--revision", required=True)
+    enqueue.add_argument("--request-key", required=True)
+    enqueue.add_argument("--output", type=Path, required=True)
+    enqueue.add_argument("--tenant-id", required=True)
+    enqueue.add_argument("--priority", type=int, default=100)
+    enqueue.add_argument("--env-file", type=Path)
+
+    for name, help_text in (
+        ("worker-once", "lease and execute at most one queued scan job"),
+        ("worker", "continuously lease and execute queued scan jobs"),
+    ):
+        worker = sub.add_parser(name, help=help_text)
+        worker.add_argument("--tenant-id", required=True)
+        worker.add_argument("--worker-id")
+        worker.add_argument(
+            "--jev",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="pass JEV routing through to scans (requires JEV_API_KEY)",
+        )
+        worker.add_argument("--env-file", type=Path)
     return parser
 
 
@@ -93,20 +154,135 @@ def _add_engine_arguments(parser: argparse.ArgumentParser) -> None:
         help="tenant scope for PostgreSQL persistence; only meaningful when "
         "PLAIDNOX_DATABASE_URL is configured",
     )
-    parser.add_argument(
-        "--tenant-id",
-        default="default",
-        help="tenant scope for PostgreSQL persistence; only meaningful when "
-        "PLAIDNOX_DATABASE_URL is configured",
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "evaluate-acceptance":
+        result = evaluate_acceptance_manifest(args.manifest)
+        write_acceptance_result(result, args.output)
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.passed else 2
+    if getattr(args, "env_file", None):
+        load_env_file(args.env_file)
+    load_mounted_secrets()
+    if args.command == "migrate":
+        settings = DatabaseSettings.from_environment()
+        applied = apply_migrations(settings.create_engine())
+        print(json.dumps({"database": settings.redacted_url, "applied": applied}, indent=2))
+        return 0
+    if args.command == "create-asset-bundle":
+        policy = load_json("runtime/production_controls.json")["asset_bundle"]
+        key = os.environ.get(str(policy["key_environment_variable"]), "")
+        bundle = create_asset_bundle(
+            args.bundle_version,
+            args.key_id,
+            key,
+            validity_days=args.validity_days,
+        )
+        write_asset_bundle(bundle, args.output)
+        print(json.dumps({"bundle_version": args.bundle_version, "output": str(args.output)}, indent=2))
+        return 0
+    if args.command == "verify-asset-bundle":
+        policy = load_json("runtime/production_controls.json")["asset_bundle"]
+        key = os.environ.get(str(policy["key_environment_variable"]), "")
+        verified = verify_asset_bundle(load_asset_bundle(args.bundle), key)
+        print(json.dumps({"bundle_version": verified.bundle_version, "assets": verified.asset_count}, indent=2))
+        return 0
+    if args.command == "enqueue-local":
+        return _enqueue_local(args)
+    if args.command in {"worker-once", "worker"}:
+        return _run_worker(args, continuous=args.command == "worker")
+    return _run_scan_local(args)
+
+
+def _enqueue_local(args: argparse.Namespace) -> int:
+    verify_configured_asset_bundle()
+    settings = DatabaseSettings.from_environment()
+    factory = build_session_factory(settings)
+    snapshot = args.path.resolve()
+    if not snapshot.is_dir():
+        raise SystemExit("snapshot path must be an existing directory")
+    output = args.output.resolve()
+    config = load_local_project_config(snapshot)
+    tree_hash = snapshot_tree_hash(
+        build_structural_graph(snapshot, exclude=config.exclude, max_file_bytes=config.max_file_bytes)
+    )
+    with unit_of_work(factory, args.tenant_id) as repository:
+        job = repository.enqueue_scan_job(
+            args.request_key,
+            args.codebase,
+            args.revision,
+            snapshot.as_uri(),
+            output.as_uri(),
+            job_data={"snapshot_tree_hash": tree_hash},
+            priority=args.priority,
+        )
+        repository.append_audit_event(
+            stable_id("audit", job.job_id, "queued"),
+            "scan_job_queued",
+            "operator",
+            "cli",
+            "scan_job",
+            job.job_id,
+            "success",
+            {"codebase": args.codebase, "revision": args.revision},
+        )
+    print(json.dumps({"job_id": job.job_id, "state": job.state}, indent=2))
+    return 0
+
+
+def _run_worker(args: argparse.Namespace, *, continuous: bool) -> int:
+    verify_configured_asset_bundle()
+    settings = DatabaseSettings.from_environment()
+    factory = build_session_factory(settings)
+    runtime = load_json("runtime/production_controls.json")["worker"]
+    worker_id = args.worker_id or os.environ.get(str(runtime["worker_id_environment_variable"]), "")
+    if args.jev and not os.environ.get("JEV_API_KEY"):
+        # Deterministic misconfiguration: refuse before leasing, otherwise every
+        # job burns all of its attempts on the same scanner startup failure.
+        raise SystemExit("JEV_API_KEY is required for worker scans; configure it or pass --no-jev")
+    worker = ScanWorker(
+        factory,
+        args.tenant_id,
+        worker_id,
+        LocalScanExecutor(
+            WorkerPaths.from_environment(),
+            timeout_seconds=int(runtime["scan_timeout_seconds"]),
+            jev=args.jev,
+        ),
+        lease_seconds=int(runtime["lease_seconds"]),
+        heartbeat_seconds=int(runtime["heartbeat_seconds"]),
+    )
+    if not continuous:
+        job = worker.run_once()
+        print(json.dumps({"processed": job.job_id if job else None}, indent=2))
+        return 0
+    stop = threading.Event()
+
+    def request_stop(_signum, _frame) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    idle_seconds = float(runtime["idle_poll_seconds"])
+    while not stop.is_set():
+        try:
+            job = worker.run_once()
+        except Exception as exc:  # worker already persisted a redacted failure audit
+            print(json.dumps({"event": "scan_job_failed", "error_type": type(exc).__name__}), file=sys.stderr)
+            # Back off: a persistent failure (e.g. database down) must not hot-loop.
+            stop.wait(idle_seconds)
+            continue
+        if job is None:
+            stop.wait(idle_seconds)
+    return 0
+
+
+def _run_scan_local(args: argparse.Namespace) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    if args.env_file:
-        load_env_file(args.env_file)
+    verify_configured_asset_bundle()
     deep_hunt_agent = PlaidNoxDeepHuntAgent.from_environment(args.model, args.max_output_tokens)
     deep_hunt_agent.set_event_sink(lambda event: print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True))
     if args.saist and not args.saist_bin:
@@ -147,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 JevKnowledgeRouter(jev_client),
                 research_provider_from_environment(
                     deep_hunt_agent.cache_telemetry,
+                    deep_hunt_agent.model_budget,
                 ),
             )
         )
@@ -156,13 +333,16 @@ def main(argv: list[str] | None = None) -> int:
         session_factory=persistence_session_factory,
         tenant_id=args.tenant_id,
     )
-    result = pipeline.scan_snapshot(
-        args.path,
-        args.codebase,
-        revision=args.revision,
-        deep_hunt_agent=deep_hunt_agent,
-        propose_patches=args.propose_patches,
-    )
+    telemetry = ScanTelemetry.from_environment()
+    with telemetry.scan(args.codebase, args.revision):
+        result = pipeline.scan_snapshot(
+            args.path,
+            args.codebase,
+            revision=args.revision,
+            deep_hunt_agent=deep_hunt_agent,
+            propose_patches=args.propose_patches,
+        )
+        telemetry.record_result(result)
     _record_context_base(context_store, result, args.path)
     decision = result.policy.decision
     finding_count = len(result.findings)

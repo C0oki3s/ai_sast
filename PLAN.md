@@ -232,6 +232,8 @@ that influenced it; every rejected candidate has a falsification record.
 
 ### Phase 5 — end-to-end product validation
 
+Status: implementation foundation complete; live acceptance evidence pending.
+
 - Run repeatable acceptance scans against `C0oki3s/NSTCTF` and additional
   multi-language fixtures with seeded and non-seeded weaknesses.
 - Measure discovery coverage, validated recall, false-positive rate, duplicate
@@ -240,11 +242,32 @@ that influenced it; every rejected candidate has a falsification record.
   provider outages, stale research, interrupted scans, and database recovery.
 - Package a worker image and migrations; document configuration and operations.
 
+Implemented in this phase:
+
+- schema-validated acceptance manifests and repeatable report scoring for
+  recall, precision, duplicates, incomplete scans, cache tokens, model tokens,
+  and reported cost;
+- ordered, checksum-verified PostgreSQL migrations and a one-shot migration
+  command;
+- a non-root worker image, immutable snapshot queue/worker commands, and
+  acceptance/operations runbooks;
+- failure-injection unit coverage for budgets, malformed configuration,
+  provider-boundary accounting, lease recovery, retries, and scan
+  finalization.
+
+Still required for the release exit: run the pinned NSTCTF and reviewed
+multi-language acceptance set repeatedly through LiteLLM, record reviewer
+validated expectations, and execute the clean-environment deployment and
+database recovery drill. These scans are deliberately not started by tests or
+deployment commands.
+
 Exit: a clean environment can migrate PostgreSQL, start a worker, scan an
 immutable snapshot, resume an interrupted scan, and produce reviewable findings
 and reports with no SCM dependency.
 
 ### Phase 6 — production controls
+
+Status: controls implemented; staging demonstration pending.
 
 - Sandboxed read-only workers with blocked default egress and explicit research
   gateway access.
@@ -252,6 +275,26 @@ and reports with no SCM dependency.
   deletion, audit logs, and disaster recovery.
 - OpenTelemetry traces and metrics with redacted logs and per-model cost limits.
 - Signed and versioned policy/config bundles independent of scanner releases.
+
+Implemented in this phase:
+
+- tenant-scoped, concurrency-limited queue leases with heartbeats, timeouts,
+  bounded attempts, daily job quotas, monthly cost quotas, and idempotent
+  enqueue requests;
+- production PostgreSQL TLS enforcement, mounted-secret support, redacted and
+  content-hashed audit events, encrypted-artifact metadata, expiry/deletion
+  records, and scan completion state;
+- per-scan and per-model LiteLLM usage budgets plus privacy-safe OpenTelemetry
+  instrumentation;
+- signed, expiring asset manifests verified before enqueue, worker startup, or
+  direct scanning;
+- a read-only, non-root, capability-free worker deployment example with an
+  internal network and read-only snapshot mount.
+
+The staging exit remains open until infrastructure demonstrates network egress
+policy, encrypted storage deletion, backup/restore, lease recovery under
+process termination, telemetry export, sustained performance, and hard
+LiteLLM gateway cost ceilings.
 
 Exit: isolation, replay safety, recovery, audit provenance, performance, and
 cost ceilings are demonstrated in staging.

@@ -2,6 +2,7 @@
   "maximum_pattern_characters": 2000,
   "maximum_hits_per_query": 500,
   "rg_timeout_seconds": 30,
+  "maximum_rg_error_characters": 800,
   "context_lines_before": 40,
   "context_lines_after": 40,
   "source_window_max_characters": 12000,

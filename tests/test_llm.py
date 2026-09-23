@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,9 @@ from plaidnox_sast.llm import (
     LiteLLMConfigurationError,
     LiteLLMResponsesClient,
     LiteLLMSettings,
+    parse_json_text,
+    parse_structured,
+    response_json,
     response_text,
 )
 
@@ -89,3 +93,60 @@ def test_response_text_falls_back_to_reasoning_item_content() -> None:
     )
 
     assert response_text(response) == '{"supported": true}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"architecture": "a", "applications": []}',
+        '```json\n{"architecture": "a", "applications": []}\n```',
+        'Here is the context:\n```\n{"architecture": "a", "applications": []}\n```\nDone.',
+        'Here is the context: {"architecture": "a", "applications": []} -- hope it helps',
+    ],
+)
+def test_structured_answers_tolerate_markdown_and_prose_wrappers(text: str) -> None:
+    assert parse_json_text(text) == {"architecture": "a", "applications": []}
+
+
+def test_truncated_structured_answer_still_fails() -> None:
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_text('```json\n{"architecture": "a", "applications": [')
+
+
+def test_response_json_reads_the_normalized_response_text() -> None:
+    response = SimpleNamespace(output_text='```json\n{"supported": true}\n```')
+    assert response_json(response) == {"supported": True}
+
+
+_OBJECT_SCHEMA = {"type": "object", "required": ["architecture", "applications"]}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[{"architecture": "api", "applications": []}]',
+        '{"repository_context": {"architecture": "api", "applications": []}}',
+        'See [a] and ["b"]: {"architecture": "api", "applications": []}',
+    ],
+)
+def test_parse_structured_unwraps_arrays_envelopes_and_bracketed_prose(text):
+    assert parse_structured(text, _OBJECT_SCHEMA) == ({"architecture": "api", "applications": []}, True)
+
+
+def test_parse_structured_prefers_the_outer_object_over_a_nested_namesake():
+    text = '{"architecture": "api", "applications": [{"architecture": "x", "applications": [], "extra": 1}]}'
+
+    value, shaped = parse_structured(text, _OBJECT_SCHEMA)
+
+    assert shaped is True
+    assert value["architecture"] == "api"
+
+
+def test_parse_structured_accepts_a_sparse_but_correctly_shaped_object():
+    assert parse_structured('{"architecture": "api"}', _OBJECT_SCHEMA) == ({"architecture": "api"}, True)
+
+
+def test_parse_structured_flags_a_wrong_shape_and_rejects_non_json():
+    assert parse_structured('["app.js"]', _OBJECT_SCHEMA) == (["app.js"], False)
+    with pytest.raises(json.JSONDecodeError):
+        parse_structured("no json here", _OBJECT_SCHEMA)

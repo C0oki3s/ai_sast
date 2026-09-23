@@ -3,6 +3,7 @@
 from .adapters import PostgresContextFabricStore, PostgresKnowledgeStore
 from .database import DatabaseConfigurationError, DatabaseSettings, session_factory
 from .models import Base
+from .migrations import MigrationError, apply_migrations, migration_plan
 from .repositories import (
     SECURITY_IR_CONTEXT_VERSION,
     CodeScanningRepository,
@@ -12,6 +13,8 @@ from .repositories import (
     HuntTaskInput,
     KnowledgeInput,
     PersistenceConflictError,
+    ProductionControlError,
+    ScanJobValue,
     SourceFileInput,
     SymbolInput,
     security_ir_inputs,
@@ -31,12 +34,17 @@ __all__ = [
     "FindingEvidenceInput",
     "HuntTaskInput",
     "KnowledgeInput",
+    "MigrationError",
     "PersistenceConflictError",
+    "ProductionControlError",
     "PostgresContextFabricStore",
     "PostgresKnowledgeStore",
     "SourceFileInput",
+    "ScanJobValue",
     "SymbolInput",
     "security_ir_inputs",
+    "apply_migrations",
+    "migration_plan",
     "session_factory",
     "snapshot_tree_hash",
     "stable_id",

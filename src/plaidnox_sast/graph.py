@@ -19,6 +19,27 @@ from pathlib import Path
 from typing import Any
 
 from .assets import load_json
+from .redaction import redact
+
+
+class RipgrepQueryError(RuntimeError):
+    """A single AI-generated query failed without making the executor unusable."""
+
+    def __init__(self, query_id: str, pattern: str, diagnostic: str, exit_code: int | None = None) -> None:
+        self.query_id = redact(query_id)
+        self.pattern_hash = hashlib.sha256(pattern.encode("utf-8")).hexdigest()
+        self.diagnostic = redact(diagnostic)
+        self.exit_code = exit_code
+        status = f"exit code {exit_code}" if exit_code is not None else "validation"
+        super().__init__(f"ripgrep query {self.query_id!r} failed ({status}): {self.diagnostic}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "pattern_hash": self.pattern_hash,
+            "exit_code": self.exit_code,
+            "diagnostic": self.diagnostic,
+        }
 
 
 @dataclass(slots=True)
@@ -233,7 +254,11 @@ class RipgrepDiscovery:
     ) -> list[SearchHit]:
         runtime = load_json("runtime/code_intelligence.json")
         if not pattern or len(pattern) > int(runtime["maximum_pattern_characters"]):
-            raise ValueError("ripgrep pattern is empty or exceeds the configured limit")
+            raise RipgrepQueryError(
+                query_id,
+                pattern,
+                "pattern is empty or exceeds the configured limit",
+            )
         command = [
             "rg",
             "--json",
@@ -254,16 +279,25 @@ class RipgrepDiscovery:
         for value in dict.fromkeys((*self.exclude, *(str(item) for item in exclude_globs))):
             command.extend(("--glob", f"!{value}"))
         command.extend(("--", pattern, "."))
-        result = subprocess.run(
-            command,
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=int(runtime["rg_timeout_seconds"]),
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.root,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=int(runtime["rg_timeout_seconds"]),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RipgrepQueryError(
+                query_id,
+                pattern,
+                "query exceeded the configured execution timeout",
+            ) from exc
         if result.returncode not in {0, 1}:
-            raise RuntimeError(f"ripgrep discovery failed with exit code {result.returncode}")
+            diagnostic = " ".join((result.stderr or "ripgrep returned no diagnostic").split())
+            maximum = int(runtime["maximum_rg_error_characters"])
+            raise RipgrepQueryError(query_id, pattern, diagnostic[:maximum], result.returncode)
         hits: list[SearchHit] = []
         limit = int(runtime["maximum_hits_per_query"])
         for line in result.stdout.splitlines():

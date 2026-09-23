@@ -716,7 +716,7 @@ and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`); the
 optional patch proposal/rescan verification stage is additive and does not
 change this exit condition.
 
-## 5. End-to-end validation
+## 5. End-to-end validation — foundation implemented, evidence pending
 
 - Repeatable acceptance scans against `C0oki3s/NSTCTF` plus multi-language
   fixtures with known positives, variants, and clean controls.
@@ -726,16 +726,42 @@ change this exit condition.
   knowledge, worker crash, and database recovery.
 - Production worker image, migration job, configuration reference, and runbook.
 
+Implemented artifacts: `acceptance.py` plus its external JSON Schema and
+example manifest; the `evaluate-acceptance` CLI; checksum-verified migration
+runner; immutable snapshot queue and worker; hardened Docker image/example;
+and the acceptance and operations runbooks. Automated tests exercise the
+evaluator, migration ordering/checksums, interruption-safe leases, retry
+limits, scan finalization, model budgets, and failure paths without starting a
+source scan.
+
+Pending evidence: repeated pinned NSTCTF and multi-language acceptance scans,
+human-reviewed expectation manifests, clean-environment bring-up, and a
+disposable PostgreSQL backup/restore drill. This section is not marked complete
+until those artifacts exist.
+
 Exit condition: a clean deployment can migrate PostgreSQL, scan an immutable
 local snapshot, resume interruption, and emit complete reports without SCM.
 
-## 6. Production controls
+## 6. Production controls — implemented, staging proof pending
 
 - Sandboxed read-only workers and explicit research-gateway egress.
 - Queue leases, timeouts, quotas, tenant isolation, encryption, retention,
   deletion, artifact lifecycle, and disaster recovery.
 - OpenTelemetry traces/metrics, redacted logs, cost ceilings, and alerts.
 - Signed and versioned policy and runtime assets.
+
+Implemented controls include tenant-scoped queue leases and heartbeats,
+idempotency, bounded retries and subprocess timeouts, concurrent/daily/monthly
+quotas, production TLS validation, mounted secrets, privacy-safe audit events,
+artifact encryption/expiry metadata, deletion requests, scan completion state,
+per-scan/per-model budgets, OpenTelemetry instrumentation, signed expiring
+asset bundles, and a non-root read-only worker deployment example.
+
+The release exit remains open until AWS staging demonstrates blocked default
+egress with gateway-only provider access, encrypted artifact deletion,
+backup/restore and disaster recovery, lease reclamation after forced worker
+termination, actual telemetry export, sustained load, and LiteLLM-side hard
+cost enforcement.
 
 Exit condition: isolation, auditability, replay safety, recovery, performance,
 and cost limits are demonstrated in staging.

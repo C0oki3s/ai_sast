@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -54,8 +55,19 @@ def render_prompt(template_name: str, **values: Any) -> str:
     return rendered
 
 
-def render_operation(operation: str, payload: dict[str, Any]) -> tuple[str, str]:
-    """Render the stable system prefix and the dynamic evidence message separately."""
+def render_operation(
+    operation: str,
+    payload: dict[str, Any],
+    *,
+    output_schema: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Render the stable system prefix and the dynamic evidence message separately.
+
+    `output_schema` must be the exact schema object sent with the request.
+    The prompt states it verbatim, so gateways or models that ignore the
+    API-level `json_schema` format still receive the output contract, and
+    the prompt can never describe a different shape from the one enforced.
+    """
     manifest = load_json("prompts/manifest.json")
     try:
         specification = manifest["operations"][operation]
@@ -63,6 +75,11 @@ def render_operation(operation: str, payload: dict[str, Any]) -> tuple[str, str]
         user_template = str(specification["user"])
     except (KeyError, TypeError) as exc:
         raise PromptTemplateError(f"Unknown prompt operation {operation!r}") from exc
-    system = render_prompt(system_template)
+    system = "\n\n".join(
+        (
+            render_prompt(system_template),
+            render_prompt("_partials/output_contract.md", output_schema=dict(output_schema)),
+        )
+    )
     user = render_prompt(user_template, payload=payload)
     return system, user

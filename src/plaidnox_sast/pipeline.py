@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -123,6 +124,12 @@ class SastPipeline:
         reset_model_input_audit = getattr(deep_hunt_agent, "reset_model_input_audit", None)
         if callable(reset_model_input_audit):
             reset_model_input_audit()
+        reset_model_budget = getattr(deep_hunt_agent, "reset_model_budget", None)
+        if callable(reset_model_budget):
+            reset_model_budget()
+        reset_search_query_errors = getattr(deep_hunt_agent, "reset_search_query_errors", None)
+        if callable(reset_search_query_errors):
+            reset_search_query_errors()
 
         codebase_id = ""
         scan_id = ""
@@ -466,6 +473,7 @@ class SastPipeline:
                         }
 
         policy = PolicyEngine().evaluate(findings, config.policy)
+        ai_search_query_failures = len(getattr(deep_hunt_agent, "search_query_errors", []))
         ai_scan_incomplete = bool(
             ai_context_failures
             or ai_planning_failures
@@ -474,6 +482,7 @@ class SastPipeline:
             or ai_variant_failures
             or ai_capability_chain_failures
             or ai_consolidation_failures
+            or ai_search_query_failures
         )
         if ai_scan_incomplete and policy.decision is PolicyDecision.PASS:
             # Coverage failures must never be reported as a clean scan, so a would-be
@@ -488,8 +497,38 @@ class SastPipeline:
                 policy.decision,
                 [*policy.reasons, "PlaidNox Deep Hunt was also incomplete; review recorded error metrics"],
             )
+        persistence_scan_finalized = False
+        if self.session_factory is not None and scan_id:
+            try:
+                with unit_of_work(self.session_factory, self.tenant_id) as repository:
+                    persistence_scan_finalized = repository.finish_scan(
+                        scan_id,
+                        coverage_complete=not ai_scan_incomplete,
+                        failure_code="ai_scan_incomplete" if ai_scan_incomplete else "",
+                    )
+                    # Feed the tenant monthly cost quota; without this no usage
+                    # event is ever written and the quota can never trip.
+                    usage_by_model = getattr(
+                        getattr(deep_hunt_agent, "model_budget", None), "usage_by_model", dict
+                    )()
+                    # scan_id is stable per revision, but every run (rescan, worker
+                    # retry) really spends, so each run gets its own usage identity.
+                    usage_run = uuid.uuid4().hex
+                    for model_alias, (input_tokens, output_tokens, cost_usd) in usage_by_model.items():
+                        repository.record_model_usage(
+                            stable_id("usage", scan_id, usage_run, model_alias),
+                            scan_id,
+                            model_alias,
+                            input_tokens,
+                            output_tokens,
+                            cost_usd,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                persistence_error_type = persistence_error_type or type(exc).__name__
+                persistence_error = persistence_error or str(exc)[:240]
         prompt_cache_metrics = getattr(deep_hunt_agent, "prompt_cache_metrics", dict)()
         model_input_metrics = getattr(deep_hunt_agent, "model_input_metrics", dict)()
+        model_budget_metrics = getattr(deep_hunt_agent, "model_budget_metrics", dict)()
         model_input_audit = getattr(deep_hunt_agent, "model_input_audit", list)()
         if model_input_audit:
             repository_context["model_input_audit"] = model_input_audit
@@ -544,6 +583,8 @@ class SastPipeline:
                 "ai_consolidation_error": ai_consolidation_error,
                 "ai_consolidation_unexpected_failure": ai_consolidation_unexpected_failure,
                 "ai_scan_incomplete": ai_scan_incomplete,
+                "ai_search_query_failures": ai_search_query_failures,
+                "ai_search_query_errors": list(getattr(deep_hunt_agent, "search_query_errors", [])),
                 "ai_patch_proposals": ai_patch_proposals,
                 "ai_patch_verified": ai_patch_verified,
                 "ai_patch_unverified": ai_patch_unverified,
@@ -559,8 +600,10 @@ class SastPipeline:
                 "persistence_finding_error_type": persistence_finding_error_type,
                 "persistence_finding_error": persistence_finding_error,
                 "persistence_findings_flagged_for_revalidation": persistence_findings_flagged_for_revalidation,
+                "persistence_scan_finalized": persistence_scan_finalized,
                 **prompt_cache_metrics,
                 **model_input_metrics,
+                **model_budget_metrics,
             },
             repository_context=repository_context,
         )

@@ -94,7 +94,9 @@ PLAIDNOX_DATABASE_URL=postgresql+psycopg://user:password@postgres/code_scanning
 ```
 
 The deployable schema is
-`src/plaidnox_sast/assets/migrations/postgresql/0001_code_scanning_core.sql`.
+the ordered set under
+`src/plaidnox_sast/assets/migrations/postgresql/`. Apply it with
+`plaidnox-sast migrate`; the runner records and verifies migration checksums.
 When the database URL is configured, Security IR, Context Fabric, security
 memory, sourced knowledge, hunt plans/tasks, findings, evidence, and finding
 dependencies use PostgreSQL. The SQLite adapters are retained only for local
@@ -144,3 +146,15 @@ root-cause sweep discipline. Attribution is recorded in the repository `NOTICE.m
 - `report.md` — readable assessment.
 - `repository-context.json` — application architecture, source inventory, and
   readable source tree.
+
+## Production worker and acceptance
+
+The Phase 5/6 worker image and hardened Compose example are under
+`docker/code-scanning/`. Production workers consume queued immutable local
+snapshots, verify their tree hashes, maintain database leases, and write to a
+separate output root. They do not clone source or own SCM behavior.
+
+See [production operations](docs/CODE_SCANNING_OPERATIONS.md) for migrations,
+signed assets, private-network deployment, recovery, retention, and telemetry.
+See [the acceptance gate](docs/CODE_SCANNING_ACCEPTANCE.md) for repeatable
+recall/precision/duplicate/cost scoring over completed reports.
