@@ -796,12 +796,57 @@ matching priority item (11):
 - **Redacted failure trace.** An unhandled exception during review marks the
   attempt `"failed"` with a redacted `error_message` (`plaidnox_sast.redaction`)
   and re-raises unchanged; the API's existing `500` behavior is unaffected.
+- **Performance and privacy regression tests (priority item 12).**
+  `tests/test_scm_review_attempt_performance.py` seeds 500 unrelated attempt
+  rows and counts SQL statements via a `before_cursor_execute` listener to
+  prove one `claim`/`complete` cycle stays bounded regardless of table size,
+  instead of asserting on wall-clock time. `tests/test_scm_review_attempt_privacy.py`
+  proves the durable table never carries a raw secret: a failure's persisted
+  `error_message` is redacted, and a replayed duplicate-delivery response
+  (served from stored `findings` rather than a re-run) still carries the
+  redacted text, not the original.
 
-Deliberately deferred, not dropped: performance/privacy load tests for the
-review-attempt path, and the provider-neutral triage/remediation contracts
-described in "PR/MR Finding Delivery, Triage, and Remediation Plan" below.
-The `plaidnox-scm` CLI's local `review` subcommand is untouched -- lease
-semantics exist to dedupe concurrent HTTP deliveries, not ad-hoc local runs.
+Deliberately deferred, not dropped: the provider-neutral triage/remediation
+contracts described in "PR/MR Finding Delivery, Triage, and Remediation Plan"
+below. The `plaidnox-scm` CLI's local `review` subcommand is untouched --
+lease semantics exist to dedupe concurrent HTTP deliveries, not ad-hoc local
+runs.
+
+#### Implementation status (Wave 8)
+
+Wave 8 is correctness hardening found by an external review of Wave 7, fixed
+before the first real end-to-end NSTCTF run rather than after:
+
+- **`review_id` includes `base_sha`.** Previously keyed on `provider` +
+  `installation_id` + `repository_id` + `review_number` + `head_sha` only. If
+  the target branch advanced while a PR's head stayed the same, `base...head`
+  named a different diff but hashed to the same `review_id` -- a duplicate
+  delivery would have replayed the *old* base's stale result instead of
+  reviewing the new diff. Fixed in `api_service._review_id`.
+- **Lease heartbeat.** `ReviewAttemptRepository.renew` extends an owned
+  lease's expiry; `api_service._LeaseHeartbeat` runs it on a background
+  thread for the duration of `ReviewService.run`'s scan. This decouples scan
+  duration from lease length: `review_attempt_lease_seconds` dropped from
+  600 to 180 and a new `review_attempt_heartbeat_seconds` (45) keeps it
+  renewed, so a crashed worker is reclaimed within ~3 minutes but a healthy
+  scan has no time ceiling.
+- **Lost-lease completion is rejected.** `ReviewService.run` now checks
+  `complete()`'s return value; if another worker's reclaim already won the
+  lease (e.g. this one stalled past expiry), the stale result is not
+  returned -- it raises the same `ReviewAttemptConflictError` a live
+  conflict gets (`409`), so a bot never publishes a superseded result.
+- **First-insert race no longer surfaces a 500.** Two workers can both read
+  "no row exists" for a fresh `review_id` before either commits its insert.
+  `ReviewAttemptRepository.claim` now wraps the insert in a `SAVEPOINT` and
+  catches the `IntegrityError` from losing that race, falling through to the
+  normal reclaim/replay/conflict path against the row that actually won.
+- **`ApplicationContext` cache is keyed per baseline revision.** Previously
+  primary-keyed on `(tenant_id, codebase_id)` only, with `baseline_revision`
+  a plain column checked after fetch -- two concurrently open PRs against
+  different base commits continuously overwrote the same cached context row.
+  `scm_application_contexts` is now primary-keyed on `(tenant_id,
+  codebase_id, baseline_revision)` (migration `0004`), so multiple open base
+  revisions coexist.
 
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 

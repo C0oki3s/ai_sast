@@ -45,7 +45,7 @@ def test_upsert_then_get_round_trips_through_sqlite() -> None:
         repository.upsert_context(_context("codebase-1", "tenant-a"))
 
     with unit_of_work(factory, "tenant-a") as repository:
-        fetched = repository.get_context("codebase-1")
+        fetched = repository.get_context("codebase-1", "base-sha")
 
     assert fetched is not None
     assert fetched.application_type == "node-express"
@@ -60,7 +60,7 @@ def test_get_context_is_tenant_scoped() -> None:
         repository.upsert_context(_context("codebase-1", "tenant-a"))
 
     with unit_of_work(factory, "tenant-b") as repository:
-        fetched = repository.get_context("codebase-1")
+        fetched = repository.get_context("codebase-1", "base-sha")
 
     assert fetched is None
 
@@ -74,12 +74,30 @@ def test_same_codebase_identity_can_be_cached_for_multiple_tenants() -> None:
         repository.upsert_context(_context("shared-codebase", "tenant-b"))
 
     with unit_of_work(factory, "tenant-a") as repository:
-        tenant_a = repository.get_context("shared-codebase")
+        tenant_a = repository.get_context("shared-codebase", "base-sha")
     with unit_of_work(factory, "tenant-b") as repository:
-        tenant_b = repository.get_context("shared-codebase")
+        tenant_b = repository.get_context("shared-codebase", "base-sha")
 
     assert tenant_a is not None and tenant_a.tenant_id == "tenant-a"
     assert tenant_b is not None and tenant_b.tenant_id == "tenant-b"
+
+
+def test_two_open_prs_against_different_base_revisions_do_not_clobber_each_other() -> None:
+    """Two concurrently open PRs against different base commits must each keep their own cache entry."""
+
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.upsert_context(replace(_context("codebase-1", "tenant-a"), baseline_revision="base-a"))
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.upsert_context(replace(_context("codebase-1", "tenant-a"), baseline_revision="base-b"))
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        for_base_a = repository.get_context("codebase-1", "base-a")
+        for_base_b = repository.get_context("codebase-1", "base-b")
+
+    assert for_base_a is not None and for_base_a.baseline_revision == "base-a"
+    assert for_base_b is not None and for_base_b.baseline_revision == "base-b"
 
 
 def test_get_or_compute_reuses_cached_context_without_recomputing() -> None:
@@ -116,6 +134,12 @@ def test_get_or_compute_rebuilds_context_when_baseline_changes() -> None:
         repository.get_or_compute("codebase-1", "base-b", lambda: compute("base-b"))
 
     assert calls == 2
+
+    # Both revisions must still be independently cached -- a second PR against
+    # "base-b" must not have evicted the still-open PR against "base-a".
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.get_or_compute("codebase-1", "base-a", lambda: compute("base-a"))
+    assert calls == 2  # cache hit: "base-a" was not clobbered by the "base-b" write
 
 
 def test_get_or_compute_rebuilds_context_when_builder_version_changes() -> None:

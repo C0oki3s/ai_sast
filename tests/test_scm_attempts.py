@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_scm.attempts import (
     ReviewAttemptConflictError,
@@ -200,3 +200,68 @@ def test_fail_then_reclaim_and_complete() -> None:
         attempt = repository.claim("review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-2"))
     assert attempt.state == "running"
     assert attempt.attempt_count == 2
+
+
+def test_renew_extends_an_owned_lease_so_a_short_lease_survives_a_long_scan() -> None:
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+    epoch = datetime(2024, 1, 1, tzinfo=UTC)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.claim(
+            "review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-1", lease_seconds=60, now=epoch)
+        )
+        renewed = repository.renew("review-1", "worker-1", 60, now=epoch + timedelta(seconds=50))
+    assert renewed is True
+
+    # Without the renewal this claim (at +70s, past the original 60s lease)
+    # would have reclaimed the lease from worker-1; the heartbeat pushed
+    # expiry to +110s, so it is still owned and must conflict instead.
+    with pytest.raises(ReviewAttemptConflictError):
+        with unit_of_work(factory, "tenant-a") as repository:
+            repository.claim(
+                "review-1",
+                "codebase-1",
+                **_claim_kwargs(lease_owner="worker-2", now=epoch + timedelta(seconds=70)),
+            )
+
+
+def test_renew_after_lease_stolen_is_a_noop() -> None:
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+    past = datetime.now(UTC) - timedelta(hours=1)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.claim(
+            "review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-1", lease_seconds=1, now=past)
+        )
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.claim("review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-2"))
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        renewed = repository.renew("review-1", "worker-1", 60)
+    assert renewed is False
+
+
+def test_concurrent_first_claim_race_is_resolved_by_refetch_not_a_500(monkeypatch) -> None:
+    """Two workers both reading "no row" before either INSERTs must not surface a raw IntegrityError."""
+
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.claim("review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-winner"))
+
+    real_get = Session.get
+    seen = {"count": 0}
+
+    def fake_get(self: Session, entity: object, ident: object, *args: object, **kwargs: object) -> object:
+        seen["count"] += 1
+        if seen["count"] == 1:
+            # Simulate the race: this worker's read happened before
+            # worker-winner's row was visible to it.
+            return None
+        return real_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "get", fake_get)
+
+    with pytest.raises(ReviewAttemptConflictError):
+        with unit_of_work(factory, "tenant-a") as repository:
+            repository.claim("review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-loser"))

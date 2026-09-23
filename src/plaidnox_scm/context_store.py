@@ -52,15 +52,20 @@ class ApplicationContextRepository:
     def get_context(
         self,
         codebase_id: str,
-        baseline_revision: str | None = None,
+        baseline_revision: str,
         *,
         builder_version: str | None = None,
         context_version: str | None = None,
     ) -> ApplicationContext | None:
-        record = self._session.get(ApplicationContextRecord, (self._tenant_id, codebase_id))
+        """Look up the context cached for this exact codebase + baseline revision.
+
+        Keyed on `baseline_revision` (not just `codebase_id`) so two
+        concurrently open PRs against different base commits each get their
+        own cache entry instead of overwriting one another's.
+        """
+
+        record = self._session.get(ApplicationContextRecord, (self._tenant_id, codebase_id, baseline_revision))
         if record is None:
-            return None
-        if baseline_revision is not None and record.baseline_revision != baseline_revision:
             return None
         if builder_version is not None and record.builder_version != builder_version:
             return None
@@ -69,11 +74,16 @@ class ApplicationContextRepository:
         return _to_value(record)
 
     def upsert_context(self, context: ApplicationContext) -> ApplicationContext:
-        record = self._session.get(ApplicationContextRecord, (self._tenant_id, context.codebase_id))
+        record = self._session.get(
+            ApplicationContextRecord, (self._tenant_id, context.codebase_id, context.baseline_revision)
+        )
         if record is None:
-            record = ApplicationContextRecord(codebase_id=context.codebase_id, tenant_id=self._tenant_id)
+            record = ApplicationContextRecord(
+                codebase_id=context.codebase_id,
+                tenant_id=self._tenant_id,
+                baseline_revision=context.baseline_revision,
+            )
             self._session.add(record)
-        record.baseline_revision = context.baseline_revision
         record.source_tree_hash = context.source_tree_hash
         record.builder_version = context.builder_version
         record.application_type = context.application_type

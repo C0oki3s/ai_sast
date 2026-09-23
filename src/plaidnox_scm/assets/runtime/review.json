@@ -7,7 +7,8 @@
   "l1_max_output_tokens": 6000,
   "maximum_file_bytes": 262144,
   "maximum_application_context_characters": 24000,
-  "review_attempt_lease_seconds": 600,
+  "review_attempt_lease_seconds": 180,
+  "review_attempt_heartbeat_seconds": 45,
   "review_attempt_max_attempts": 3,
   "context_broker": {
     "maximum_requests_per_candidate": 8,

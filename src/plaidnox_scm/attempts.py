@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import or_, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import ReviewAttemptRecord
@@ -112,7 +113,7 @@ class ReviewAttemptRepository:
 
         record = self._session.get(ReviewAttemptRecord, review_id)
         if record is None:
-            record = ReviewAttemptRecord(
+            new_record = ReviewAttemptRecord(
                 review_id=review_id,
                 tenant_id=self._tenant_id,
                 codebase_id=codebase_id,
@@ -129,9 +130,20 @@ class ReviewAttemptRepository:
                 findings=[],
                 started_at=moment,
             )
-            self._session.add(record)
-            self._session.flush()
-            return _to_value(record)
+            try:
+                with self._session.begin_nested():
+                    self._session.add(new_record)
+                    self._session.flush()
+            except IntegrityError:
+                # Lost the create race: two workers both read no row for this
+                # review_id, and the other one's INSERT committed first. Fall
+                # through to the reclaim/replay/conflict path below against
+                # the row that actually won, instead of surfacing a 500.
+                self._session.expire_all()
+                record = self._session.get(ReviewAttemptRecord, review_id)
+                assert record is not None
+            else:
+                return _to_value(new_record)
 
         # `lease_expires_at` is compared to `moment` only inside the SQL WHERE
         # below, never as a fetched Python datetime -- SQLite drops tzinfo on
@@ -187,6 +199,34 @@ class ReviewAttemptRepository:
             record = refreshed
 
         raise ReviewAttemptConflictError(f"review {review_id} is already running under an unexpired lease")
+
+    def renew(
+        self,
+        review_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Heartbeat: push the lease's expiry out. False (no-op) if the lease was lost.
+
+        Lets a long-running review keep a short, fast-reclaimable lease
+        instead of needing one long enough to cover the slowest possible
+        scan up front.
+        """
+
+        moment = now or datetime.now(UTC)
+        result = self._session.execute(
+            update(ReviewAttemptRecord)
+            .where(
+                ReviewAttemptRecord.review_id == review_id,
+                ReviewAttemptRecord.lease_owner == lease_owner,
+                ReviewAttemptRecord.state == "running",
+            )
+            .values(lease_expires_at=moment + timedelta(seconds=lease_seconds))
+        )
+        self._session.flush()
+        return result.rowcount == 1
 
     def complete(
         self,

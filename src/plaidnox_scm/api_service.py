@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import uuid4
@@ -12,14 +13,59 @@ from sqlalchemy.orm import Session, sessionmaker
 from plaidnox_sast.redaction import redact
 
 from . import attempts
-from .api_models import PolicyAction, ReviewAttemptStatus, ReviewFinding, ReviewRequest, ReviewResponse
+from .api_models import (
+    PolicyAction,
+    ReviewAttemptStatus,
+    ReviewFinding,
+    ReviewRequest,
+    ReviewResponse,
+)
 from .assets import load_json
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
 from .source_broker import SourceBroker
 
-
 DependenciesFactory = Callable[[], ReviewDependencies]
+
+
+class _LeaseHeartbeat:
+    """Renews a review attempt's lease while a scan is still running.
+
+    A single fixed lease long enough to cover the slowest possible scan
+    would also be slow to reclaim from a genuinely dead worker. Renewing a
+    short lease on a heartbeat gets both: fast reclaim on a crash, and no
+    ceiling on how long a healthy scan may run.
+    """
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        tenant_id: str,
+        review_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+        heartbeat_seconds: float,
+    ) -> None:
+        self._session_factory = session_factory
+        self._tenant_id = tenant_id
+        self._review_id = review_id
+        self._lease_owner = lease_owner
+        self._lease_seconds = lease_seconds
+        self._heartbeat_seconds = heartbeat_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._heartbeat_seconds):
+            with attempts.unit_of_work(self._session_factory, self._tenant_id) as repository:
+                repository.renew(self._review_id, self._lease_owner, self._lease_seconds)
 
 _COUNTER_FIELDS = (
     "candidates_generated",
@@ -67,18 +113,18 @@ class ReviewService:
         if attempt.state == "completed":
             return _replay_response(attempt)
 
+        heartbeat = _LeaseHeartbeat(
+            self.session_factory,
+            tenant_id,
+            review_id,
+            lease_owner,
+            int(runtime["review_attempt_lease_seconds"]),
+            float(runtime["review_attempt_heartbeat_seconds"]),
+        )
+        heartbeat.start()
         try:
-            with self.source_broker.materialize(request) as source:
-                result = review_pull_request(
-                    source.repo_path,
-                    source.base_revision,
-                    source.head_revision,
-                    codebase_id,
-                    tenant_id,
-                    self.session_factory,
-                )
-                if result.outcome == "configuration_required":
-                    dependencies = self.dependencies_factory()
+            try:
+                with self.source_broker.materialize(request) as source:
                     result = review_pull_request(
                         source.repo_path,
                         source.base_revision,
@@ -86,23 +132,35 @@ class ReviewService:
                         codebase_id,
                         tenant_id,
                         self.session_factory,
-                        context_builder=dependencies.context_builder,
-                        l1_reviewer=dependencies.l1_reviewer,
-                        candidate_verifier=dependencies.candidate_verifier,
                     )
-        except Exception as exc:
-            with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
-                repository.fail(
-                    review_id,
-                    lease_owner,
-                    error_type=type(exc).__name__,
-                    error_message=redact(str(exc)),
-                )
-            raise
+                    if result.outcome == "configuration_required":
+                        dependencies = self.dependencies_factory()
+                        result = review_pull_request(
+                            source.repo_path,
+                            source.base_revision,
+                            source.head_revision,
+                            codebase_id,
+                            tenant_id,
+                            self.session_factory,
+                            context_builder=dependencies.context_builder,
+                            l1_reviewer=dependencies.l1_reviewer,
+                            candidate_verifier=dependencies.candidate_verifier,
+                        )
+            except Exception as exc:
+                with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
+                    repository.fail(
+                        review_id,
+                        lease_owner,
+                        error_type=type(exc).__name__,
+                        error_message=redact(str(exc)),
+                    )
+                raise
+        finally:
+            heartbeat.stop()
 
         response = _response(request, result)
         with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
-            repository.complete(
+            completed = repository.complete(
                 review_id,
                 lease_owner,
                 outcome=result.outcome,
@@ -111,6 +169,14 @@ class ReviewService:
                 incomplete_reason=response.incomplete_reason,
                 counters=_counters_dict(result.counters),
                 findings=[finding.model_dump(mode="json") for finding in response.findings],
+            )
+        if not completed:
+            # Another worker's reclaim already won the lease -- e.g. this one
+            # stalled past its lease and a duplicate delivery took over. That
+            # worker's result is the one of record; this result must not be
+            # published, so surface it as the same 409 a live conflict gets.
+            raise attempts.ReviewAttemptConflictError(
+                f"review {review_id} lease was lost before completion"
             )
         return response
 
@@ -201,12 +267,17 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
 
 
 def _review_id(request: ReviewRequest) -> str:
+    # `base_sha` is part of the identity, not just `head_sha`: if the target
+    # branch advances while the same PR head is still open, `base...head`
+    # names a different diff and must get its own review, not a replay of
+    # the review completed against the old base.
     identity = ":".join(
         (
             request.provider,
             str(request.installation_id),
             str(request.repository_id),
             str(request.review_number),
+            request.base_sha.lower(),
             request.head_sha.lower(),
         )
     )

@@ -20,13 +20,18 @@ class Base(DeclarativeBase):
 
 
 class ApplicationContextRecord(Base):
-    """Cached Layer-1 ApplicationContext for one codebase (Contextual Review Plan v2, Layer 1)."""
+    """Cached Layer-1 ApplicationContext for one codebase (Contextual Review Plan v2, Layer 1).
+
+    Keyed per `baseline_revision`, not just per codebase -- two concurrently
+    open PRs against different base commits must not overwrite each other's
+    cached context.
+    """
 
     __tablename__ = "scm_application_contexts"
 
     tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     codebase_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    baseline_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    baseline_revision: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_tree_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     builder_version: Mapped[str] = mapped_column(String(64), nullable=False)
     application_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
