@@ -116,3 +116,28 @@ def test_context_broker_blocks_path_escape_and_redacts_secret_shaped_evidence(tm
     redacted = expansion.evidence[1].records[0]["content"]
     assert "AKIAABCDEFGHIJKLMNOP" not in redacted
     assert "<redacted-aws-access-key>" in redacted
+
+
+def test_context_broker_resolves_definition_requests_given_as_paths(tmp_path: Path) -> None:
+    (tmp_path / "auth.js").write_text("export function validate(token) { return token; }\n")
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "user.js").write_text(
+        "const mongoose = require('mongoose');\n"
+        "const User = mongoose.model('User', new mongoose.Schema({ email: String }));\n"
+        "module.exports = User;\n"
+    )
+    graph = build_structural_graph(tmp_path)
+    candidate = _candidate(
+        ExpansionRequest("definition", "auth.js", "Path with extracted symbols."),
+        ExpansionRequest("definition", "auth.js:validate", "Path-qualified symbol."),
+        ExpansionRequest("definition", "models/user.js", "Path with no extracted symbols."),
+        ExpansionRequest("definition", "User", "Binding Tree-sitter does not index."),
+    )
+
+    expansion = SCMContextBroker().expand(tmp_path, graph, candidate, _context())
+
+    assert expansion.complete is True
+    assert expansion.evidence[0].records[0]["symbol"] == "validate"
+    assert expansion.evidence[1].records[0]["path"] == "auth.js"
+    assert "mongoose.model" in expansion.evidence[2].records[0]["content"]
+    assert expansion.evidence[3].records[0]["path"] == "models/user.js"

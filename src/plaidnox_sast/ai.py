@@ -454,7 +454,15 @@ class PlaidNoxDeepHuntAgent:
             reasoning_effort_override=reasoning_effort_override,
         )
         review = _deep_hunt_result_from_response(response)
-        _validate_deep_hunt_result(root, candidate, review, metadata_only=metadata_only)
+        _validate_deep_hunt_result(
+            root,
+            candidate,
+            review,
+            metadata_only=metadata_only,
+            evidence_paths=_evidence_paths(
+                candidate, context_expansions, evidence["protected_security_context"]
+            ),
+        )
         return review
 
     def _apply_retry_route(
@@ -2098,6 +2106,7 @@ def _validate_deep_hunt_result(
     review: DeepHuntResult,
     *,
     metadata_only: bool = False,
+    evidence_paths: frozenset[str] | None = None,
 ) -> None:
     expected_gates = {
         "design_invariant",
@@ -2131,17 +2140,51 @@ def _validate_deep_hunt_result(
             raise AIResponseError("Metadata-only review invented source-code evidence locations")
         return
 
-    target = (root / candidate.evidence.path).resolve()
-    if root.resolve() not in target.parents or not target.is_file():
-        raise AIResponseError("AI review evidence path escapes the repository")
-    line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+    # Cross-file findings (change in one file, impact in another) legitimately
+    # cite any file the verifier was shown -- not only the candidate's own.
+    allowed = evidence_paths or frozenset({candidate.evidence.path})
+    line_counts: dict[str, int] = {}
     for location in review.evidence_locations:
         start = int(location.get("start_line", 0))
         end = int(location.get("end_line", 0))
-        if str(location.get("path", "")) != candidate.evidence.path:
+        path = str(location.get("path", ""))
+        if path not in allowed:
             raise AIResponseError("AI review cited a location outside the supplied evidence file")
-        if start < 1 or end < start or end > line_count:
+        if path not in line_counts:
+            target = (root / path).resolve()
+            if root.resolve() not in target.parents or not target.is_file():
+                raise AIResponseError("AI review evidence path escapes the repository")
+            line_counts[path] = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+        if start < 1 or end < start or end > line_counts[path]:
             raise AIResponseError("AI review cited an invalid evidence line range")
+
+
+_EVIDENCE_PATH = re.compile(r'"path":\s*"([^"\\]+)"')
+
+
+def _evidence_paths(
+    candidate: Candidate,
+    context_expansions: list[dict[str, Any]],
+    security_context: str,
+) -> frozenset[str]:
+    """Repository paths whose source the verifier was actually shown."""
+
+    paths = {candidate.evidence.path}
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "path" and isinstance(item, str):
+                    paths.add(item)
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(context_expansions)
+    paths.update(_EVIDENCE_PATH.findall(security_context))
+    return frozenset(paths)
 
 
 def _patch_proposal_from_response(response: Any) -> PatchProposal:

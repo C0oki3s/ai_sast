@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from plaidnox_sast.graph import Call, RipgrepDiscovery, StructuralGraph, Symbol
+from plaidnox_sast.graph import Call, Reference, RipgrepDiscovery, StructuralGraph, Symbol
 from plaidnox_sast.redaction import redact
 
 from .assets import load_json
@@ -176,12 +176,23 @@ class SCMContextBroker:
         request: ExpansionRequest,
         runtime: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        # L1 is asked for an exact symbol but routinely sends a repository path
+        # ("models/NST.js") or "path:symbol". Matching only symbol names left
+        # every such request -- and so every candidate -- unresolved.
+        path, symbol_name = _definition_target(request.target, graph)
         matches = [
             symbol
             for symbol in graph.symbols
-            if _symbol_matches(symbol.name, symbol.qualified_name, request.target)
+            if (not symbol_name or _symbol_matches(symbol.name, symbol.qualified_name, symbol_name))
+            and (path is None or symbol.path == path)
         ]
-        return [_symbol_record(root, symbol, runtime) for symbol in matches]
+        if matches:
+            return [_symbol_record(root, symbol, runtime) for symbol in matches]
+        if path is not None:
+            # The file is admitted but Tree-sitter extracted no matching symbol
+            # (e.g. `const User = mongoose.model(...)`): return its head instead.
+            return _file_head_records(root, path, runtime)
+        return _declaration_records(root, graph, symbol_name, runtime)
 
     def _callers(
         self,
@@ -193,7 +204,16 @@ class SCMContextBroker:
         runtime: dict[str, Any],
     ) -> list[dict[str, Any]]:
         calls = [call for call in graph.calls if _name_matches(call.callee, request.target)]
-        return [_call_record(root, call, "caller", runtime) for call in calls]
+        if calls:
+            return [_call_record(root, call, "caller", runtime) for call in calls]
+        # Functions passed by reference (Express middleware: `app.get(p, authCheck, h)`,
+        # callbacks, decorators) have no call edge, only identifier references.
+        references = [
+            reference
+            for reference in graph.references
+            if reference.kind == "identifier" and _name_matches(reference.target, request.target)
+        ]
+        return [_reference_record(root, reference, runtime) for reference in references]
 
     def _callees(
         self,
@@ -313,6 +333,55 @@ class SCMContextBroker:
         return records
 
 
+def _definition_target(target: str, graph: StructuralGraph) -> tuple[str | None, str]:
+    """Split a definition target into (admitted graph path or None, symbol name)."""
+
+    target = target.strip()
+    known = {item.path for item in graph.files}
+    if target in known:
+        return target, ""
+    for separator in ("#", ":"):
+        path, _, name = target.rpartition(separator)
+        if path in known and name and not name.isdigit():
+            return path, name
+    return None, target
+
+
+def _file_head_records(root: Path, path: str, runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    span = int(runtime["context_lines_before"]) + int(runtime["context_lines_after"])
+    record = _source_record(root, path, 1, span * 3, runtime)
+    return [{"kind": "definition", "symbol": path, **record}] if record else []
+
+
+def _declaration_records(
+    root: Path,
+    graph: StructuralGraph,
+    name: str,
+    runtime: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Find `const|let|var|class|function NAME` bindings Tree-sitter did not index."""
+
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+        return []
+    declaration = re.compile(rf"\b(?:const|let|var|class|function|def)\s+{re.escape(name)}\b")
+    maximum = int(runtime["maximum_records_per_request"])
+    records: list[dict[str, Any]] = []
+    for file_ir in graph.files:
+        target = root.resolve() / file_ir.path
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for number, line in enumerate(lines, start=1):
+            if declaration.search(line):
+                record = _source_record(root, file_ir.path, number, number, runtime)
+                if record:
+                    records.append({"kind": "definition", "symbol": name, **record})
+                if len(records) >= maximum:
+                    return records
+    return records
+
+
 def _symbol_matches(name: str, qualified_name: str, target: str) -> bool:
     return _name_matches(name, target) or _name_matches(qualified_name, target)
 
@@ -345,6 +414,19 @@ def _call_record(root: Path, call: Call, relationship: str, runtime: dict[str, A
         "path": call.path,
         "start_line": call.line,
         "end_line": call.line,
+        "content": source["content"] if source else "",
+    }
+
+
+def _reference_record(root: Path, reference: Reference, runtime: dict[str, Any]) -> dict[str, Any]:
+    source = _source_record(root, reference.path, reference.line, reference.line, runtime)
+    return {
+        "kind": "reference",
+        "relationship": "caller",
+        "symbol": reference.target,
+        "path": reference.path,
+        "start_line": reference.line,
+        "end_line": reference.line,
         "content": source["content"] if source else "",
     }
 
