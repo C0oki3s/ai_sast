@@ -1,0 +1,45 @@
+"""Authenticated HTTP API consumed by provider webhook adapters."""
+
+from __future__ import annotations
+
+import hmac
+
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
+
+from .api_models import ReviewRequest, ReviewResponse
+from .api_service import ReviewService
+from .source_broker import SourceBrokerError
+
+
+def create_app(service: ReviewService, *, api_token: str) -> FastAPI:
+    expected_token = api_token.strip()
+    if not expected_token:
+        raise ValueError("A non-empty API token is required")
+
+    app = FastAPI(title="PlaidNox SCM Review API", version="1.0.0")
+
+    def authenticate(authorization: str | None = Header(default=None)) -> None:
+        prefix = "Bearer "
+        if authorization is None or not authorization.startswith(prefix):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token")
+        supplied = authorization[len(prefix) :]
+        if not hmac.compare_digest(supplied.encode(), expected_token.encode()):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token")
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post(
+        "/v1/reviews",
+        response_model=ReviewResponse,
+        dependencies=[Depends(authenticate)],
+    )
+    async def review(request: ReviewRequest) -> ReviewResponse:
+        try:
+            return await run_in_threadpool(service.run, request)
+        except SourceBrokerError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    return app

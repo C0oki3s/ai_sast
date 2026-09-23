@@ -746,3 +746,9 @@ SCM Integration is active in the separate `plaidnox_scm` package. Code
 Scanning remains an immutable-snapshot analysis API with no provider-specific
 orchestration. SCM implementation status and delivery order are maintained in
 `docs/PRODUCT_WORKSTREAMS.md`.
+
+GitHub provider behavior already lives in `PlaidNox/plaidnox-github-bot`.
+Webhook signatures, installation tokens, check runs, inline comments, and
+stale-HEAD publication must remain there. `plaidnox_scm` implements the
+authenticated provider-neutral `POST /v1/reviews` contract consumed by that
+bot and must not duplicate its provider adapter.

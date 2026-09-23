@@ -17,6 +17,12 @@ SCM orchestration, SCA, secrets, cloud/IaC, licenses, outdated software, DAST,
 and IDE plugins are separate workstreams documented in
 [`docs/PRODUCT_WORKSTREAMS.md`](docs/PRODUCT_WORKSTREAMS.md).
 
+PR/MR review is implemented in the separate `plaidnox_scm` package in this
+repository. The deployable `plaidnox-scm-api` exposes `POST /v1/reviews` for
+provider adapters. GitHub webhook verification, installation credentials,
+checks, and inline comments remain in `PlaidNox/plaidnox-github-bot`; see
+[`docs/GITHUB_BOT_INTEGRATION.md`](docs/GITHUB_BOT_INTEGRATION.md).
+
 ## Pipeline
 
 ```text

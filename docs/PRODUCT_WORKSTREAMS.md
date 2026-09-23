@@ -510,7 +510,7 @@ Before QC, prioritize in this order: (1) deterministic `ChangeRelevance`;
 review contract; (4) lean candidate schema; (5) candidate-specific context
 broker; (6) verifier evidence-role model; (7) optional explicit flow
 requests; (8) baseline classification; (9) deterministic policy;
-(10) SCM publication; (11) live timeline/counters; (12) performance and
+(10) SCM delivery integration; (11) live timeline/counters; (12) performance and
 privacy tests.
 
 This v2 plan guides PR/MR implementation. The existing 10-organization
@@ -723,11 +723,44 @@ incomplete review, low confidence, unknown severity, decision precedence, and
 policy immutability. Provider-specific checks and comments remain outside this
 phase.
 
-The next implementation phase begins at priority item (10): provider-neutral
-SCM publication contracts followed by a GitHub adapter with webhook
-verification, HEAD-bound checks, idempotent finding publication, and stale-HEAD
-protection. Triage/remediation, timeline, and dashboard work remain later SCM
-phases.
+#### Implementation status (Wave 6)
+
+Wave 6 implements the scanner side of priority item (10) and deliberately
+does not duplicate `PlaidNox/plaidnox-github-bot`:
+
+- **Existing GitHub adapter retained as the edge service.** The bot owns
+  webhook receipt/signature verification, installation authentication,
+  normalized PR-event creation, `PlaidNox Security` check runs, inline review
+  comments, current-HEAD revalidation, and stale-result suppression. None of
+  those GitHub-specific responsibilities are implemented in `ai_sast`.
+- **Provider-neutral scanner API.** `plaidnox_scm.api` exposes authenticated
+  `POST /v1/reviews` and matches the bot's versioned request/result contract.
+  `PASS` is translated to `allow`; `WARN`, `BLOCK`,
+  `REQUIRE_SECURITY_APPROVAL`, and `INCOMPLETE` retain their explicit meanings.
+  An incomplete scan never becomes an allow response.
+- **Immutable source boundary.** The API accepts revision identity only, never
+  provider credentials. `RepositoryMirrorBroker` resolves a repository from a
+  configured internal mirror root keyed by provider and external repository ID,
+  verifies both full commit SHAs, and refuses missing or mismatched revisions.
+  A future source-broker implementation can replace it without changing the
+  review engine or HTTP contract.
+- **Canonical finding adapter.** Independently verified baseline
+  classifications are rendered into the bot contract with stable finding and
+  review IDs, exact changed root-cause line, severity/confidence, impact,
+  remediation, vulnerability class, and baseline relationship. Existing
+  baseline debt without a verification in the current review is not fabricated
+  into an inline finding.
+- **Deployment entrypoint.** `plaidnox-scm-api` requires PostgreSQL, a non-empty
+  scanner API token, and an internal repository mirror root through environment
+  configuration. The endpoint moves the synchronous review off the async event
+  loop. Schema creation remains migration-owned.
+
+The remaining delivery work is split by repository. In
+`PlaidNox/plaidnox-github-bot`: durable webhook/review/publication idempotency,
+queueing, patch-line validation, and triage persistence. In `ai_sast`: review
+attempt persistence/lease semantics, live timeline/counters, performance and
+privacy tests, and later provider-neutral triage/remediation contracts. No
+GitHub webhook or Checks API code should be added here.
 
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
@@ -876,35 +909,12 @@ unrelated changed lines.
 
 #### GitHub publication architecture
 
-Create a provider-specific publisher outside Code Scanning core. Suggested
-modules:
-
-```text
-src/plaidnox_sast/scm/
-    base.py
-    models.py
-    github.py
-    publication.py
-
-src/plaidnox_sast/review_delivery/
-    renderer.py
-    service.py
-    models.py
-```
-
-Provider-neutral interface:
-
-```text
-publish_review_started(review)
-publish_review_progress(review, progress)
-publish_finding(review, finding)
-publish_review_summary(review, policy_result)
-update_finding_publication(publication, finding)
-resolve_finding_publication(publication, finding)
-```
-
-The GitHub implementation owns Checks API/review comments. The security
-engine does not call GitHub directly.
+`PlaidNox/plaidnox-github-bot` is the existing provider adapter. It owns the
+GitHub App webhook, installation-token lifecycle, Checks API, review comments,
+and stale-HEAD guard. `ai_sast` exposes only the provider-neutral
+`POST /v1/reviews` scanner boundary and never calls GitHub directly. GitLab and
+other providers should use separate adapters against that same scanner
+contract instead of adding provider SDKs to `plaidnox_scm`.
 
 #### GitHub Check behavior
 
@@ -1303,13 +1313,15 @@ body cannot inject HTML/script into dashboard rendering.
 
 Build in this order:
 
-- **D1 — canonical finding/presentation contracts**: lifecycle enums;
-  evidence roles; `FindingPresentation`; migration additions.
-- **D2 — GitHub check publisher**: create/update check on HEAD;
-  deterministic PASS/WARN/BLOCK/INCOMPLETE mapping; stale HEAD guard.
-- **D3 — inline publisher**: changed-line anchor resolver; one comment
-  per finding/head; concise renderer; publication persistence/
-  idempotency.
+- **D1 — scanner API contract (implemented in `ai_sast`)**: authenticated
+  normalized review request; immutable revision acquisition; canonical finding
+  response; deterministic PASS/allow/WARN/BLOCK/INCOMPLETE mapping.
+- **D2 — GitHub check publisher (implemented in the bot)**: create/update a
+  check on the exact HEAD and reject stale scanner results. Durable publication
+  persistence and retry idempotency remain bot follow-up work.
+- **D3 — inline publisher (implemented in the bot)**: changed-root comments.
+  Independent GitHub patch-line validation, update-in-place behavior, and
+  durable publication idempotency remain bot follow-up work.
 - **D4 — dashboard finding detail**: description/evidence/activity;
   control-proof vs explicit-flow representation.
 - **D5 — triage webhook + parser**: commands; authorization; audit;
@@ -1416,11 +1428,12 @@ own exit condition is met and this workstream is actually started (per this
 file's Boundary rule and Delivery order — SCM Integration is item 2, after
 Code Scanning):
 
-- P0: GitHub webhook models + signature verification; PR/MR job + HEAD
-  coalescing; repository bootstrap; baseline store/load; incremental Security
-  IR; impact expansion; Sensitive Evidence IR; PR contextual hunter; baseline
-  comparison; policy compiler runtime; deterministic policy evaluator;
-  GitHub Check publisher.
+- P0: repository bootstrap; baseline store/load; incremental Security IR;
+  impact expansion; Sensitive Evidence IR; PR contextual hunter; baseline
+  comparison; policy compiler runtime; deterministic policy evaluator; and the
+  authenticated provider-neutral scanner API. GitHub webhook models, signature
+  verification, Checks publication, inline comments, and stale-HEAD protection
+  are owned by `PlaidNox/plaidnox-github-bot` and are not duplicated here.
 - P1: JEV PR-routing refinements; GitLab adapter; capability-chain expansion
   in the PR context; manual full white-box trigger.
 - P2: larger-scale scheduler (the 100-org/1,000-org scale path above).

@@ -262,5 +262,11 @@ SCM Integration has been explicitly started as the independent
 `plaidnox_scm` package while Code Scanning continues through its remaining
 phases. The package boundary remains strict: SCM consumes immutable Code
 Scanning APIs and does not add provider or PR/MR behavior to the scanner.
+`PlaidNox/plaidnox-github-bot` owns GitHub webhook verification, installation
+authentication, check runs, inline comments, and stale-HEAD publication. The
+`plaidnox_scm` package owns only the provider-neutral authenticated review API,
+immutable source-broker boundary, PR/MR review orchestration, baseline
+classification, and merge policy. Do not recreate GitHub webhook or Checks API
+code in this repository.
 SCA, secrets, cloud/IaC, license risk, outdated software, DAST, and IDE plugins
 remain separately planned products and do not block either workstream.

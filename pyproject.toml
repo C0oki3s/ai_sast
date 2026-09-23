@@ -8,12 +8,14 @@ version = "0.1.0"
 description = "Context-aware, static-only source code security analysis pipeline"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.115,<1.0",
   "Jinja2>=3.1,<4.0",
   "PyYAML>=6.0",
   "SQLAlchemy>=2.0,<3.0",
   "psycopg[binary]>=3.2,<4.0",
   "tree-sitter>=0.25,<0.27",
   "tree-sitter-language-pack>=1.9,<3.0",
+  "uvicorn[standard]>=0.34,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +24,7 @@ ai = ["litellm>=1.101,<2.0"]
 [project.scripts]
 plaidnox-sast = "plaidnox_sast.cli:main"
 plaidnox-scm = "plaidnox_scm.cli:main"
+plaidnox-scm-api = "plaidnox_scm.api_main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
