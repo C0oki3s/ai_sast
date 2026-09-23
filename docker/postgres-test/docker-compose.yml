@@ -12,5 +12,8 @@ services:
       - ../../src/plaidnox_sast/assets/migrations/postgresql/0002_incremental_repository_context.sql:/docker-entrypoint-initdb.d/0002_incremental_repository_context.sql:ro,z
       - ../../src/plaidnox_scm/assets/migrations/postgresql/0001_scm_application_context.sql:/docker-entrypoint-initdb.d/1001_scm_application_context.sql:ro,z
       - ../../src/plaidnox_scm/assets/migrations/postgresql/0002_scm_finding_baselines.sql:/docker-entrypoint-initdb.d/1002_scm_finding_baselines.sql:ro,z
+      - ../../src/plaidnox_scm/assets/migrations/postgresql/0003_scm_review_attempts.sql:/docker-entrypoint-initdb.d/1003_scm_review_attempts.sql:ro,z
+      - ../../src/plaidnox_scm/assets/migrations/postgresql/0004_scm_application_context_multi_revision.sql:/docker-entrypoint-initdb.d/1004_scm_application_context_multi_revision.sql:ro,z
+      - ../../src/plaidnox_scm/assets/migrations/postgresql/0005_scm_finding_triage.sql:/docker-entrypoint-initdb.d/1005_scm_finding_triage.sql:ro,z
     tmpfs:
       - /var/lib/postgresql/data

@@ -4,6 +4,7 @@
     "0001_scm_application_context.sql",
     "0002_scm_finding_baselines.sql",
     "0003_scm_review_attempts.sql",
-    "0004_scm_application_context_multi_revision.sql"
+    "0004_scm_application_context_multi_revision.sql",
+    "0005_scm_finding_triage.sql"
   ]
 }
