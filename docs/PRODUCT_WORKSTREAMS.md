@@ -762,6 +762,47 @@ attempt persistence/lease semantics, live timeline/counters, performance and
 privacy tests, and later provider-neutral triage/remediation contracts. No
 GitHub webhook or Checks API code should be added here.
 
+#### Implementation status (Wave 7)
+
+Wave 7 implements the first half of Wave 6's named `ai_sast` remainder --
+review attempt persistence/lease semantics and live timeline/counters --
+matching priority item (11):
+
+- **Durable review-attempt record.** A new `scm_review_attempts` table
+  (`ReviewAttemptRecord`) keyed by the same deterministic `review_id` hash
+  `api_service._review_id` already computes gives every `POST /v1/reviews`
+  call a durable trace: identity fields, `state`
+  (`"running"`/`"completed"`/`"failed"`), and the rendered result once
+  complete.
+- **Lease semantics reused from Code Scanning.** `plaidnox_scm.attempts`
+  (`ReviewAttemptRepository.claim`/`complete`/`fail`) is the same
+  compare-and-swap `UPDATE ... WHERE` idiom as `HuntTaskRecord`/
+  `lease_next_task` in `plaidnox_sast.persistence.repositories` --
+  portable across PostgreSQL and the SQLite test adapter, not
+  `SELECT ... FOR UPDATE SKIP LOCKED`. A genuinely concurrent duplicate
+  delivery (unexpired lease) fails fast with `409`; an interrupted attempt
+  (expired lease) is reclaimed up to a bounded `review_attempt_max_attempts`
+  (default 3, `assets/runtime/review.json`) before raising instead of
+  retrying forever (rule 14).
+- **Idempotent replay.** A duplicate delivery for an already-`"completed"`
+  `review_id` (e.g. a provider webhook retry) returns the stored
+  action/summary/findings/incomplete_reason directly -- the AI review is
+  never re-run for the same identity twice.
+- **Live status endpoint.** `GET /v1/reviews/{review_id}` (bearer-auth,
+  same as `POST`) returns `state`, `outcome`, `action`, `summary`,
+  `counters`, and `attempt_count` for an in-flight or completed review, or
+  `404` for an unknown id -- the first piece of the "live timeline/counters"
+  observability named in Wave 6.
+- **Redacted failure trace.** An unhandled exception during review marks the
+  attempt `"failed"` with a redacted `error_message` (`plaidnox_sast.redaction`)
+  and re-raises unchanged; the API's existing `500` behavior is unaffected.
+
+Deliberately deferred, not dropped: performance/privacy load tests for the
+review-attempt path, and the provider-neutral triage/remediation contracts
+described in "PR/MR Finding Delivery, Triage, and Remediation Plan" below.
+The `plaidnox-scm` CLI's local `review` subcommand is untouched -- lease
+semantics exist to dedupe concurrent HTTP deliveries, not ad-hoc local runs.
+
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
 This subsection is the authoritative design for everything that happens

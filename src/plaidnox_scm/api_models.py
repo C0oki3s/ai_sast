@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,3 +65,19 @@ class ReviewResponse(BaseModel):
     summary: str
     findings: list[ReviewFinding] = Field(default_factory=list)
     incomplete_reason: str | None = None
+
+
+class ReviewAttemptStatus(BaseModel):
+    """Live status/counters for one review attempt (`GET /v1/reviews/{review_id}`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    review_id: str
+    state: str
+    outcome: str | None = None
+    action: str | None = None
+    summary: str | None = None
+    counters: dict[str, Any] | None = None
+    attempt_count: int
+    started_at: datetime
+    completed_at: datetime | None = None

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, String, func
+from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -64,6 +64,51 @@ class FindingBaselineRecord(Base):
     title: Mapped[str] = mapped_column(String, nullable=False)
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ReviewAttemptRecord(Base):
+    """Durable idempotency/lease record for one `POST /v1/reviews` attempt.
+
+    Keyed by the same deterministic `review_id` hash `api_service._review_id`
+    already computes -- a completed row lets a duplicate delivery (retried
+    webhook) replay the stored result instead of re-running the review, and
+    an unexpired `running` row makes a genuinely concurrent duplicate
+    delivery fail fast instead of racing on the same baseline/context writes.
+    """
+
+    __tablename__ = "scm_review_attempts"
+    __table_args__ = (
+        Index("ix_scm_review_attempt_lease", "state", "lease_expires_at"),
+        Index("ix_scm_review_attempt_codebase", "tenant_id", "codebase_id", "created_at"),
+    )
+
+    review_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    codebase_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    repository_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    review_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    delivery_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    outcome: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str | None] = mapped_column(String(64))
+    summary: Mapped[str | None] = mapped_column(String)
+    incomplete_reason: Mapped[str | None] = mapped_column(String)
+    counters: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    findings: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(String)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
