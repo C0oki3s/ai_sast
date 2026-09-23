@@ -105,6 +105,27 @@ class ReviewResponse(BaseModel):
     counters: dict[str, int] | None = None
 
 
+class PromoteBaselineRequest(BaseModel):
+    """Promotes a completed review's still-open findings into the persistent
+    baseline once its pull/merge request has actually merged, so a later
+    review against the new base revision sees them as already `existing`
+    instead of re-flagging them as newly `introduced`.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    merge_revision: str = Field(min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
+
+
+class PromoteBaselineResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_id: str
+    codebase_id: str
+    baseline_revision: str
+    promoted_count: int
+
+
 class ReviewAttemptStatus(BaseModel):
     """Live status/counters for one review attempt (`GET /v1/reviews/{review_id}`)."""
 

@@ -905,6 +905,55 @@ inventing a split would fabricate structure the AI review never produced).
 The full finding lifecycle state machine, GitHub publication, and triage
 commands below remain their own, larger waves.
 
+#### Implementation status (Wave 10)
+
+Wave 10 implements the pipeline diagram's final, previously-unimplemented
+stage: `-> reconcile baseline after merge`. `review.py`'s baseline
+classification already reads `list_baseline_findings(codebase_id,
+base_revision)` to tell an `INTRODUCED` finding from an `EXISTING` one, but
+nothing ever wrote a row forward once a PR carrying an `INTRODUCED` finding
+actually merged -- so the very next PR opened against the new `main` would
+see the exact same finding as newly introduced all over again, forever.
+`ApplicationContextRepository.upsert_baseline_finding()` already existed and
+was unit-tested in isolation (`tests/test_scm_postgresql.py`), but had zero
+production call sites before this wave.
+
+- **`POST /v1/reviews/{review_id}/promote`.** A new endpoint, called once a
+  provider webhook adapter observes the reviewed pull/merge request has
+  actually merged. Body: `{"merge_revision": "<the new target-branch sha>"}`
+  -- this is intentionally *not* re-derived from the stored attempt, since
+  the pipeline has no concept of a merge commit (a squash or rebase merge
+  produces a sha nothing in this repo ever saw); the caller supplies it.
+- **`ReviewService.promote_to_baseline()`.** Loads the completed attempt by
+  `review_id` (same tenant-free lookup as `get_status`, since `review_id`
+  already hashes the full request identity) and, for each persisted
+  `ReviewFinding`, calls `upsert_baseline_finding()` keyed on
+  `(tenant_id, codebase_id, merge_revision, root_cause_fingerprint)`. No
+  extra filtering by `baseline_relationship` is needed: `_response()`
+  already only ever appends findings with `verification_state ==
+  "verified"`, so anything the same review resolved -- `RESOLVED` findings
+  never got into `attempt.findings` in the first place, and won't be
+  carried forward into the new baseline revision either.
+- **Errors.** Unknown `review_id` -> 404. A review attempt that has not
+  reached `"completed"` yet (still running, failed, or never claimed) ->
+  409 (`ReviewNotCompletedError`), since there is nothing verified yet to
+  promote.
+- **Idempotent by construction.** `upsert_baseline_finding()` was already an
+  upsert; calling `/promote` twice for the same `merge_revision` (e.g. a
+  replayed merge webhook) produces the same one row per finding, not
+  duplicates -- covered by
+  `test_promote_endpoint_is_idempotent_under_a_replayed_merge_webhook`.
+
+Deliberately not attempted here: automatically deriving `merge_revision`
+from the provider (e.g. calling GitHub to resolve what the PR actually
+merged into) -- that lives on the bot side, which this repo does not own or
+call into, per the standing package boundary. Also not attempted: pruning
+or tombstoning the *old* `base_revision`'s baseline rows once a newer one
+exists for the same codebase -- they simply go unqueried once every open PR
+has moved its `base_sha` past them, the same "stale, never re-read" pattern
+`ApplicationContext.get_context()`'s docstring already relies on for
+per-revision cache entries, so no deletion path was added.
+
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
 This subsection is the authoritative design for everything that happens

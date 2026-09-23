@@ -7,8 +7,14 @@ import hmac
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 
-from .api_models import ReviewAttemptStatus, ReviewRequest, ReviewResponse
-from .api_service import ReviewService
+from .api_models import (
+    PromoteBaselineRequest,
+    PromoteBaselineResponse,
+    ReviewAttemptStatus,
+    ReviewRequest,
+    ReviewResponse,
+)
+from .api_service import ReviewNotCompletedError, ReviewService
 from .attempts import ReviewAttemptConflictError, ReviewAttemptExhaustedError
 from .source_broker import SourceBrokerError
 
@@ -55,5 +61,19 @@ def create_app(service: ReviewService, *, api_token: str) -> FastAPI:
         if attempt_status is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown review_id")
         return attempt_status
+
+    @app.post(
+        "/v1/reviews/{review_id}/promote",
+        response_model=PromoteBaselineResponse,
+        dependencies=[Depends(authenticate)],
+    )
+    async def promote_review(review_id: str, request: PromoteBaselineRequest) -> PromoteBaselineResponse:
+        try:
+            result = await run_in_threadpool(service.promote_to_baseline, review_id, request.merge_revision)
+        except ReviewNotCompletedError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown review_id")
+        return result
 
     return app

@@ -13,22 +13,28 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_sast.redaction import redact
 
-from . import attempts
+from . import attempts, context_store
 from .api_models import (
     FindingEvidence,
     PolicyAction,
+    PromoteBaselineResponse,
     ReviewAttemptStatus,
     ReviewFinding,
     ReviewRequest,
     ReviewResponse,
 )
 from .assets import load_json
+from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
 from .source_broker import SourceBroker
 
 DependenciesFactory = Callable[[], ReviewDependencies]
+
+
+class ReviewNotCompletedError(RuntimeError):
+    """Raised when baseline promotion is requested for an attempt that never reached `"completed"`."""
 
 
 class _LeaseHeartbeat:
@@ -182,6 +188,52 @@ class ReviewService:
                 f"review {review_id} lease was lost before completion"
             )
         return response
+
+    def promote_to_baseline(self, review_id: str, merge_revision: str) -> PromoteBaselineResponse | None:
+        """Promotes a merged review's still-open findings into the persistent baseline.
+
+        Called once the reviewed pull/merge request has actually merged (a
+        provider webhook adapter reacting to a "merged" event), so a later
+        review with `base_sha == merge_revision` sees these findings as
+        already `existing` instead of re-flagging them as newly
+        `introduced`. `attempt.findings` already excludes anything
+        `review.py`'s baseline classification resolved to `RESOLVED` --
+        `_response()` only ever appends `verification_state == "verified"`
+        findings -- so nothing here needs to re-filter by relationship or
+        carry resolved findings forward.
+        """
+
+        with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
+            attempt = repository.get(review_id)
+        if attempt is None:
+            return None
+        if attempt.state != "completed":
+            raise ReviewNotCompletedError(f"review {review_id} has not completed yet")
+
+        with context_store.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
+            for finding in attempt.findings:
+                repository.upsert_baseline_finding(
+                    BaselineFinding(
+                        codebase_id=attempt.codebase_id,
+                        baseline_revision=merge_revision,
+                        root_cause_fingerprint=finding["root_cause_fingerprint"],
+                        finding_fingerprint=finding["finding_id"],
+                        lifecycle_state="open",
+                        root_cause_path=finding["root_cause_path"],
+                        root_cause_symbol=finding["root_cause_symbol"],
+                        vulnerability_class=finding["category"] or "",
+                        title=finding["title"],
+                        severity=finding["severity"],
+                        confidence=finding["confidence"],
+                    )
+                )
+
+        return PromoteBaselineResponse(
+            review_id=review_id,
+            codebase_id=attempt.codebase_id,
+            baseline_revision=merge_revision,
+            promoted_count=len(attempt.findings),
+        )
 
     def get_status(self, review_id: str) -> ReviewAttemptStatus | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
