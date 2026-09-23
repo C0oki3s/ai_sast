@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -15,7 +17,7 @@ from plaidnox_scm.api_service import ReviewService, _review_id
 from plaidnox_scm.attempts import unit_of_work as attempts_unit_of_work
 from plaidnox_scm.evidence import EvidenceRole
 from plaidnox_scm.models import Base
-from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource
+from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource, SourceBrokerError
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -229,6 +231,47 @@ def test_repository_mirror_broker_requires_exact_requested_revisions(tmp_path: P
 
     with RepositoryMirrorBroker(tmp_path / "mirrors").materialize(request) as source:
         assert source == RepositorySource(mirror.resolve(), base, head)
+
+
+def test_repository_mirror_broker_retries_a_not_yet_synced_mirror(monkeypatch, tmp_path: Path) -> None:
+    """Wave 11: tolerates the race between webhook delivery and mirror sync.
+
+    The mirror directory doesn't exist yet when `materialize()` is first
+    called -- it only appears partway through the retry budget, standing in
+    for an out-of-band sync that is still in flight. `time.sleep` is
+    monkeypatched so the test doesn't actually wait, and its call count
+    doubles as proof of exactly how many attempts were needed.
+    """
+
+    staging = tmp_path / "staging"
+    base, head = _repository(staging)
+    request = ReviewRequest.model_validate(_request(base, head))
+    mirrors_root = tmp_path / "mirrors"
+    provider_dir = mirrors_root / "github" / "899377752"
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 2:
+            provider_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(staging, provider_dir)
+
+    monkeypatch.setattr("plaidnox_scm.source_broker.time.sleep", fake_sleep)
+    broker = RepositoryMirrorBroker(mirrors_root, sync_retry_attempts=5, sync_retry_interval_seconds=0.01)
+
+    with broker.materialize(request) as source:
+        assert source == RepositorySource(provider_dir.resolve(), base, head)
+    assert len(sleep_calls) == 2
+
+
+def test_repository_mirror_broker_gives_up_after_the_retry_budget(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("plaidnox_scm.source_broker.time.sleep", lambda seconds: None)
+    request = ReviewRequest.model_validate(_request("a" * 40, "b" * 40))
+    broker = RepositoryMirrorBroker(tmp_path / "mirrors", sync_retry_attempts=3, sync_retry_interval_seconds=0.01)
+
+    with pytest.raises(SourceBrokerError):
+        with broker.materialize(request):
+            pass
 
 
 def test_review_endpoint_rejects_unknown_contract_fields(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from plaidnox_sast.persistence import DatabaseSettings
 
 from .api import create_app
 from .api_service import ReviewService
+from .assets import load_json
 from .production import dependencies_from_environment
 from .source_broker import RepositoryMirrorBroker
 
@@ -26,8 +27,13 @@ def build_app():
         expire_on_commit=False,
         autoflush=False,
     )
+    runtime = load_json("runtime/review.json")
     service = ReviewService(
-        source_broker=RepositoryMirrorBroker(mirror_root),
+        source_broker=RepositoryMirrorBroker(
+            mirror_root,
+            sync_retry_attempts=int(runtime["mirror_sync_retry_attempts"]),
+            sync_retry_interval_seconds=float(runtime["mirror_sync_retry_interval_seconds"]),
+        ),
         session_factory=factory,
         dependencies_factory=dependencies_from_environment,
     )

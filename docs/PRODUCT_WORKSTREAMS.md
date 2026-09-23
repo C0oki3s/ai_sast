@@ -954,6 +954,47 @@ has moved its `base_sha` past them, the same "stale, never re-read" pattern
 `ApplicationContext.get_context()`'s docstring already relies on for
 per-revision cache entries, so no deletion path was added.
 
+#### Implementation status (Wave 11)
+
+Wave 11 implements the external review's remaining P0 item: the "source
+mirror gap." `RepositoryMirrorBroker.materialize()` was a purely passive
+reader with zero fetch/sync/retry logic -- it assumed the mirror directory
+already contained the exact requested `base_sha`/`head_sha` and hard-failed
+via `SourceBrokerError` on the very first check otherwise. In production
+that first check can race a webhook delivered before an out-of-band mirror
+sync has landed the corresponding commit(s) on disk, turning a transient
+lag into a hard-failed review.
+
+- **Bounded local retry, not a provider fetch.** `materialize()` now retries
+  the same local filesystem read up to `sync_retry_attempts` times
+  (`review.json`'s `mirror_sync_retry_attempts` / `_interval_seconds`,
+  defaulting in production to 5 attempts / 2s apart -- up to ~8s of
+  tolerance), sleeping between attempts. This stays inside this module's
+  documented boundary ("never calls a provider API directly"): it never
+  contacts GitHub or any other provider, only re-reads the same mirror path
+  it was already configured to trust.
+- **No behavior change for existing callers.** `sync_retry_attempts`
+  defaults to `1` (i.e. no retry, no sleep) on the constructor, so every
+  test and call site that already constructs `RepositoryMirrorBroker(root)`
+  with no extra arguments keeps its exact prior all-or-nothing behavior.
+  Only `api_main.py`'s production wiring passes the larger budget from
+  `review.json` explicitly.
+- **Tests.** `test_repository_mirror_broker_retries_a_not_yet_synced_mirror`
+  monkeypatches `time.sleep` so a directory that doesn't exist when
+  `materialize()` is first called appears partway through the retry budget
+  (simulating an in-flight sync) and asserts the review still succeeds, and
+  `test_repository_mirror_broker_gives_up_after_the_retry_budget` asserts a
+  mirror that never appears still eventually raises `SourceBrokerError`
+  rather than retrying forever.
+
+Deliberately not attempted here: fetching or syncing from the provider
+itself if the retry budget is exhausted -- this module's docstring
+explicitly disclaims that responsibility, and doing it here would mean
+this repo taking on installation-token handling that belongs to the
+(unverifiable) GitHub bot. If a mirror is still missing after the
+configured budget, that remains a hard failure surfaced as the same 409
+`SourceBrokerError` response as before this wave.
+
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
 This subsection is the authoritative design for everything that happens

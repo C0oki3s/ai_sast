@@ -10,6 +10,8 @@
   "review_attempt_lease_seconds": 180,
   "review_attempt_heartbeat_seconds": 45,
   "review_attempt_max_attempts": 3,
+  "mirror_sync_retry_attempts": 5,
+  "mirror_sync_retry_interval_seconds": 2.0,
   "context_broker": {
     "maximum_requests_per_candidate": 8,
     "maximum_records_per_request": 20,
