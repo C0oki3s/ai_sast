@@ -6,8 +6,8 @@
     "deep": "kimi-k3"
   },
   "jev_default_model": "jev-latest",
-  "saist_detection_model": "plaidnox-code-fast",
-  "saist_validation_model": "plaidnox-code-standard",
+  "saist_detection_model": "glm-5.3-flash",
+  "saist_validation_model": "kimi-k2.7-code",
   "saist_request_timeout_seconds": 60,
   "saist_process_timeout_seconds": 900
 }

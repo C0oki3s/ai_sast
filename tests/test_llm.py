@@ -8,6 +8,7 @@ from plaidnox_sast.llm import (
     LiteLLMConfigurationError,
     LiteLLMResponsesClient,
     LiteLLMSettings,
+    response_text,
 )
 
 
@@ -74,3 +75,17 @@ def test_response_text_is_normalized_from_litellm_message_output():
     )
 
     assert client.responses.create(model="provider/model", input="evidence").output_text == "structured result"
+
+
+def test_response_text_falls_back_to_reasoning_item_content() -> None:
+    response = SimpleNamespace(
+        output_text="",
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                content=[SimpleNamespace(type="text", text='{"supported": true}')],
+            )
+        ],
+    )
+
+    assert response_text(response) == '{"supported": true}'

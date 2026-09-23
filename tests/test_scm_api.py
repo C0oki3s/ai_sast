@@ -274,6 +274,28 @@ def test_repository_mirror_broker_gives_up_after_the_retry_budget(monkeypatch, t
             pass
 
 
+def test_missing_mirror_revision_is_failed_dependency_not_attempt_conflict(tmp_path: Path) -> None:
+    request = _request("a" * 40, "b" * 40)
+    service = ReviewService(
+        RepositoryMirrorBroker(
+            tmp_path / "mirrors",
+            sync_retry_attempts=1,
+            sync_retry_interval_seconds=0,
+        ),
+        _factory(),
+        lambda: (_ for _ in ()).throw(AssertionError("dependencies must not be requested")),
+    )
+
+    response = TestClient(create_app(service, api_token="scanner-token")).post(
+        "/v1/reviews",
+        headers={"Authorization": "Bearer scanner-token"},
+        json=request,
+    )
+
+    assert response.status_code == 424
+    assert "mirror" in response.json()["detail"].lower()
+
+
 def test_review_endpoint_rejects_unknown_contract_fields(tmp_path: Path) -> None:
     mirror = tmp_path / "mirrors" / "github" / "899377752"
     base, head = _repository(mirror)

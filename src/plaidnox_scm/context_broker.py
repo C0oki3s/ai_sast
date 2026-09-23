@@ -340,10 +340,18 @@ def _definition_target(target: str, graph: StructuralGraph) -> tuple[str | None,
     known = {item.path for item in graph.files}
     if target in known:
         return target, ""
-    for separator in ("#", ":"):
-        path, _, name = target.rpartition(separator)
-        if path in known and name and not name.isdigit():
-            return path, name
+    # Models sometimes qualify a path with a human-readable symbol hint, for
+    # example ``models/NST.js User schema``. Resolve the longest admitted path
+    # prefix first, then use any suffix only as a best-effort symbol hint. This
+    # remains bounded to files already admitted into the structural graph.
+    for path in sorted(known, key=len, reverse=True):
+        if not target.startswith(path):
+            continue
+        suffix = target[len(path) :]
+        if suffix and suffix[0] not in {"#", ":", " ", "\t"}:
+            continue
+        name = suffix.lstrip("#: \t").strip()
+        return path, name
     return None, target
 
 

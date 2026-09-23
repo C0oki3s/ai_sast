@@ -73,7 +73,7 @@ class LiteLLMResponse:
 
     def __init__(self, response: Any) -> None:
         self._response = response
-        self.output_text = _output_text(response)
+        self.output_text = response_text(response)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._response, name)
@@ -145,19 +145,29 @@ def _direct_provider_key(
     return None
 
 
-def _output_text(response: Any) -> str:
+def response_text(response: Any) -> str:
+    """Extract structured answer text across provider-specific Responses shapes."""
+
     direct = getattr(response, "output_text", None)
     if direct:
         return str(direct)
-    values: list[str] = []
+    output_values: list[str] = []
+    message_values: list[str] = []
+    fallback_values: list[str] = []
     for raw_item in getattr(response, "output", None) or []:
         item = _object_dict(raw_item)
-        if item.get("type") != "message":
-            continue
         for raw_content in item.get("content") or []:
             content = _object_dict(raw_content)
-            if content.get("type") in {"output_text", "text"} and content.get("text"):
-                values.append(str(content["text"]))
+            text = content.get("text")
+            if not text:
+                continue
+            value = str(text)
+            fallback_values.append(value)
+            if content.get("type") == "output_text":
+                output_values.append(value)
+            elif item.get("type") == "message":
+                message_values.append(value)
+    values = output_values or message_values or fallback_values
     return "\n".join(values)
 
 

@@ -141,3 +141,32 @@ def test_context_broker_resolves_definition_requests_given_as_paths(tmp_path: Pa
     assert expansion.evidence[1].records[0]["path"] == "auth.js"
     assert "mongoose.model" in expansion.evidence[2].records[0]["content"]
     assert expansion.evidence[3].records[0]["path"] == "models/user.js"
+
+
+def test_context_broker_resolves_path_plus_human_definition_hints(tmp_path: Path) -> None:
+    (tmp_path / "app.js").write_text("const User = require('./models/NST');\n")
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "NST.js").write_text(
+        "const User = mongoose.model('User', new mongoose.Schema({ email: String }));\n"
+    )
+    (tmp_path / "middleware").mkdir()
+    (tmp_path / "middleware" / "xss.js").write_text(
+        "function sanitizerMiddleware(req, res, next) { return next(); }\n"
+    )
+    graph = build_structural_graph(tmp_path)
+    candidate = _candidate(
+        ExpansionRequest("definition", "models/NST.js User schema", "Load the schema."),
+        ExpansionRequest(
+            "definition",
+            "middleware/xss.js sanitizerMiddleware",
+            "Load the sanitizer.",
+        ),
+    )
+
+    expansion = SCMContextBroker().expand(tmp_path, graph, candidate, _context())
+
+    assert expansion.complete is True
+    assert expansion.evidence[0].records[0]["path"] == "models/NST.js"
+    assert "mongoose.model" in expansion.evidence[0].records[0]["content"]
+    assert expansion.evidence[1].records[0]["path"] == "middleware/xss.js"
+    assert "sanitizerMiddleware" in expansion.evidence[1].records[0]["content"]

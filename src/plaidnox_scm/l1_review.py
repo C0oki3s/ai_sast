@@ -9,10 +9,11 @@ from typing import Any, Protocol
 
 from plaidnox_sast.assets import load_json as load_sast_json
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
+from plaidnox_sast.llm import response_text
 from plaidnox_sast.redaction import redact_payload
 
 from .assets import load_json
-from .change_relevance import ChangeRelevance
+from .change_relevance import ChangeRelevance, classify
 from .context_store import ApplicationContext
 from .diffing import ChangedFile, Diff
 from .prompts import render_operation
@@ -99,15 +100,20 @@ class LiteLLMChangedFileReviewer:
         coverage_gaps: list[str] = []
         coverage_complete = True
         maximum_bytes = int(runtime["maximum_file_bytes"])
+        model_calls = 0
 
         with materialize_revision(repo_path, diff.head_ref) as head_root:
             for changed_file in diff.files:
                 reviewed_paths.append(changed_file.path)
+                file_diff = Diff(diff.base_ref, diff.head_ref, (changed_file,))
+                file_relevance = classify(file_diff)
+                if file_relevance.docs_only or file_relevance.generated_only:
+                    continue
                 payload = _review_payload(
                     repo_path,
                     diff,
                     changed_file,
-                    relevance,
+                    file_relevance,
                     application_context,
                     build_file_security_ir(head_root, changed_file.path, maximum_bytes),
                     maximum_bytes,
@@ -132,6 +138,7 @@ class LiteLLMChangedFileReviewer:
                     },
                     max_output_tokens=int(runtime["l1_max_output_tokens"]),
                 )
+                model_calls += 1
                 if getattr(response, "status", "completed") != "completed":
                     raise L1ReviewError(f"L1 review was incomplete for {changed_file.path}")
                 result = _parse_response(response, changed_file)
@@ -144,7 +151,7 @@ class LiteLLMChangedFileReviewer:
             reviewed_paths=tuple(reviewed_paths),
             coverage_complete=coverage_complete,
             coverage_gaps=tuple(coverage_gaps),
-            model_calls=len(reviewed_paths),
+            model_calls=model_calls,
         )
 
 
@@ -206,32 +213,12 @@ def _serialize_ir(value: FileSecurityIR | None) -> dict[str, Any] | None:
     }
 
 
-def _response_text(response: Any) -> str:
-    """Return the model's structured answer text.
-
-    Some reasoning models occasionally place the final structured answer in a
-    ``reasoning``-typed output item instead of a ``message``-typed one, which
-    leaves the SDK's ``output_text`` convenience property empty even though a
-    valid answer was produced. Fall back to scanning every output item's
-    content blocks for text in that case.
-    """
-    text = getattr(response, "output_text", "")
-    if text:
-        return str(text)
-    for item in getattr(response, "output", None) or []:
-        for block in getattr(item, "content", None) or []:
-            block_text = getattr(block, "text", None)
-            if block_text:
-                return str(block_text)
-    return ""
-
-
 def _parse_response(
     response: Any,
     changed_file: ChangedFile,
 ) -> tuple[list[L1Candidate], bool, list[str]]:
     try:
-        payload = json.loads(_response_text(response))
+        payload = json.loads(response_text(response))
         raw_candidates = list(payload["candidates"])
         coverage_complete = bool(payload["coverage_complete"])
         coverage_gaps = [str(item) for item in payload["coverage_gaps"]]

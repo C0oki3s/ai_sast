@@ -51,7 +51,7 @@ def create_app(service: ReviewService, *, api_token: str) -> FastAPI:
         try:
             return await run_in_threadpool(service.run, request)
         except SourceBrokerError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(exc)) from exc
         except (ReviewAttemptConflictError, ReviewAttemptExhaustedError) as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 

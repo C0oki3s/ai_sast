@@ -34,7 +34,7 @@ from .knowledge import (
     KnowledgeStore,
     LiteLLMKnowledgeProvider,
 )
-from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
+from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient, response_text
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
 from .prompts import render_operation
 from .redaction import redact as _redact
@@ -863,7 +863,7 @@ class PlaidNoxDeepHuntAgent:
             manifest,
         )
         try:
-            payload = json.loads(response.output_text)
+            payload = json.loads(response_text(response))
             architecture = str(payload["architecture"])
             applications = list(payload["applications"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -916,7 +916,7 @@ class PlaidNoxDeepHuntAgent:
             model_tier=ModelTier.FAST,
         )
         try:
-            payload = json.loads(response.output_text)
+            payload = json.loads(response_text(response))
             queries = [dict(item) for item in payload["queries"]]
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError("AI reconnaissance search plan did not match the required schema") from exc
@@ -955,7 +955,7 @@ class PlaidNoxDeepHuntAgent:
             request,
         )
         try:
-            payload = json.loads(response.output_text)
+            payload = json.loads(response_text(response))
             task_values = list(payload["tasks"])
             strategy = str(payload["strategy"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1056,7 +1056,7 @@ class PlaidNoxDeepHuntAgent:
                         "vulnerability_discovery",
                         request,
                     )
-                    payload = json.loads(response.output_text)
+                    payload = json.loads(response_text(response))
                     for item in payload["candidates"]:
                         candidate = _candidate_from_ai_item(root, item, segment)
                         if candidate is not None:
@@ -1168,7 +1168,7 @@ class PlaidNoxDeepHuntAgent:
                         "variant_sweep",
                         request,
                     )
-                    payload = json.loads(response.output_text)
+                    payload = json.loads(response_text(response))
                     for item in payload["candidates"]:
                         variant = _candidate_from_ai_item(root, item, segment)
                         if variant is not None:
@@ -1333,7 +1333,7 @@ class PlaidNoxDeepHuntAgent:
                         "capability_chain",
                         request,
                     )
-                    payload = json.loads(response.output_text)
+                    payload = json.loads(response_text(response))
                     for item in payload["candidates"]:
                         pivot = _candidate_from_ai_item(root, item, segment)
                         if pivot is not None:
@@ -1444,7 +1444,7 @@ class PlaidNoxDeepHuntAgent:
             request,
         )
         try:
-            payload = json.loads(response.output_text)
+            payload = json.loads(response_text(response))
             queries = list(payload["queries"])
             task_ids = {task.task_id for task in plan.tasks}
             covered = {str(task_id) for query in queries for task_id in query["task_ids"]}
@@ -1523,7 +1523,7 @@ class PlaidNoxDeepHuntAgent:
             max_output_tokens=int(load_json("runtime/agent.json")["consolidation_max_output_tokens"]),
         )
         try:
-            consolidation = json.loads(response.output_text)
+            consolidation = json.loads(response_text(response))
             assignments = {str(key): str(value) for key, value in consolidation["assignments"].items()}
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError("AI finding consolidation did not match the required schema") from exc
@@ -1550,7 +1550,7 @@ class PlaidNoxDeepHuntAgent:
             max_output_tokens=int(load_json("runtime/agent.json")["consolidation_max_output_tokens"]),
         )
         try:
-            groups = dict(json.loads(narrative_response.output_text)["groups"])
+            groups = dict(json.loads(response_text(narrative_response))["groups"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError("AI finding group narratives did not match the required schema") from exc
         if set(groups) != set(members_by_group):
@@ -1814,7 +1814,7 @@ def _security_ir_context(
 
 def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
     try:
-        payload = json.loads(response.output_text)
+        payload = json.loads(response_text(response))
         review = DeepHuntResult(
             supported=bool(payload["supported"]),
             confidence=float(payload["confidence"]),
@@ -2189,7 +2189,7 @@ def _evidence_paths(
 
 def _patch_proposal_from_response(response: Any) -> PatchProposal:
     try:
-        payload = json.loads(response.output_text)
+        payload = json.loads(response_text(response))
         proposal = PatchProposal(
             proposed=bool(payload["proposed"]),
             patch=str(payload["patch"]),

@@ -123,3 +123,25 @@ def test_l1_review_rejects_candidate_not_anchored_to_changed_lines(tmp_path: Pat
         LiteLLMChangedFileReviewer(_Client(_payload(start_line=99))).review(
             repo, diff, classify(diff), _context(base)
         )
+
+
+def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(
+    tmp_path: Path,
+) -> None:
+    repo, base, _head = _repo(tmp_path)
+    (repo / "RETEST_NOTES.md").write_text("Trigger a fresh review.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add retest notes")
+    head = _git(repo, "rev-parse", "HEAD")
+    diff = compute_diff(repo, base, head)
+    client = _Client(_payload())
+
+    result = LiteLLMChangedFileReviewer(client).review(repo, diff, classify(diff), _context(base))
+
+    assert result.reviewed_paths == ("RETEST_NOTES.md", "middleware.js")
+    assert result.model_calls == 1
+    assert len(client.responses.calls) == 1
+    rendered_user_prompt = str(client.responses.calls[0]["input"][1]["content"])
+    assert '"changed_files": [' in rendered_user_prompt
+    assert '"middleware.js"' in rendered_user_prompt
+    assert "RETEST_NOTES.md" not in rendered_user_prompt
