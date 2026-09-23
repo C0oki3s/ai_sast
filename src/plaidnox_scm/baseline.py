@@ -40,6 +40,7 @@ class FindingBaselineClassification:
     vulnerability_class: str
     title: str
     severity: str
+    confidence: float
     root_cause_changed_in_review: bool
     reason: str
 
@@ -133,6 +134,7 @@ def classify_against_baseline(
                 vulnerability_class=verification.vulnerability_class,
                 title=verification.title,
                 severity=verification.severity,
+                confidence=verification.confidence,
                 root_cause_changed_in_review=root_changed,
                 reason=_classification_reason(relationship, verification.state),
             )
@@ -154,6 +156,7 @@ def classify_against_baseline(
                 vulnerability_class=baseline.vulnerability_class,
                 title=baseline.title,
                 severity=baseline.severity,
+                confidence=baseline.confidence,
                 root_cause_changed_in_review=_path_changed(diff, baseline.root_cause_path),
                 reason="Verified baseline finding remains open; this review did not independently resolve it.",
             )

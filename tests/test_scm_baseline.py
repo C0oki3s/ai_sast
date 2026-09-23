@@ -307,3 +307,4 @@ def test_fixture_d_existing_unrelated_finding_is_visible_but_not_new_pr_risk(tmp
     assert result.counters.introduced == 0
     assert result.counters.regressed == 0
     assert result.baseline_classifications[0].relationship == "EXISTING"
+    assert result.policy.decision == "PASS"

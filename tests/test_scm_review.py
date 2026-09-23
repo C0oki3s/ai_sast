@@ -245,7 +245,9 @@ def test_jwt_verification_removal_runs_l1_and_independent_verification(tmp_path:
     assert result.counters.evaluated == 1
     assert result.counters.verified == 1
     assert result.counters.regressed == 1
+    assert result.counters.blocking == 1
     assert result.baseline_classifications[0].relationship == "REGRESSED"
+    assert result.policy.decision == "BLOCK"
     assert builder.calls == reviewer.calls == verifier.calls == 1
 
 
@@ -316,4 +318,5 @@ def test_cli_reports_configuration_required_without_litellm_instead_of_crashing(
 
     assert exit_code == 2
     assert payload["outcome"] == "configuration_required"
+    assert payload["policy"]["decision"] == "INCOMPLETE"
     assert payload["ai_review_invoked"] is False

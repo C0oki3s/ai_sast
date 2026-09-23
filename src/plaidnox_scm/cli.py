@@ -49,6 +49,7 @@ def _result_to_json(result: ReviewResult) -> dict[str, Any]:
         "coverage_complete": result.coverage_complete,
         "coverage_gaps": list(result.coverage_gaps),
         "counters": asdict(result.counters),
+        "policy": asdict(result.policy),
         "candidates": [asdict(item) for item in result.candidates],
         "verifications": [asdict(item) for item in result.verifications],
         "baseline_classifications": [asdict(item) for item in result.baseline_classifications],
@@ -120,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     json.dump(_result_to_json(result), sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
-    return 0 if result.outcome in {"pass_fast_exit", "pass_no_verified_finding"} else 2
+    return 0 if result.policy.decision in {"PASS", "WARN"} else 2
 
 
 if __name__ == "__main__":

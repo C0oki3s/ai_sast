@@ -21,6 +21,7 @@ from .change_relevance import ChangeRelevance, classify
 from .context_store import ApplicationContext, unit_of_work
 from .diffing import Diff, compute_diff
 from .l1_review import ChangedFileReviewer, L1Candidate, L1ReviewBatch
+from .policy import MergePolicyResult, evaluate_merge_policy
 from .snapshots import resolve_revision
 from .verification import CandidateVerification, CandidateVerifier
 
@@ -45,6 +46,8 @@ class ReviewCounters:
     modified_existing: int = 0
     existing: int = 0
     resolved: int = 0
+    in_triage: int = 0
+    blocking: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,7 @@ class ReviewResult:
     coverage_complete: bool
     coverage_gaps: tuple[str, ...]
     baseline_classifications: tuple[FindingBaselineClassification, ...]
+    policy: MergePolicyResult
     detail: str
 
 
@@ -97,6 +101,7 @@ def review_pull_request(
             application_context.security_controls if application_context is not None else (),
             coverage_complete=True,
         )
+        policy = evaluate_merge_policy(baseline_classifications, coverage_complete=True)
         return ReviewResult(
             outcome="pass_fast_exit",
             relevance=relevance,
@@ -106,10 +111,16 @@ def review_pull_request(
             application_context=application_context,
             candidates=(),
             verifications=(),
-            counters=_counters(L1ReviewBatch((), (), True, (), 0), (), baseline_classifications),
+            counters=_counters(
+                L1ReviewBatch((), (), True, (), 0),
+                (),
+                baseline_classifications,
+                policy,
+            ),
             coverage_complete=True,
             coverage_gaps=(),
             baseline_classifications=baseline_classifications,
+            policy=policy,
             detail="Documentation/generated-only change; AI review skipped.",
         )
 
@@ -134,6 +145,11 @@ def review_pull_request(
             (),
             coverage_complete=False,
         )
+        policy = evaluate_merge_policy(
+            baseline_classifications,
+            coverage_complete=False,
+            configuration_complete=False,
+        )
         gaps = tuple(f"Missing review dependency: {name}" for name in missing)
         return ReviewResult(
             outcome="configuration_required",
@@ -145,12 +161,18 @@ def review_pull_request(
             candidates=(),
             verifications=(),
             counters=replace(
-                _counters(L1ReviewBatch((), (), False, gaps, 0), (), baseline_classifications),
+                _counters(
+                    L1ReviewBatch((), (), False, gaps, 0),
+                    (),
+                    baseline_classifications,
+                    policy,
+                ),
                 unresolved=1,
             ),
             coverage_complete=False,
             coverage_gaps=gaps,
             baseline_classifications=baseline_classifications,
+            policy=policy,
             detail=f"Security-relevant change requires configured review dependencies: {', '.join(missing)}.",
         )
 
@@ -206,7 +228,11 @@ def review_pull_request(
         application_context.security_controls,
         coverage_complete=provisional_coverage_complete,
     )
-    counters = _counters(batch, verifications, baseline_classifications)
+    policy = evaluate_merge_policy(
+        baseline_classifications,
+        coverage_complete=provisional_coverage_complete,
+    )
+    counters = _counters(batch, verifications, baseline_classifications, policy)
     coverage_gaps = tuple(batch.coverage_gaps) + tuple(
         gap for result in verifications if result.state == "unresolved" for gap in result.evidence_gaps
     )
@@ -234,6 +260,7 @@ def review_pull_request(
         coverage_complete=coverage_complete,
         coverage_gaps=coverage_gaps,
         baseline_classifications=baseline_classifications,
+        policy=policy,
         detail=detail,
     )
 
@@ -242,6 +269,7 @@ def _counters(
     batch: L1ReviewBatch,
     verifications: tuple[CandidateVerification, ...],
     baseline_classifications: tuple[FindingBaselineClassification, ...],
+    policy: MergePolicyResult,
 ) -> ReviewCounters:
     return ReviewCounters(
         candidates_generated=len(batch.candidates),
@@ -256,4 +284,10 @@ def _counters(
         ),
         existing=sum(item.relationship == "EXISTING" for item in baseline_classifications),
         resolved=sum(item.relationship == "RESOLVED" for item in baseline_classifications),
+        in_triage=sum(
+            item.verification_state == "verified"
+            and item.relationship not in {"EXISTING", "RESOLVED"}
+            for item in baseline_classifications
+        ),
+        blocking=policy.blocking_count,
     )

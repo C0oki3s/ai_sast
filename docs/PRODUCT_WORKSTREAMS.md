@@ -692,10 +692,42 @@ idempotent persistence, the JWT control regression, incomplete resolution
 protection, and **Fixture D** (an unrelated existing finding is visible while
 the reviewed change still completes without new verified risk).
 
-The next implementation phase begins at priority item (9): deterministic merge
-policy over verification completeness, baseline relationship, severity, and
-configured thresholds. Provider webhook/check publication, triage/remediation,
-timeline, and dashboard work remain later SCM phases.
+#### Implementation status (Wave 5)
+
+Wave 5 implements priority item (9), deterministic merge policy:
+
+- **Versioned policy, no model verdict.** `plaidnox_scm.policy` consumes only
+  review completeness and baseline-classified, independently verified finding
+  facts. Severity sets, confidence threshold, relationship behavior, incomplete
+  behavior, and decision precedence live in
+  `assets/policies/default.json` rather than orchestration code.
+- **Default new-risk behavior.** Verified High/Critical `INTRODUCED`,
+  `REGRESSED`, and `MODIFIED_EXISTING` findings produce `BLOCK`; Medium/Low/Info
+  new risk produces `WARN`. Unchanged `EXISTING` debt and `RESOLVED` findings
+  remain visible but produce `PASS` by default.
+- **Uncertainty cannot silently pass.** Incomplete coverage/configuration emits
+  `INCOMPLETE`. A verified result below the automatic-decision confidence or
+  with an unknown severity emits `REQUIRE_SECURITY_APPROVAL`. Configured
+  precedence keeps a known blocking finding blocking even if other coverage is
+  incomplete while preserving the incomplete flag and reason.
+- **One policy result.** Every `ReviewResult` and CLI JSON response now carries
+  the policy version, decision, per-finding dispositions, counts, and reasons.
+  CLI process status is derived from this result: `PASS`/`WARN` are successful;
+  `BLOCK`, `INCOMPLETE`, and `REQUIRE_SECURITY_APPROVAL` are non-successful.
+- **Required counters.** Review counters now distinguish in-triage, blocking,
+  existing, and resolved findings in addition to generated/evaluated/verified/
+  rejected/unresolved candidates.
+
+Tests cover default block/warn/pass behavior, Fixture B, Fixture D,
+incomplete review, low confidence, unknown severity, decision precedence, and
+policy immutability. Provider-specific checks and comments remain outside this
+phase.
+
+The next implementation phase begins at priority item (10): provider-neutral
+SCM publication contracts followed by a GitHub adapter with webhook
+verification, HEAD-bound checks, idempotent finding publication, and stale-HEAD
+protection. Triage/remediation, timeline, and dashboard work remain later SCM
+phases.
 
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
