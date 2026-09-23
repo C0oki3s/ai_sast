@@ -6,6 +6,7 @@ import hashlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -14,6 +15,7 @@ from plaidnox_sast.redaction import redact
 
 from . import attempts
 from .api_models import (
+    FindingEvidence,
     PolicyAction,
     ReviewAttemptStatus,
     ReviewFinding,
@@ -21,6 +23,7 @@ from .api_models import (
     ReviewResponse,
 )
 from .assets import load_json
+from .evidence import EvidenceRole
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
 from .source_broker import SourceBroker
@@ -91,7 +94,7 @@ class ReviewService:
 
     def run(self, request: ReviewRequest) -> ReviewResponse:
         review_id = _review_id(request)
-        tenant_id = f"{request.provider}:installation:{request.installation_id}"
+        tenant_id = _tenant_id(request)
         codebase_id = f"{request.provider}:repository:{request.repository_id}"
         runtime = load_json("runtime/review.json")
         lease_owner = uuid4().hex
@@ -210,6 +213,7 @@ def _replay_response(attempt: attempts.ReviewAttempt) -> ReviewResponse:
         summary=attempt.summary or "",
         findings=[ReviewFinding.model_validate(item) for item in attempt.findings],
         incomplete_reason=attempt.incomplete_reason,
+        counters=attempt.counters,
     )
 
 
@@ -224,24 +228,57 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
         verification = verification_by_id.get(classification.candidate_id)
         if candidate is None or verification is None:
             continue
-        description = redact(verification.message.strip())
-        if verification.business_impact.strip():
-            description = f"{description}\n\nImpact: {redact(verification.business_impact.strip())}"
         findings.append(
             ReviewFinding(
                 finding_id=classification.finding_fingerprint,
+                root_cause_fingerprint=classification.root_cause_fingerprint,
                 title=redact(classification.title),
                 severity=classification.severity.lower(),
                 confidence=classification.confidence,
-                description=description,
+                description=redact(verification.message.strip()),
+                impact=redact(verification.business_impact.strip()) or None,
                 root_cause_path=classification.root_cause_path,
+                root_cause_symbol=classification.root_cause_symbol,
                 root_cause_start_line=candidate.changed_lines.start,
                 root_cause_end_line=candidate.changed_lines.end,
                 root_cause_changed_in_pr=classification.root_cause_changed_in_review,
                 proof_of_concept=None,
                 remediation=redact(verification.remediation.strip()) or None,
+                remediation_invariant=redact(verification.security_invariant.strip()) or None,
+                proof_plan=redact(verification.proof_plan.strip()) or None,
+                regression_test_expectation=redact(verification.regression_test.strip()) or None,
                 category=classification.vulnerability_class,
                 baseline_relationship=classification.relationship.lower(),
+                tenant_id=_tenant_id(request),
+                repository_id=request.repository_id,
+                base_revision=request.base_sha,
+                head_revision=request.head_sha,
+                attacker_origin=_evidence_summary(verification.evidence, EvidenceRole.ATTACKER_ORIGIN),
+                security_boundary=_evidence_summary(verification.evidence, EvidenceRole.SECURITY_BOUNDARY),
+                defense_removed_or_bypassed=_evidence_summary(
+                    verification.evidence, EvidenceRole.DEFENSE_REMOVED_OR_BYPASSED
+                ),
+                downstream_trust=_evidence_summary(verification.evidence, EvidenceRole.DOWNSTREAM_TRUST),
+                sensitive_effects=[
+                    redact(item.summary.strip())
+                    for item in verification.evidence
+                    if item.role == EvidenceRole.SENSITIVE_EFFECT and item.summary.strip()
+                ],
+                capabilities=_capabilities(candidate, verification),
+                evidence=[
+                    FindingEvidence(
+                        role=item.role.value,
+                        source=item.source,
+                        path=item.path,
+                        start_line=item.start_line,
+                        end_line=item.end_line,
+                        summary=redact(item.summary),
+                    )
+                    for item in verification.evidence
+                ],
+                context_facts=[redact(fact) for fact in candidate.context_facts_used],
+                evidence_gaps=[redact(gap) for gap in verification.evidence_gaps],
+                verified_at=datetime.now(UTC),
             )
         )
 
@@ -263,7 +300,24 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
         summary=_summary(result, len(findings)),
         findings=findings,
         incomplete_reason=incomplete_reason,
+        counters=_counters_dict(result.counters),
     )
+
+
+def _tenant_id(request: ReviewRequest) -> str:
+    return f"{request.provider}:installation:{request.installation_id}"
+
+
+def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
+    for item in evidence:
+        if item.role == role and item.summary.strip():
+            return redact(item.summary.strip())
+    return None
+
+
+def _capabilities(candidate: object, verification: object) -> list[str]:
+    raw = (verification.gained_capability, candidate.provisional_attacker_capability)
+    return list(dict.fromkeys(redact(value.strip()) for value in raw if value and value.strip()))
 
 
 def _review_id(request: ReviewRequest) -> str:

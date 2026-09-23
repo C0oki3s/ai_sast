@@ -848,6 +848,63 @@ before the first real end-to-end NSTCTF run rather than after:
   codebase_id, baseline_revision)` (migration `0004`), so multiple open base
   revisions coexist.
 
+#### Implementation status (Wave 9)
+
+Wave 9 implements the same external review's P0.5/P0.6 items: the `POST
+/v1/reviews` response is a thin `action`/`summary`/`findings` shell around
+data the pipeline already computes but drops before it reaches the HTTP
+contract. This does not attempt the full "Canonical finding object" in
+"PR/MR Finding Delivery, Triage, and Remediation Plan" below (state
+machine, publication records, triage) -- only the fields a bot integration
+needs today to render a finding without re-deriving them itself.
+
+- **`ReviewResponse.counters`.** The `ReviewCounters` already computed and
+  persisted alongside every attempt (candidates_generated, evaluated,
+  verified, blocking, in_triage, etc.) were previously only reachable via a
+  second `GET /v1/reviews/{review_id}` poll. They're now on the synchronous
+  `POST` response too (and on a replayed duplicate-delivery response, read
+  back from the persisted attempt), so a bot doesn't need a follow-up call
+  to render its check summary.
+- **`ReviewFinding` carries the evidence, not just a paragraph.** Added
+  `root_cause_fingerprint`, `root_cause_symbol`, `tenant_id`,
+  `repository_id`, `base_revision`, `head_revision`, `remediation_invariant`
+  (`verification.security_invariant`), `proof_plan` and
+  `regression_test_expectation` (computed by `PlaidNoxDeepHuntAgent.hunt`
+  all along but previously dropped at the `CandidateVerification` boundary
+  in `verification.py` -- now threaded through), the role-tagged
+  `attacker_origin`/`security_boundary`/`defense_removed_or_bypassed`/
+  `downstream_trust`/`sensitive_effects` (derived from
+  `verification.evidence`'s `EvidenceRole` tags), `capabilities`
+  (`gained_capability` + `provisional_attacker_capability`, deduped),
+  `evidence` (the full role-tagged `ReviewEvidence` list, as a new
+  `FindingEvidence` contract model), `context_facts`
+  (`candidate.context_facts_used`), `evidence_gaps`
+  (`verification.evidence_gaps`), and `verified_at`.
+- **`impact` is a field, not a string concatenation.** `description` used
+  to have `"\n\nImpact: ..."` appended onto it when `business_impact` was
+  non-empty. `impact` is now `ReviewFinding.impact: str | None`, letting a
+  consumer render it separately instead of parsing it back out.
+- **Every new free-text field is redacted.** All of the above route through
+  `plaidnox_sast.redaction.redact` exactly like `description`/`title`
+  already did, verified by a dedicated test
+  (`test_wave9_finding_contract_fields_are_all_redacted`) that plants a
+  fake secret in the evidence summary, capability, remediation invariant,
+  proof plan, and context facts simultaneously and asserts none of them
+  carry it through the response or the persisted attempt.
+
+Deliberately not attempted here, since no real upstream data exists for
+them without new work: `scan_id` (the SCM review path never invokes
+`plaidnox_sast/pipeline.py`'s scan orchestrator, so there is no scan
+identity to expose); `verifier_model_execution_id` (the Responses API
+`response.id` is fetched in `plaidnox_sast/ai.py` but discarded after
+telemetry extraction -- capturing and threading it through
+`DeepHuntResult` -> `CandidateVerification` -> `ReviewFinding` is future
+work); `safe_reproduction_steps[]` as a distinct list (no structured list
+of reproduction steps exists separately from `proof_plan`'s prose --
+inventing a split would fabricate structure the AI review never produced).
+The full finding lifecycle state machine, GitHub publication, and triage
+commands below remain their own, larger waves.
+
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
 This subsection is the authoritative design for everything that happens

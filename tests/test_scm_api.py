@@ -13,6 +13,7 @@ from plaidnox_scm.api import create_app
 from plaidnox_scm.api_models import ReviewRequest
 from plaidnox_scm.api_service import ReviewService, _review_id
 from plaidnox_scm.attempts import unit_of_work as attempts_unit_of_work
+from plaidnox_scm.evidence import EvidenceRole
 from plaidnox_scm.models import Base
 from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource
 
@@ -92,6 +93,7 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
         "summary": "No new verified finding requires merge action. Policy decision: PASS.",
         "findings": [],
         "incomplete_reason": None,
+        "counters": response.json()["counters"],
     }
     assert response.json()["review_id"].startswith("review_")
     assert dependency_calls == 0
@@ -103,21 +105,40 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
     candidate = SimpleNamespace(
         candidate_id="candidate-1",
         changed_lines=SimpleNamespace(start=12, end=12),
+        context_facts_used=("Token middleware guards every protected route.",),
+        provisional_attacker_capability="Forge an unsigned session claim.",
     )
     verification = SimpleNamespace(
         candidate_id="candidate-1",
         message="Unsigned claims become trusted identity. Observed sk-aaaaaaaaaaaa must not leave the scanner.",
         business_impact="An attacker can impersonate a manager.",
         remediation="Restore cryptographic JWT verification.",
+        security_invariant="Only cryptographically signed claims may authenticate a request.",
+        gained_capability="Forge an unsigned session claim.",
+        proof_plan="Send a request with an unsigned JWT and observe it is accepted.",
+        regression_test="Reject any request whose JWT signature does not verify.",
+        evidence_gaps=(),
+        evidence=(
+            SimpleNamespace(
+                role=EvidenceRole.ATTACKER_ORIGIN,
+                source="deep_hunt",
+                path="middleware/ValidateToken.js",
+                start_line=12,
+                end_line=12,
+                summary="Deep Hunt ATTACKER_ORIGIN evidence",
+            ),
+        ),
     )
     classification = SimpleNamespace(
         verification_state="verified",
         candidate_id="candidate-1",
         finding_fingerprint="finding-1",
+        root_cause_fingerprint="root-cause-1",
         title="Protected routes accept unsigned JWT claims",
         severity="High",
         confidence=0.99,
         root_cause_path="middleware/ValidateToken.js",
+        root_cause_symbol="ValidateToken.middleware",
         root_cause_changed_in_review=True,
         vulnerability_class="CWE-347",
         relationship="INTRODUCED",
@@ -148,27 +169,57 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
     body = response.json()
     assert body["head_sha"] == head
     assert body["action"] == "block"
-    assert body["findings"] == [
-        {
-            "finding_id": "finding-1",
-            "title": "Protected routes accept unsigned JWT claims",
-            "severity": "high",
-            "confidence": 0.99,
-            "description": (
-                "Unsigned claims become trusted identity. Observed <redacted-api-key> "
-                "must not leave the scanner.\n\n"
-                "Impact: An attacker can impersonate a manager."
-            ),
-            "root_cause_path": "middleware/ValidateToken.js",
-            "root_cause_start_line": 12,
-            "root_cause_end_line": 12,
-            "root_cause_changed_in_pr": True,
-            "proof_of_concept": None,
-            "remediation": "Restore cryptographic JWT verification.",
-            "category": "CWE-347",
-            "baseline_relationship": "introduced",
-        }
-    ]
+    assert body["counters"]["blocking"] == 1
+    assert body["counters"]["in_triage"] == 1
+    [finding] = body["findings"]
+    verified_at = finding.pop("verified_at")
+    assert verified_at is not None
+    assert finding == {
+        "finding_id": "finding-1",
+        "root_cause_fingerprint": "root-cause-1",
+        "title": "Protected routes accept unsigned JWT claims",
+        "severity": "high",
+        "confidence": 0.99,
+        "description": (
+            "Unsigned claims become trusted identity. Observed <redacted-api-key> "
+            "must not leave the scanner."
+        ),
+        "impact": "An attacker can impersonate a manager.",
+        "root_cause_path": "middleware/ValidateToken.js",
+        "root_cause_symbol": "ValidateToken.middleware",
+        "root_cause_start_line": 12,
+        "root_cause_end_line": 12,
+        "root_cause_changed_in_pr": True,
+        "proof_of_concept": None,
+        "remediation": "Restore cryptographic JWT verification.",
+        "remediation_invariant": "Only cryptographically signed claims may authenticate a request.",
+        "proof_plan": "Send a request with an unsigned JWT and observe it is accepted.",
+        "regression_test_expectation": "Reject any request whose JWT signature does not verify.",
+        "category": "CWE-347",
+        "baseline_relationship": "introduced",
+        "tenant_id": "github:installation:12345",
+        "repository_id": 899377752,
+        "base_revision": base,
+        "head_revision": head,
+        "attacker_origin": "Deep Hunt ATTACKER_ORIGIN evidence",
+        "security_boundary": None,
+        "defense_removed_or_bypassed": None,
+        "downstream_trust": None,
+        "sensitive_effects": [],
+        "capabilities": ["Forge an unsigned session claim."],
+        "evidence": [
+            {
+                "role": "ATTACKER_ORIGIN",
+                "source": "deep_hunt",
+                "path": "middleware/ValidateToken.js",
+                "start_line": 12,
+                "end_line": 12,
+                "summary": "Deep Hunt ATTACKER_ORIGIN evidence",
+            }
+        ],
+        "context_facts": ["Token middleware guards every protected route."],
+        "evidence_gaps": [],
+    }
 
 
 def test_repository_mirror_broker_requires_exact_requested_revisions(tmp_path: Path) -> None:

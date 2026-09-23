@@ -20,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from plaidnox_scm import attempts
 from plaidnox_scm.api_models import ReviewRequest
 from plaidnox_scm.api_service import ReviewService, _review_id
+from plaidnox_scm.evidence import EvidenceRole
 from plaidnox_scm.models import Base
 from plaidnox_scm.source_broker import RepositoryMirrorBroker
 
@@ -113,21 +114,34 @@ def test_failed_review_persists_a_redacted_error_message(monkeypatch, tmp_path: 
 def test_replayed_duplicate_delivery_does_not_resurface_a_raw_secret(monkeypatch, tmp_path: Path) -> None:
     mirror = tmp_path / "mirrors" / "github" / "899377752"
     base, head = _repository(mirror)
-    candidate = SimpleNamespace(candidate_id="candidate-1", changed_lines=SimpleNamespace(start=12, end=12))
+    candidate = SimpleNamespace(
+        candidate_id="candidate-1",
+        changed_lines=SimpleNamespace(start=12, end=12),
+        context_facts_used=(),
+        provisional_attacker_capability="",
+    )
     verification = SimpleNamespace(
         candidate_id="candidate-1",
         message=f"Leaked key {_LEAKED_API_KEY} observed in logs.",
         business_impact="",
         remediation="Rotate the key.",
+        security_invariant="",
+        gained_capability="",
+        proof_plan="",
+        regression_test="",
+        evidence_gaps=(),
+        evidence=(),
     )
     classification = SimpleNamespace(
         verification_state="verified",
         candidate_id="candidate-1",
         finding_fingerprint="finding-1",
+        root_cause_fingerprint="root-cause-1",
         title="Secret leaked to logs",
         severity="High",
         confidence=0.9,
         root_cause_path="app.py",
+        root_cause_symbol="handler",
         root_cause_changed_in_review=True,
         vulnerability_class="CWE-532",
         relationship="INTRODUCED",
@@ -158,6 +172,100 @@ def test_replayed_duplicate_delivery_does_not_resurface_a_raw_secret(monkeypatch
     for response in (first_response, second_response):
         assert _LEAKED_API_KEY not in response.findings[0].description
         assert "<redacted-api-key>" in response.findings[0].description
+
+    tenant_id = f"{request.provider}:installation:{request.installation_id}"
+    with attempts.unit_of_work(factory, tenant_id) as repository:
+        attempt = repository.get(_review_id(request))
+    assert attempt is not None
+    assert _LEAKED_API_KEY not in str(attempt.findings)
+
+
+def test_wave9_finding_contract_fields_are_all_redacted(monkeypatch, tmp_path: Path) -> None:
+    """Every new free-text field on the richer finding contract (Wave 9) must be
+    redacted, not just `description` -- a secret can just as easily surface in
+    an evidence summary, a capability, or the remediation invariant.
+    """
+
+    mirror = tmp_path / "mirrors" / "github" / "899377752"
+    base, head = _repository(mirror)
+    candidate = SimpleNamespace(
+        candidate_id="candidate-1",
+        changed_lines=SimpleNamespace(start=12, end=12),
+        context_facts_used=(f"Config loader reads {_LEAKED_API_KEY} from a fixture.",),
+        provisional_attacker_capability=f"Exfiltrate {_LEAKED_API_KEY} via the debug endpoint.",
+    )
+    verification = SimpleNamespace(
+        candidate_id="candidate-1",
+        message="Debug endpoint leaks configuration.",
+        business_impact=f"Full compromise using {_LEAKED_API_KEY}.",
+        remediation=f"Rotate {_LEAKED_API_KEY} and remove the endpoint.",
+        security_invariant=f"Secrets such as {_LEAKED_API_KEY} must never leave the process.",
+        gained_capability=f"Exfiltrate {_LEAKED_API_KEY} via the debug endpoint.",
+        proof_plan=f"Call /debug/config and observe {_LEAKED_API_KEY} in the response body.",
+        regression_test=f"Assert /debug/config never returns {_LEAKED_API_KEY}.",
+        evidence_gaps=(f"Could not confirm whether {_LEAKED_API_KEY} is rotated elsewhere.",),
+        evidence=(
+            SimpleNamespace(
+                role=EvidenceRole.SENSITIVE_EFFECT,
+                source="deep_hunt",
+                path="app.py",
+                start_line=12,
+                end_line=12,
+                summary=f"Response body contains {_LEAKED_API_KEY}.",
+            ),
+        ),
+    )
+    classification = SimpleNamespace(
+        verification_state="verified",
+        candidate_id="candidate-1",
+        finding_fingerprint="finding-1",
+        root_cause_fingerprint="root-cause-1",
+        title="Debug endpoint leaks configuration",
+        severity="High",
+        confidence=0.9,
+        root_cause_path="app.py",
+        root_cause_symbol="handler",
+        root_cause_changed_in_review=True,
+        vulnerability_class="CWE-532",
+        relationship="INTRODUCED",
+    )
+    result = SimpleNamespace(
+        outcome="findings_verified",
+        policy=SimpleNamespace(decision="BLOCK", reasons=()),
+        counters=SimpleNamespace(blocking=1, in_triage=1),
+        candidates=(candidate,),
+        verifications=(verification,),
+        baseline_classifications=(classification,),
+        coverage_gaps=(),
+        detail="verified",
+    )
+    monkeypatch.setattr("plaidnox_scm.api_service.review_pull_request", lambda *args, **kwargs: result)
+    factory = _factory()
+    service = ReviewService(
+        RepositoryMirrorBroker(tmp_path / "mirrors"),
+        factory,
+        lambda: (_ for _ in ()).throw(AssertionError("dependencies must not be requested")),
+    )
+    request = ReviewRequest.model_validate(_request(base, head))
+
+    response = service.run(request)
+    finding = response.findings[0]
+
+    rendered = "".join(
+        (
+            finding.impact or "",
+            finding.remediation or "",
+            finding.remediation_invariant or "",
+            finding.proof_plan or "",
+            finding.regression_test_expectation or "",
+            *finding.capabilities,
+            *finding.context_facts,
+            *finding.evidence_gaps,
+            *(item.summary for item in finding.evidence),
+        )
+    )
+    assert _LEAKED_API_KEY not in rendered
+    assert "<redacted-api-key>" in rendered
 
     tenant_id = f"{request.provider}:installation:{request.installation_id}"
     with attempts.unit_of_work(factory, tenant_id) as repository:

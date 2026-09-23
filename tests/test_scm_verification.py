@@ -140,6 +140,11 @@ def test_sast_verifier_uses_head_snapshot_and_enforces_change_minimum_depth(tmp_
         EvidenceRole.DEFENSE_REMOVED_OR_BYPASSED,
         EvidenceRole.CONTEXT_ONLY,
     }
+    # Deep Hunt already computes these; the finding contract needs them
+    # too, so they must survive onto `CandidateVerification` rather than
+    # being dropped at this boundary.
+    assert results[0].proof_plan == "Submit a forged token in an isolated test."
+    assert results[0].regression_test == "Reject a token with an invalid signature."
 
 
 def test_missing_candidate_specific_context_keeps_supported_review_unresolved(tmp_path: Path) -> None:

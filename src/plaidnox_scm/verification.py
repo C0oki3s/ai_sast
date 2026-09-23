@@ -53,6 +53,8 @@ class CandidateVerification:
     route: RouteDecision
     evidence: tuple[ReviewEvidence, ...] = ()
     context_expansion: CandidateContextExpansion | None = None
+    proof_plan: str = ""
+    regression_test: str = ""
 
 
 class CandidateVerifier(Protocol):
@@ -165,6 +167,8 @@ class SastDeepHuntVerifier:
                             review.evidence_locations,
                         ),
                         context_expansion=expansion,
+                        proof_plan=review.proof_plan,
+                        regression_test=review.regression_test,
                     )
                 )
         return tuple(results)
