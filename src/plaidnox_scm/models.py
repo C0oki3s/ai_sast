@@ -75,6 +75,47 @@ class FindingBaselineRecord(Base):
     )
 
 
+class FindingTriageRecord(Base):
+    """Current triage lifecycle state for one finding (Wave 12).
+
+    Keyed by `(tenant_id, finding_id)`, not by review or revision -- unlike
+    `FindingBaselineRecord`, triage state is a property of the finding
+    itself and must survive across re-reviews of the same PR (new pushes)
+    and across the finding moving between `EXISTING`/`MODIFIED_EXISTING`
+    baseline relationships.
+    """
+
+    __tablename__ = "scm_finding_triage"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    finding_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    actor: Mapped[str | None] = mapped_column(String(255))
+    reason: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class FindingTriageEventRecord(Base):
+    """Append-only audit trail of every triage command actually applied (Wave 12)."""
+
+    __tablename__ = "scm_finding_triage_events"
+    __table_args__ = (Index("ix_scm_finding_triage_events_finding", "tenant_id", "finding_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    finding_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    command: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    new_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class ReviewAttemptRecord(Base):
     """Durable idempotency/lease record for one `POST /v1/reviews` attempt.
 

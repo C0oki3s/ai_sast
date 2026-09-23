@@ -995,6 +995,73 @@ this repo taking on installation-token handling that belongs to the
 configured budget, that remains a hard failure surfaced as the same 409
 `SourceBrokerError` response as before this wave.
 
+#### Implementation status (Wave 12)
+
+Wave 12 implements the persistence + state-machine half of "Triage
+commands" below: `!valid`, `!fp`, `!accepted_risk`, and `!fixed`. Webhook
+verification, comment parsing, and GitHub-permission-based actor
+authorization are the bot's job (`PlaidNox/plaidnox-github-bot`) and stay
+out of this repo's boundary -- this wave takes an already-parsed command
+and an already-authorized actor identity as HTTP input.
+
+- **New tables.** `scm_finding_triage` (`FindingTriageRecord`), keyed on
+  `(tenant_id, finding_id)` -- not by review or revision, since triage
+  state is a property of the finding itself and must survive across
+  re-reviews of the same PR (new pushes) and across the finding moving
+  between `EXISTING`/`MODIFIED_EXISTING` baseline relationships. Plus
+  `scm_finding_triage_events` (`FindingTriageEventRecord`), an append-only
+  audit trail of every command actually applied, indexed on `(tenant_id,
+  finding_id, created_at)` for a future dashboard "Activity tab."
+- **`plaidnox_scm/triage.py`.** A `FindingTriageRepository` with the same
+  `unit_of_work(factory, tenant_id)` shape as `attempts.py`/
+  `context_store.py`. States: `open -> confirmed -> {false_positive,
+  accepted_risk, fix_pending}`, matching the doc's state machine restricted
+  to the transitions these four commands can actually cause. A command
+  replayed once the finding already sits at (or past) its own target state
+  is treated as an idempotent no-op (`applied=False`, same state, no
+  duplicate event row) rather than a conflict, so a retried triage webhook
+  cannot double-log history or 409 on its own retry.
+- **`!fixed` never sets `resolved` directly.** Per the doc, "`RESOLVED`
+  cannot be set only because somebody writes `!fixed`; it requires fix
+  validation against a new revision." `!fixed` only transitions to
+  `fix_pending` -- the actual `RESOLVED` transition is `baseline.py`'s own
+  `RESOLVED` relationship, computed the next time a review reverifies the
+  finding is actually gone. Wiring that revalidation back into
+  `scm_finding_triage` is future work, not attempted here.
+- **`POST`/`GET /v1/reviews/{review_id}/findings/{finding_id}/triage`.**
+  `TriageRequest` (`command` restricted by pattern to the four supported
+  commands, `actor`, optional `reason`) and `TriageResponse`/`TriageStatus`
+  in `api_models.py`. `TriageReasonRequiredError` (missing reason on `!fp`/
+  `!accepted_risk`) -> 422; `TriageConflictError` (e.g. `!valid` on an
+  already-`false_positive` finding) -> 409; unknown `review_id` -> 404. A
+  `GET` before any command returns the implicit default `open` state with
+  null actor/reason/updated_at, rather than 404, since every finding starts
+  there.
+- **`finding_id` is deliberately not checked against this `review_id`'s own
+  `attempt.findings`.** `baseline.py`'s `classify_against_baseline()` can
+  leave a still-open finding at `verification_state == "baseline"` when a
+  review's coverage didn't happen to re-verify it that time, and
+  `_response()` only ever appends `"verified"` findings to
+  `attempt.findings` -- so a real, previously established finding can
+  legitimately be absent from one review's own list while still needing to
+  be triageable through it. Requiring presence would incorrectly 404 real
+  findings.
+- **Tests.** `tests/test_scm_triage.py` covers the default-open status, a
+  fresh `!valid`, `!fp`/`!accepted_risk` both with and without a reason,
+  `!fixed` landing on `fix_pending` (not `resolved`), an idempotent replay
+  of `!valid`, an invalid transition (`!valid` after `!fp`) -> 409, and an
+  unknown `review_id` -> 404.
+
+Deliberately not attempted here: GitHub webhook parsing, comment
+authorship parsing, and org-role-based actor authorization (bot-side, per
+the standing package boundary); wiring the policy engine to actually treat
+`accepted_risk`/`false_positive` state as non-blocking on a later review
+(the doc says only that the policy engine "decides" this, not that this
+wave must implement that decision); the real `RESOLVED` transition via fix
+validation against a new revision (a distinct, larger remediation-agent
+feature); and `!reopen`/`!snooze`/`!assign`, which the doc itself labels
+"optional later."
+
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
 This subsection is the authoritative design for everything that happens

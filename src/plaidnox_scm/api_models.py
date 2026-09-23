@@ -126,6 +126,43 @@ class PromoteBaselineResponse(BaseModel):
     promoted_count: int
 
 
+class TriageRequest(BaseModel):
+    """One `!valid`/`!fp`/`!accepted_risk`/`!fixed` command, already parsed and
+    already authorized by the provider bot -- this contract carries only the
+    resulting command + actor identity, not the raw comment or webhook.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    command: str = Field(pattern=r"^(valid|fp|accepted_risk|fixed)$")
+    actor: str = Field(min_length=1, max_length=255)
+    reason: str | None = Field(default=None, max_length=4000)
+
+
+class TriageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str
+    review_id: str
+    state: str
+    previous_state: str
+    actor: str | None = None
+    reason: str | None = None
+    applied: bool
+    updated_at: datetime
+
+
+class TriageStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str
+    review_id: str
+    state: str
+    actor: str | None = None
+    reason: str | None = None
+    updated_at: datetime | None = None
+
+
 class ReviewAttemptStatus(BaseModel):
     """Live status/counters for one review attempt (`GET /v1/reviews/{review_id}`)."""
 

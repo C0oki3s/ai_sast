@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_sast.redaction import redact
 
-from . import attempts, context_store
+from . import attempts, context_store, triage
 from .api_models import (
     FindingEvidence,
     PolicyAction,
@@ -22,6 +22,8 @@ from .api_models import (
     ReviewFinding,
     ReviewRequest,
     ReviewResponse,
+    TriageResponse,
+    TriageStatus,
 )
 from .assets import load_json
 from .baseline_models import BaselineFinding
@@ -250,6 +252,64 @@ class ReviewService:
             attempt_count=attempt.attempt_count,
             started_at=attempt.started_at,
             completed_at=attempt.completed_at,
+        )
+
+    def apply_triage_command(
+        self,
+        review_id: str,
+        finding_id: str,
+        command: str,
+        *,
+        actor: str,
+        reason: str | None,
+    ) -> TriageResponse | None:
+        """Applies one triage command, keyed on the finding rather than this review.
+
+        `finding_id` is deliberately not checked against this `review_id`'s
+        own persisted `attempt.findings`: `baseline.py`'s
+        `classify_against_baseline()` can leave a still-open finding at
+        `verification_state == "baseline"` when a review's coverage did not
+        happen to re-verify it, and `_response()` only ever appends
+        `"verified"` findings to `attempt.findings` -- so a real, previously
+        established finding can legitimately be absent from one review's
+        list while still needing to be triageable against it.
+        """
+
+        with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
+            attempt = repository.get(review_id)
+        if attempt is None:
+            return None
+
+        with triage.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
+            outcome = repository.apply_command(finding_id, review_id, command, actor=actor, reason=reason)
+        return TriageResponse(
+            finding_id=finding_id,
+            review_id=review_id,
+            state=outcome.triage.state,
+            previous_state=outcome.previous_state,
+            actor=outcome.triage.actor,
+            reason=outcome.triage.reason,
+            applied=outcome.applied,
+            updated_at=outcome.triage.updated_at,
+        )
+
+    def get_triage(self, review_id: str, finding_id: str) -> TriageStatus | None:
+        with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
+            attempt = repository.get(review_id)
+        if attempt is None:
+            return None
+
+        with triage.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
+            current = repository.get(finding_id)
+        if current is None:
+            return TriageStatus(finding_id=finding_id, review_id=review_id, state=triage.OPEN)
+        return TriageStatus(
+            finding_id=finding_id,
+            review_id=review_id,
+            state=current.state,
+            actor=current.actor,
+            reason=current.reason,
+            updated_at=current.updated_at,
         )
 
 
