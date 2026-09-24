@@ -378,11 +378,16 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
         if candidate is None or verification is None:
             continue
 
-        proof_plan = redact(verification.proof_plan.strip()) or None
-        regression_test = redact(verification.regression_test.strip()) or None
-        security_invariant = redact(verification.security_invariant.strip()) or None
-        gained_capability = redact(verification.gained_capability.strip()) or None
-        attack_path = redact(verification.attack_path.strip()) or None
+        proof_plan = _optional_verification_text(verification, "proof_plan")
+        regression_test = _optional_verification_text(verification, "regression_test")
+        security_invariant = _optional_verification_text(verification, "security_invariant")
+        gained_capability = _optional_verification_text(verification, "gained_capability")
+        attack_path = _optional_verification_text(verification, "attack_path")
+        vulnerable_snippet = _api_vulnerable_snippet(
+            getattr(verification, "vulnerable_snippet", None)
+        )
+        evidence_trace = _api_evidence_trace(getattr(verification, "evidence_trace", None))
+        rich_evidence = vulnerable_snippet is not None or evidence_trace is not None
 
         findings.append(
             ReviewFinding(
@@ -398,28 +403,28 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                 root_cause_start_line=candidate.changed_lines.start,
                 root_cause_end_line=candidate.changed_lines.end,
                 root_cause_changed_in_pr=classification.root_cause_changed_in_review,
-                root_cause=FindingRootCause(
-                    path=classification.root_cause_path,
-                    symbol=classification.root_cause_symbol,
-                    start_line=candidate.changed_lines.start,
-                    end_line=candidate.changed_lines.end,
-                    changed_in_pr=classification.root_cause_changed_in_review,
+                root_cause=(
+                    FindingRootCause(
+                        path=classification.root_cause_path,
+                        symbol=classification.root_cause_symbol,
+                        start_line=candidate.changed_lines.start,
+                        end_line=candidate.changed_lines.end,
+                        changed_in_pr=classification.root_cause_changed_in_review,
+                    )
+                    if rich_evidence
+                    else None
                 ),
-                vulnerable_snippet=_api_vulnerable_snippet(
-                    getattr(verification, "vulnerable_snippet", None)
-                ),
-                evidence_trace=_api_evidence_trace(
-                    getattr(verification, "evidence_trace", None)
-                ),
-                attack_path=attack_path,
-                security_invariant=security_invariant,
-                gained_capability=gained_capability,
+                vulnerable_snippet=vulnerable_snippet,
+                evidence_trace=evidence_trace,
+                attack_path=attack_path if rich_evidence else None,
+                security_invariant=security_invariant if rich_evidence else None,
+                gained_capability=gained_capability if rich_evidence else None,
                 reproduction=(
                     FindingReproduction(
                         proof_plan=proof_plan,
                         regression_test_expectation=regression_test,
                     )
-                    if proof_plan or regression_test
+                    if rich_evidence and (proof_plan or regression_test)
                     else None
                 ),
                 proof_of_concept=None,
@@ -500,6 +505,14 @@ def _tenant_id(request: ReviewRequest) -> str:
     return f"{request.provider}:installation:{request.installation_id}"
 
 
+def _optional_verification_text(verification: object, attribute: str) -> str | None:
+    value = getattr(verification, attribute, "")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return redact(text) or None if text else None
+
+
 def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
     for item in evidence:
         if item.role == role and item.summary.strip():
@@ -508,7 +521,7 @@ def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
 
 
 def _capabilities(candidate: object, verification: object) -> list[str]:
-    raw = (verification.gained_capability, candidate.provisional_attacker_capability)
+    raw = (getattr(verification, "gained_capability", ""), candidate.provisional_attacker_capability)
     return list(
         dict.fromkeys(redact(value.strip()) for value in raw if value and value.strip())
     )
