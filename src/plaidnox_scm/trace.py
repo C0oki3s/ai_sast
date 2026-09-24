@@ -145,8 +145,6 @@ def build_evidence_trace(
     if not nodes:
         return None
 
-    # Ensure the changed root cause is present even when the verifier omitted a
-    # duplicate location from its own evidence list.
     if not any(node.role == EvidenceRole.ROOT_CAUSE_CHANGED_CODE for node in nodes):
         root_evidence = ReviewEvidence(
             role=EvidenceRole.ROOT_CAUSE_CHANGED_CODE,
@@ -205,11 +203,6 @@ def build_evidence_trace(
     first_layer = by_layer[populated_layers[0]]
     last_layer = by_layer[populated_layers[-1]]
     unique_gaps = tuple(dict.fromkeys(redact(value.strip()) for value in gaps if value.strip()))
-    required_roles = {
-        EvidenceRole.ROOT_CAUSE_CHANGED_CODE,
-        EvidenceRole.DOWNSTREAM_TRUST,
-        EvidenceRole.SENSITIVE_EFFECT,
-    }
     represented_roles = {node.role for node in nodes}
     non_entry_ids = {node.node_id for node in nodes} - {node.node_id for node in first_layer}
     complete = (
@@ -257,11 +250,7 @@ def _validated_node(
 
     expression = redact("\n".join(lines[start - 1 : end])[:1200])
     anchor = _anchor_at(graph, path, start, end)
-    symbol = (
-        anchor.qualified_name or anchor.name
-        if anchor is not None
-        else graph.symbol_at(path, start)
-    )
+    symbol = anchor.qualified_name or anchor.name if anchor is not None else path
     key = (item.role.value, path, start, end, item.summary, symbol, expression)
     digest = hashlib.sha256("|".join(str(value) for value in key).encode("utf-8")).hexdigest()[:16]
     return EvidenceTraceNode(
