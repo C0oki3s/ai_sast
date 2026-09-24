@@ -282,7 +282,6 @@ def test_units_move_through_running_retryable_final_and_abandoned_states(tmp_pat
     assert resumed.status_counts() == {"failed_retryable": 2, "failed_final": 1}
     assert resumed.pending("llm_response", "live")["last_error_type"] == "abandoned"
     assert resumed.pending("llm_response", "rate")["last_error_type"] == "RateLimitError"
-
     resumed.begin("llm_response", "rate", {}, {"operation": "b"})
     row = resumed._db.execute(
         "SELECT status, attempt_count FROM checkpoint_units WHERE unit_key = 'rate'"
@@ -291,3 +290,20 @@ def test_units_move_through_running_retryable_final_and_abandoned_states(tmp_pat
     resumed.complete("llm_response", "rate", {"ok": True})
     assert resumed.get("llm_response", "rate") == {"ok": True}
     resumed.close()
+
+
+def test_successful_replacement_supersedes_only_matching_retryable_work(tmp_path):
+    from plaidnox_sast.checkpoint import ScanCheckpoint
+
+    store = ScanCheckpoint(tmp_path / "checkpoint.sqlite", "scope")
+    store.begin("llm_response", "old-key", {}, {"operation": "security_review", "work_identity": "candidate-a"})
+    store.fail("llm_response", "old-key", "incomplete:max_output_tokens")
+    store.begin("llm_response", "other-key", {}, {"operation": "security_review", "work_identity": "candidate-b"})
+    store.fail("llm_response", "other-key", "TimeoutError")
+    store.begin("llm_response", "replacement-key", {}, {"operation": "security_review", "work_identity": "candidate-a"})
+    store.complete("llm_response", "replacement-key", {"ok": True})
+
+    assert store.status_counts() == {"completed": 1, "failed_retryable": 1, "superseded": 1}
+    assert store.pending("llm_response", "old-key") is None
+    assert store.pending("llm_response", "other-key") is not None
+    store.close()

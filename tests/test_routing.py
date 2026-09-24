@@ -80,13 +80,14 @@ def test_model_execution_router_uses_configured_fallback():
     assert decision.reason == "configured model fallback"
 
 
-def test_model_execution_router_applies_configured_operation_override():
+def test_model_execution_router_does_not_pin_repository_context_to_a_model():
     decision = ModelExecutionRouter().classify({"operation": "repository_context"})
 
-    assert decision.model_name == load_json("runtime/models.json")["agent_model_override_by_operation"]["repository_context"]
+    assert load_json("runtime/models.json")["agent_model_override_by_operation"] == {}
+    assert decision.model_name == load_json("runtime/models.json")["agent_fallback_model_by_tier"]["standard"]
     assert decision.model_tier is ModelTier.STANDARD
-    assert decision.confidence == 1.0
-    assert "operation model override" in decision.reason
+    assert decision.confidence == 0.0
+    assert decision.reason == "configured model fallback"
 
 
 def test_frontier_router_prioritizes_high_severity_capabilities_as_high():

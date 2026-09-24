@@ -87,8 +87,10 @@ def test_prompt_corpus_uses_markdown_templates_only():
     assert all(
         str(path).endswith(".md")
         for operation in manifest["operations"].values()
-        for path in operation.values()
+        for name, path in operation.items()
+        if name in {"system", "user"}
     )
+    assert manifest["operations"]["vulnerability_discovery"]["contract_version"]
 
 
 def test_dynamic_evidence_is_separate_from_stable_system_prompt():

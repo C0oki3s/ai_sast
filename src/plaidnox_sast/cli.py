@@ -29,7 +29,6 @@ from .knowledge import (
     KnowledgeStore,
     research_provider_from_environment,
 )
-from .models import PolicyDecision
 from .observability import ScanTelemetry
 from .persistence import (
     DatabaseConfigurationError,
@@ -126,7 +125,10 @@ def _add_ai_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-output-tokens",
         type=int,
         default=None,
-        help="cap the AI response's output tokens; unset lets the model use its own limit",
+        help=(
+            "cap each AI response's output tokens; unset uses the production limit from "
+            "runtime/models.json"
+        ),
     )
     parser.add_argument(
         "--env-file",
@@ -327,7 +329,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
         )
         telemetry.record_result(result)
     _record_context_base(context_store, result, args.path)
-    decision = result.policy.decision
+    status = result.scan_status
     finding_count = len(result.findings)
     write_json(result, output / "report.json")
     write_repository_context(result, output / "repository-context.json")
@@ -338,7 +340,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
             {
                 "codebase": result.codebase,
                 "revision": result.revision,
-                "decision": decision,
+                "scan_status": status.value,
                 "findings": finding_count,
                 "json": str(output / "report.json"),
                 "repository_context": str(output / "repository-context.json"),
@@ -348,7 +350,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
-    if args.enforce and decision in (PolicyDecision.BLOCK, PolicyDecision.INCOMPLETE):
+    if args.enforce and status.value == "UNSUCCESSFUL":
         return 2
     return 0
 

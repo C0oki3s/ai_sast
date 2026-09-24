@@ -111,6 +111,7 @@ def to_sarif(result: ScanResult) -> dict[str, Any]:
                     }
                 },
                 "automationDetails": {"id": f"{result.codebase}/{result.revision}"},
+                "properties": {"scanStatus": result.scan_status.value, "findingsTotal": len(result.findings)},
                 "results": entries,
             }
         ],
@@ -133,18 +134,25 @@ def write_markdown(result: ScanResult, destination: Path) -> None:
         f"**Codebase:** `{result.codebase}`  ",
         f"**Revision:** `{result.revision}`  ",
         f"**Mode:** {result.mode.value}  ",
-        f"**Policy decision:** **{result.policy.decision.value.upper()}**  ",
+        f"**Scan status:** **{result.scan_status.value}**  ",
         "**Execution:** Static analysis only; target code and dependencies were not executed.",
         "",
         "## Summary",
         "",
         (
-            f"Validated findings: **{len(result.findings)}** — "
+            f"Verified findings: **{len(result.findings)}** — "
             f"{counts['critical']} critical, {counts['high']} high, "
             f"{counts['medium']} medium, {counts['low']} low."
         ),
         "",
     ]
+    if result.scan_status.value == "UNSUCCESSFUL":
+        lines.extend([
+            f"Verified findings recovered before failure: **{len(result.findings)}**.",
+            "",
+            "Required analysis did not complete. See scan metrics for failed or pending work.",
+            "",
+        ])
     if result.repository_context.get("architecture"):
         lines.extend(
             [

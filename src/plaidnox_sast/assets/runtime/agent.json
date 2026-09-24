@@ -1,5 +1,5 @@
 {
-  "workflow_version": "2026-09-22.1",
+  "workflow_version": "2026-09-24.5",
   "source_segment_characters": 8000,
   "discovery_max_workers": 2,
   "region_overlap_ratio": 0.5,
@@ -9,7 +9,11 @@
   "rate_limit_base_wait_seconds": 8,
   "rate_limit_max_wait_seconds": 65,
   "sweep_max_workers": 2,
-  "discovery_max_continuations": 2,
+  "discovery_max_continuations": 1,
+  "discovery_critical_max_continuations": 2,
+  "discovery_context_max_characters": 12000,
+  "discovery_context_per_request_max_characters": 3000,
+  "candidate_supporting_evidence_limit": 20,
   "context_expansion_max_rounds": 2,
   "context_expansion_max_requests_per_round": 5,
   "repository_entrypoint_limit": 100,
@@ -85,6 +89,14 @@
       "structured_shape_retries": 1
     }
   },
+  "model_output_token_limit_by_operation": {
+    "repository_context": 18000,
+    "hunt_plan": 16000,
+    "finding_consolidation": 12000,
+    "finding_group_narratives": 12000,
+    "vulnerability_discovery": 16000,
+    "security_review": 5000
+  },
   "consolidation_max_output_tokens": 12000,
   "research_max_output_tokens": 8000,
   "capability_chain_max_frontier": 5,
@@ -94,20 +106,45 @@
   "context_request_edge_page_size": 20,
   "knowledge_claim_characters": 240,
   "knowledge_max_claims": 6,
-  "prompt_cache_volatile_payload_keys": ["source_segment", "continuation_focus"],
+  "prompt_cache_volatile_payload_keys": [
+    "source_segment",
+    "new_context"
+  ],
   "prompt_cache_key_prefix": "plaidnox-sast",
   "reasoning_effort_by_operation": {
     "recon_search_plan": "low",
     "search_query_plan": "low",
     "finding_consolidation": "low",
     "finding_group_narratives": "low",
-    "repository_context": "medium",
+    "repository_context": "low",
     "hunt_plan": "medium",
-    "vulnerability_discovery": "medium",
+    "vulnerability_discovery": "low",
     "variant_sweep": "medium",
     "patch_proposal": "medium",
     "security_review": "high",
     "metadata_exposure_review": "high",
     "capability_chain": "high"
+  },
+  "discovery_context_requests_per_expansion": 3,
+  "discovery_context_request_priority": {
+    "definition": 0,
+    "readers": 1,
+    "writers": 1,
+    "middleware": 2,
+    "authorization_decision": 2,
+    "security_control": 2,
+    "route": 3,
+    "references": 4,
+    "callers": 4,
+    "callees": 4,
+    "flow": 5,
+    "store_relationship": 6,
+    "credential_consumer": 6,
+    "configuration": 7,
+    "environment_usage": 7,
+    "imports": 8,
+    "window": 9,
+    "search": 10,
+    "knowledge": 11
   }
 }

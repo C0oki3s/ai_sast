@@ -63,6 +63,7 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
         "cost": 0.0,
     }
     case_results: list[dict[str, Any]] = []
+    engineering_failures: list[str] = []
     base = path.resolve().parent
     for case in manifest["cases"]:
         report_path = _bounded_report_path(base, str(case["report_path"]))
@@ -87,6 +88,12 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
         totals["input_tokens"] += int(metrics.get("model_budget_input_tokens", 0) or 0)
         totals["output_tokens"] += int(metrics.get("model_budget_output_tokens", 0) or 0)
         totals["cost"] += float(metrics.get("model_budget_cost_usd", 0.0) or 0.0)
+        case_metric_failures = _discovery_metric_failures(
+            str(case["case_id"]),
+            metrics,
+            manifest["thresholds"],
+        )
+        engineering_failures.extend(case_metric_failures)
         case_results.append(
             {
                 "case_id": str(case["case_id"]),
@@ -101,6 +108,7 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
                 "unexpected_fingerprints": sorted(
                     str(item.get("fingerprint", "<missing>")) for item in unmatched_findings
                 ),
+                "discovery_metric_failures": case_metric_failures,
             }
         )
 
@@ -108,7 +116,7 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
     precision = _ratio(totals["tp"], totals["tp"] + totals["fp"], empty=1.0)
     duplicate_rate = _ratio(totals["duplicates"], totals["findings"], empty=0.0)
     thresholds = manifest["thresholds"]
-    failures: list[str] = []
+    failures: list[str] = list(engineering_failures)
     if recall < float(thresholds["minimum_recall"]):
         failures.append(f"recall {recall:.4f} is below {float(thresholds['minimum_recall']):.4f}")
     if precision < float(thresholds["minimum_precision"]):
@@ -169,6 +177,22 @@ def _matches(expectation: dict[str, Any], finding: dict[str, Any]) -> bool:
     vulnerability_class = str(expectation.get("vulnerability_class", "")).strip().lower()
     if vulnerability_class and str(finding.get("vulnerability_class", "")).strip().lower() != vulnerability_class:
         return False
+    metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+    packet = metadata.get("evidence_packet") if isinstance(metadata.get("evidence_packet"), dict) else {}
+    deep_hunt = metadata.get("deep_hunt") if isinstance(metadata.get("deep_hunt"), dict) else {}
+    semantic_expectations = (
+        ("root_cause_contains", json.dumps(packet.get("root_cause", {}), sort_keys=True)),
+        ("invariant_contains", str(packet.get("invariant") or deep_hunt.get("security_invariant", ""))),
+        (
+            "capability_contains",
+            " ".join(str(item) for item in packet.get("gained_capabilities", []))
+            or str(deep_hunt.get("gained_capability", "")),
+        ),
+    )
+    for field, actual in semantic_expectations:
+        expected = str(expectation.get(field, "")).strip().casefold()
+        if expected and expected not in actual.casefold():
+            return False
     expected_start = expectation.get("start_line")
     expected_end = expectation.get("end_line", expected_start)
     if expected_start is None:
@@ -176,6 +200,39 @@ def _matches(expectation: dict[str, Any], finding: dict[str, Any]) -> bool:
     actual_start = int(evidence.get("start_line", 0) or 0)
     actual_end = int(evidence.get("end_line", actual_start) or actual_start)
     return actual_start <= int(expected_end) and actual_end >= int(expected_start)
+
+
+def _discovery_metric_failures(
+    case_id: str,
+    metrics: dict[str, Any],
+    thresholds: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    checks = (
+        ("maximum_discovery_calls", "discovery_model_calls", "discovery calls"),
+        ("maximum_calls_per_region", "discovery_model_calls_per_unique_region", "calls per region"),
+        ("maximum_continuations", "continuations_executed", "executed continuations"),
+        ("maximum_raw_candidates", "candidates_raw", "raw candidates"),
+        ("maximum_discovery_failures", "ai_discovery_failures", "discovery failures"),
+        ("maximum_rate_limit_waits", "rate_limit_waits", "rate-limit waits"),
+    )
+    for threshold_name, metric_name, label in checks:
+        if threshold_name not in thresholds:
+            continue
+        actual = float(metrics.get(metric_name, 0) or 0)
+        maximum = float(thresholds[threshold_name])
+        if actual > maximum:
+            failures.append(f"{case_id}: {label} {actual:g} exceeds {maximum:g}")
+    if "maximum_candidate_duplicate_ratio" in thresholds:
+        raw = int(metrics.get("candidates_raw", 0) or 0)
+        unique = int(metrics.get("candidates_semantic_unique", 0) or 0)
+        duplicate_ratio = _ratio(max(0, raw - unique), raw, empty=0.0)
+        maximum = float(thresholds["maximum_candidate_duplicate_ratio"])
+        if duplicate_ratio > maximum:
+            failures.append(
+                f"{case_id}: candidate duplicate ratio {duplicate_ratio:.4f} exceeds {maximum:.4f}"
+            )
+    return failures
 
 
 def _bounded_report_path(base: Path, configured: str) -> Path:

@@ -10,6 +10,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from jsonschema import Draft202012Validator
 
@@ -514,7 +515,7 @@ class PerplexityKnowledgeProvider:
             raise RuntimeError("Perplexity security research did not match the required schema")
         sources = _response_sources(response)
         if not sources:
-            raise RuntimeError("Perplexity security research returned no cited sources")
+            return []
         entries = []
         for item in payload["entries"]:
             source_url = str(item["source_url"])
@@ -538,8 +539,7 @@ class PerplexityKnowledgeProvider:
                     claims=[str(claim) for claim in item["claims"]],
                 )
             )
-        if not entries:
-            raise RuntimeError("Perplexity security research contained no entries backed by returned citations")
+        # Uncited prose is discarded; absence of citations does not stop local code analysis.
         return entries
 
 
@@ -603,7 +603,19 @@ def _object_dict(value: Any) -> dict[str, Any]:
 
 
 def _normalise_url(value: str) -> str:
-    return value.strip().rstrip("/")
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return raw.rstrip("/")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return raw.rstrip("/")
+    host = parsed.hostname.lower() if parsed.hostname else parsed.netloc.lower()
+    if port and not ((parsed.scheme == "https" and port == 443) or (parsed.scheme == "http" and port == 80)):
+        host = f"{host}:{port}"
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((parsed.scheme.lower(), host, path, "", ""))
 
 
 def _entry_from_row(row: sqlite3.Row) -> KnowledgeEntry:

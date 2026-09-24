@@ -274,7 +274,13 @@ app.post("/reports", async (req, res) => {
     assert review.supported is True
     request = client.responses.kwargs
     assert request["model"] == load_json("runtime/models.json")["agent_fallback_model_by_tier"]["standard"]
-    assert request["prompt_cache_key"] == "plaidnox-sast:security_review"
+    assert request["max_output_tokens"] == load_json("runtime/agent.json")[
+        "model_output_token_limit_by_operation"
+    ]["security_review"]
+    if request["model"].startswith("gpt-"):
+        assert request["prompt_cache_key"] == "plaidnox-sast:security_review"
+    else:
+        assert "prompt_cache_key" not in request
     assert request["text"]["format"]["strict"] is True
     supplied = request["input"][1]["content"]
     assert "untrusted evidence" in request["input"][0]["content"]
@@ -299,11 +305,13 @@ def test_rate_limited_request_waits_and_retries_instead_of_failing(sample_repo, 
     client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
     waits = []
     monkeypatch.setattr("plaidnox_sast.ai.time.sleep", waits.append)
-    review = PlaidNoxDeepHuntAgent(client, model="test-model").review(sample_repo, deep_candidate(), finding())
+    agent = PlaidNoxDeepHuntAgent(client, model="test-model")
+    review = agent.review(sample_repo, deep_candidate(), finding())
 
     assert review.supported is True
     assert len(calls) == 3
     assert waits == [8.0, 16.0]
+    assert agent.model_input_metrics()["rate_limit_waits"] == 2
 
 
 def test_non_transient_request_error_is_not_retried(sample_repo, monkeypatch):
@@ -318,6 +326,27 @@ def test_non_transient_request_error_is_not_retried(sample_repo, monkeypatch):
     with pytest.raises(ValueError):
         PlaidNoxDeepHuntAgent(client, model="test-model").review(sample_repo, deep_candidate(), finding())
     assert calls.count("slept") == 0
+
+
+def test_connection_error_is_left_to_litellm_and_not_mislabeled_as_rate_limit(sample_repo, monkeypatch):
+    class APIConnectionError(Exception):
+        pass
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise APIConnectionError("gateway connection failed")
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    monkeypatch.setattr("plaidnox_sast.ai.time.sleep", lambda seconds: calls.append(("slept", seconds)))
+    agent = PlaidNoxDeepHuntAgent(client, model="test-model")
+
+    with pytest.raises(APIConnectionError):
+        agent.review(sample_repo, deep_candidate(), finding())
+
+    assert len(calls) == 1
+    assert agent.model_input_metrics()["rate_limit_waits"] == 0
 
 
 def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo):
@@ -383,6 +412,22 @@ def test_ai_review_keeps_sensitive_contents_out_of_metadata_review(sample_repo):
     assert "Metadata-only verification" in client.responses.kwargs["input"][0]["content"]
     supplied = json.loads(client.responses.kwargs["input"][1]["content"])
     assert supplied["security_ir_context"] == {}
+
+
+def test_deep_hunt_receives_the_canonical_candidate_evidence_packet(sample_repo):
+    candidate = deep_candidate()
+    candidate.metadata["evidence_packet"] = {
+        "candidate_id": "candidate-auth-root",
+        "root_cause": {"symbol": "authCheck"},
+        "invariant": "Verified identity cannot be overwritten.",
+        "gained_capabilities": ["Select another user's resources."],
+    }
+    client = FakeClient(review_payload())
+
+    PlaidNoxDeepHuntAgent(client).review(sample_repo, candidate, finding())
+
+    supplied = json.loads(client.responses.kwargs["input"][1]["content"])
+    assert supplied["candidate_evidence_packet"] == candidate.metadata["evidence_packet"]
 
 
 def test_ai_review_rejects_supported_result_with_incomplete_gates(sample_repo):
@@ -769,6 +814,9 @@ app.get("/users/:id", async (req, res) => {
     assert "ai_remediation" not in candidates[0].metadata
     assert client.responses.requests[0]["text"]["format"]["name"] == "plaidnox_recon_search_plan"
     assert client.responses.requests[1]["text"]["format"]["name"] == "plaidnox_repository_context"
+    assert client.responses.requests[1]["max_output_tokens"] == load_json("runtime/agent.json")[
+        "model_output_token_limit_by_operation"
+    ]["repository_context"]
     assert client.responses.requests[2]["text"]["format"]["name"] == "plaidnox_search_query_plan"
     assert client.responses.requests[3]["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
     discovery_payload = json.loads(client.responses.requests[3]["input"][1]["content"])
@@ -1857,6 +1905,96 @@ def test_candidate_from_ai_item_does_not_require_a_confirmed_field(sample_repo):
     assert candidate.title == "Unresolved SSRF hypothesis"
 
 
+def test_candidate_from_ai_item_preserves_ai_root_cause_paraphrases_for_verification(sample_repo):
+    from plaidnox_sast.ai import _candidate_from_ai_item
+
+    (sample_repo / "middleware.js").write_text(
+        "function authCheck(req) {\n"
+        "  const claims = jwt.decode(req.cookies.idToken);\n"
+        "  return removeAccessTokenFromDB(claims.email);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    item = {
+        "title": "Unverified JWT data controls account cleanup",
+        "vulnerability_class": "CWE-287",
+        "classification_references": [],
+        "business_impact": "An attacker may disrupt another account's session.",
+        "severity": "high",
+        "confidence": 0.7,
+        "category": "authentication",
+        "path": "middleware.js",
+        "start_line": 2,
+        "end_line": 3,
+        "message": "Decoded cookie claims select the account to mutate.",
+        "attack_path": "cookie -> decode -> account cleanup",
+        "candidate_id": "candidate-auth-1",
+        "security_control": "JWT verification before identity-dependent database mutation",
+        "broken_invariant": "Only verified identities may select an account record.",
+        "gained_capability": "Force revocation of a chosen user's token.",
+        "root_cause": {
+            "symbol": "authCheck",
+            "security_control": "Cognito verifier boundary",
+            "broken_invariant": "Unverified token data cannot authorize state changes.",
+            "capability": "Revoke a victim's persisted access token.",
+        },
+    }
+
+    candidate = _candidate_from_ai_item(
+        sample_repo,
+        item,
+        {"path": "middleware.js", "start_line": 1, "end_line": 4},
+    )
+
+    assert candidate is not None
+    assert candidate.metadata["root_cause"]["security_control"] == "Cognito verifier boundary"
+    assert candidate.metadata["security_control"] == item["security_control"]
+
+
+def test_candidate_from_ai_item_accepts_only_source_windows_returned_by_context_broker(sample_repo):
+    from plaidnox_sast.ai import _candidate_from_ai_item
+
+    (sample_repo / "middleware.js").write_text(
+        "function authCheck(req) {\n"
+        "  const claims = jwt.decode(req.cookies.idToken);\n"
+        "  return removeAccessTokenFromDB(claims.email);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    item = {
+        "title": "Unverified JWT data controls account cleanup",
+        "vulnerability_class": "CWE-287",
+        "classification_references": [],
+        "business_impact": "An attacker may disrupt another account's session.",
+        "severity": "high",
+        "confidence": 0.7,
+        "category": "authentication",
+        "path": "middleware.js",
+        "start_line": 2,
+        "end_line": 3,
+        "message": "Decoded cookie claims select the account to mutate.",
+        "attack_path": "cookie -> decode -> account cleanup",
+    }
+    original = {"path": "app.js", "start_line": 1, "end_line": 10}
+
+    assert _candidate_from_ai_item(sample_repo, item, original) is None
+    candidate = _candidate_from_ai_item(
+        sample_repo,
+        item,
+        original,
+        allowed_source_windows=[{"path": "middleware.js", "start_line": 1, "end_line": 4}],
+    )
+
+    assert candidate is not None
+    assert candidate.evidence.path == "middleware.js"
+    assert _candidate_from_ai_item(
+        sample_repo,
+        item,
+        original,
+        allowed_source_windows=[{"path": "middleware.js", "start_line": 1, "end_line": 2}],
+    ) is None
+
+
 def test_candidate_from_ai_item_does_not_populate_a_remediation_metadata_key(sample_repo):
     from plaidnox_sast.ai import _candidate_from_ai_item
 
@@ -2246,11 +2384,11 @@ def test_repository_context_still_fails_typed_after_exhausting_shape_retries(sam
 def test_payload_puts_per_request_keys_after_stable_prefix() -> None:
     from plaidnox_sast.prompts import _payload_json
 
-    first = _payload_json({"source_segment": {"path": "a"}, "repository_context": {"x": 1}, "hunt_plan": {}, "continuation_focus": ""})
-    second = _payload_json({"continuation_focus": "", "hunt_plan": {}, "repository_context": {"x": 1}, "source_segment": {"path": "b"}})
+    first = _payload_json({"source_segment": {"path": "a"}, "repository_context": {"x": 1}, "hunt_plan": {}, "new_context": []})
+    second = _payload_json({"new_context": [], "hunt_plan": {}, "repository_context": {"x": 1}, "source_segment": {"path": "b"}})
     prefix = first[: first.index('"source_segment"')]
     assert second.startswith(prefix)
-    assert first.index('"continuation_focus"') > first.index('"source_segment"')
+    assert first.index('"new_context"') > first.index('"source_segment"')
 
 
 def test_discovery_stops_when_a_continuation_only_repeats_known_candidates(sample_repo):

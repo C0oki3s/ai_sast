@@ -56,6 +56,7 @@
           },
           "knowledge_queries": {
             "type": "array",
+            "description": "Public, externally researchable framework/library/CWE/CVE/OWASP questions only; repository-specific facts belong in local evidence or coverage requirements.",
             "items": {
               "type": "string",
               "maxLength": 800

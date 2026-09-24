@@ -6,9 +6,7 @@
     "standard": "gpt-5.4-mini",
     "deep": "gpt-5.4"
   },
-  "agent_model_override_by_operation": {
-    "repository_context": "gpt-5.4-mini"
-  },
+  "agent_model_override_by_operation": {},
   "agent_models": [
     {
       "name": "claude-haiku-4.5",
@@ -99,18 +97,23 @@
       "tier": "standard",
       "latency": "low",
       "cost": "low",
-      "guidance": "Low-cost general code analysis, planning and extraction with reasoning."
+      "guidance": "Primary OpenAI model for bounded code analysis, planning, and extraction."
     },
     {
       "name": "gpt-5.4",
       "tier": "deep",
       "latency": "standard",
       "cost": "standard",
-      "guidance": "Deeper code-security reasoning and adversarial verification at moderate cost."
+      "guidance": "OpenAI model for deep code-security reasoning and adversarial verification."
     }
   ],
   "saist_detection_model": "glm-5.3-flash",
   "saist_validation_model": "kimi-k2.7-code",
   "saist_request_timeout_seconds": 60,
-  "saist_process_timeout_seconds": 900
+  "saist_process_timeout_seconds": 900,
+  "agent_model_by_tier": {
+    "fast": "gpt-5.4-mini",
+    "standard": "gpt-5.4-mini",
+    "deep": "gpt-5.4"
+  }
 }

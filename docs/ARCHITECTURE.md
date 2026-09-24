@@ -20,9 +20,15 @@ flowchart LR
     TS --> CTX
     MEM[Threat context / memory / sourced knowledge] --> CTX
     CTX --> PLAN[AI hunt-task plan]
-    PLAN --> DISC[AI candidate discovery]
+    PLAN --> OBL[Region security obligations]
+    OBL --> DISC[One initial AI review per region]
+    DISC --> BROKER{NEEDS_CONTEXT?}
+    BROKER -->|new evidence| DELTA[Delta-only continuation]
+    DELTA --> DISC
+    BROKER -->|none| GAP[Explicit coverage gap]
+    DISC --> MERGE[Canonical candidate evidence merge]
     SAIST[Optional DataDog SAIST candidate adapter] --> DISC
-    DISC --> ROUTE[Model tier routing]
+    MERGE --> ROUTE[Model tier routing]
     ROUTE --> VERIFY[PlaidNox Deep Hunt falsification]
     VERIFY --> FIND[Verified findings + dependencies]
     FIND --> SWEEP[Recursive root-cause variant sweep]
@@ -55,6 +61,24 @@ rg hit
   -> AI reasoning
   -> optional targeted flow proof
 ```
+
+Each `DiscoveryRegion` has an immutable source/IR identity and a deterministic
+set of obligations derived from the AI hunt plan's invariants, entry points,
+evidence requirements, falsification requirements, and sensitive effects. The
+model must disposition every obligation as `NO_ISSUE`, `NOT_APPLICABLE`,
+`CANDIDATE_FOUND`, `NEEDS_CONTEXT`, or `UNRESOLVED`. Only `NEEDS_CONTEXT` can
+request another call. The Context Broker resolves a typed request through
+ripgrep, Tree-sitter Security IR, source policy, or stored knowledge. An empty
+or repeated result becomes an explicit coverage gap; it never causes another
+reasoning pass. A continuation receives the region identity, root-cause
+summaries, unresolved obligations, and newly resolved context, without
+resending the original source region.
+
+Candidates are merged by structural root, security control, broken invariant,
+and gained capability before verification starts. A `CandidateEvidencePacket`
+then carries the root cause, attacker origins, boundary, downstream branches,
+sensitive effects, trace, capabilities, and remaining evidence gaps into Deep
+Hunt.
 
 ## Verdict ownership
 

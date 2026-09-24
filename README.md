@@ -1,10 +1,10 @@
 # PlaidNox Code Security Agent
 
 PlaidNox Code Security is an AI-required, read-only source-code security
-pipeline. Every operational scan builds an application context, reads each
-eligible source segment, generates evidence-bound candidates, and runs the
-PlaidNox Deep Hunt agent against every readable candidate before it becomes a
-finding.
+pipeline. Every operational scan builds application context, derives explicit
+security obligations for structural source regions, acquires only the missing
+context needed to disposition those obligations, merges equivalent candidate
+evidence, and runs PlaidNox Deep Hunt before any candidate becomes a finding.
 
 The scanner never installs dependencies, runs builds, executes application
 code, invokes repository scripts, or reads tracked secret-file contents.
@@ -34,7 +34,10 @@ immutable local source snapshot
   -> build/reuse Context Fabric snapshot/overlay
   -> LLM-created hunt tasks from architecture, code, business context, and knowledge
   -> knowledge database reuse / retrieval / Perplexity web-research fallback
-  -> recursive PlaidNox discovery and root-cause variant sweeps
+  -> one obligation-driven discovery review per structural region
+  -> typed Context Broker expansion only when an obligation needs evidence
+  -> delta-only bounded continuation when the broker returns new context
+  -> canonical candidate/evidence merge and root-cause variant sweeps
   -> optional DataDog SAIST candidate input
   -> deterministic candidate route classification
   -> PlaidNox Deep Hunt: entry point -> forward trace -> falsification -> evidence

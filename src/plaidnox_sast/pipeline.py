@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
-import threading
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +14,7 @@ from .assets import load_json
 from .config import load_local_project_config
 from .errors import AIStageError
 from .checkpoint import ScanCheckpoint, candidate_from_dict, candidate_to_dict, finding_from_dict, unit_key
-from .fingerprint import CandidateIndex, candidate_fingerprint, deduplicate
+from .fingerprint import CandidateIndex, candidate_evidence_packet, candidate_fingerprint, deduplicate
 from .graph import build_structural_graph
 from .routers import CandidateRouter
 from .models import (
@@ -227,6 +225,8 @@ class SastPipeline:
         ai_discovery_error_types: list[str] = []
         ai_discovery_errors: list[str] = []
         ai_discovery_unexpected_failures = 0
+        ai_discovery_unresolved_obligations = 0
+        ai_discovery_contract_failures = 0
         ai_context_error_type = ""
         ai_context_error = ""
         ai_context_unexpected_failures = 0
@@ -243,10 +243,6 @@ class SastPipeline:
         validator = FindingValidator()
         worker_count = int(load_json("runtime/agent.json")["discovery_max_workers"])
         deep_budget_max = int(load_json("runtime/agent.json")["deep_hunt_budget_max"])
-        deep_budget_reserved = [0]
-        early_reviews: dict[str, Future] = {}
-        early_lock = threading.Lock()
-        early_executor = ThreadPoolExecutor(max_workers=worker_count)
 
         def verify(candidate_route):
             candidate, route = candidate_route
@@ -291,22 +287,6 @@ class SastPipeline:
                 unexpected = not isinstance(exc, AIStageError)
                 return candidate, None, 0, 0, 1, 1, type(exc).__name__, str(exc)[:240], unexpected
 
-        def review_early(candidate):
-            """Start the Deep Hunt review of a fresh candidate while discovery continues."""
-            fingerprint = candidate_fingerprint(codebase, candidate)
-            with early_lock:
-                if fingerprint in early_reviews:
-                    return
-                route = router.classify(candidate)
-                if route.model_tier == ModelTier.DEEP:
-                    if deep_budget_reserved[0] >= deep_budget_max:
-                        return
-                    deep_budget_reserved[0] += 1
-                early_reviews[fingerprint] = early_executor.submit(verify, (candidate, route))
-
-        if hasattr(deep_hunt_agent, "candidate_sink"):
-            deep_hunt_agent.candidate_sink = review_early
-
         try:
             context = context_builder(root, codebase, revision, graph, config.business_context)
             repository_context = context.to_dict()
@@ -316,6 +296,12 @@ class SastPipeline:
             ai_discovery_error_types = list(getattr(deep_hunt_agent, "discovery_error_types", []))
             ai_discovery_errors = list(getattr(deep_hunt_agent, "discovery_errors", []))
             ai_discovery_unexpected_failures = int(getattr(deep_hunt_agent, "discovery_unexpected_failures", 0))
+            ai_discovery_unresolved_obligations = int(
+                getattr(deep_hunt_agent, "discovery_unresolved_obligations", 0)
+            )
+            ai_discovery_contract_failures = int(
+                getattr(deep_hunt_agent, "discovery_contract_failures", 0)
+            )
         except Exception as exc:  # noqa: BLE001
             ai_context_failures += 1
             ai_context_error_type = type(exc).__name__
@@ -334,6 +320,8 @@ class SastPipeline:
             codebase,
             saist_candidates + ai_discovery_candidates,
         )
+        for candidate in candidates:
+            candidate.metadata["evidence_packet"] = candidate_evidence_packet(candidate).to_dict()
 
         findings = []
         rejected_count = 0
@@ -358,18 +346,12 @@ class SastPipeline:
         seen_candidates = CandidateIndex(nearby_lines=0)
         for candidate in candidates:
             seen_candidates.admit(candidate)
-        deep_budget_used = deep_budget_reserved[0]
+        deep_budget_used = 0
 
         while work_queue:
-            early_round = []
-            pending_queue = []
             for candidate in work_queue:
-                early = early_reviews.pop(candidate_fingerprint(codebase, candidate), None)
-                if early is None:
-                    pending_queue.append(candidate)
-                else:
-                    early_round.append(early)
-            round_routes = [(candidate, router.classify(candidate)) for candidate in pending_queue]
+                candidate.metadata["evidence_packet"] = candidate_evidence_packet(candidate).to_dict()
+            round_routes = [(candidate, router.classify(candidate)) for candidate in work_queue]
             deep_entries = [entry for entry in round_routes if entry[1].model_tier == ModelTier.DEEP]
             remaining_budget = max(0, deep_budget_max - deep_budget_used)
             if len(deep_entries) > remaining_budget:
@@ -403,7 +385,7 @@ class SastPipeline:
 
             verified_round = []
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                results = itertools.chain((future.result() for future in early_round), executor.map(verify, round_routes))
+                results = executor.map(verify, round_routes)
                 for (
                     candidate,
                     finding,
@@ -458,7 +440,6 @@ class SastPipeline:
                         next_round.append(pivot)
                         ai_capability_chain_candidates += 1
             work_queue = next_round
-        early_executor.shutdown(wait=True)
         ai_consolidation_failures = 0
         ai_consolidation_error_type = ""
         ai_consolidation_error = ""
@@ -557,10 +538,13 @@ class SastPipeline:
 
         policy = PolicyEngine().evaluate(findings, config.policy)
         ai_search_query_failures = len(getattr(deep_hunt_agent, "search_query_errors", []))
+        ai_knowledge_failures = len(getattr(deep_hunt_agent, "knowledge_errors", []))
         ai_scan_incomplete = bool(
             ai_context_failures
             or ai_planning_failures
             or ai_discovery_failures
+            or ai_discovery_unresolved_obligations
+            or ai_discovery_contract_failures
             or ai_failures
             or ai_variant_failures
             or ai_capability_chain_failures
@@ -573,7 +557,10 @@ class SastPipeline:
             # which stays reserved for a completed scan with findings worth a warning.
             policy = PolicyResult(
                 PolicyDecision.INCOMPLETE,
-                ["PlaidNox Deep Hunt was incomplete; review recorded error metrics before treating this scan as clean"],
+                [
+                    "PlaidNox Deep Hunt was incomplete; review coverage gaps and error metrics "
+                    "before treating this scan as clean"
+                ],
             )
         elif ai_scan_incomplete:
             policy = PolicyResult(
@@ -612,6 +599,7 @@ class SastPipeline:
         prompt_cache_metrics = getattr(deep_hunt_agent, "prompt_cache_metrics", dict)()
         model_input_metrics = getattr(deep_hunt_agent, "model_input_metrics", dict)()
         model_budget_metrics = getattr(deep_hunt_agent, "model_budget_metrics", dict)()
+        discovery_metrics = dict(getattr(deep_hunt_agent, "discovery_metrics", {}))
         model_input_audit = getattr(deep_hunt_agent, "model_input_audit", list)()
         checkpoint_resume_cursor = checkpoint.resume_cursor() if checkpoint is not None else {}
         if model_input_audit:
@@ -634,6 +622,8 @@ class SastPipeline:
                 "ai_discovery_error_types": ai_discovery_error_types,
                 "ai_discovery_errors": ai_discovery_errors,
                 "ai_discovery_unexpected_failures": ai_discovery_unexpected_failures,
+                "ai_discovery_unresolved_obligations": ai_discovery_unresolved_obligations,
+                "ai_discovery_contract_failures": ai_discovery_contract_failures,
                 "deduplicated_candidates": duplicate_count,
                 "rejected_candidates": rejected_count,
                 "validated_findings": len(findings),
@@ -643,8 +633,13 @@ class SastPipeline:
                 "security_ir_calls": len(graph.calls),
                 "tree_sitter_files": graph.tree_sitter_files,
                 "syntax_fallback_files": graph.fallback_files,
-                "rg_queries": graph.rg_queries,
-                "rg_hits": len(graph.search_hits),
+                "rg_queries": graph.rg_queries + int(discovery_metrics.get("queries_raw", 0)),
+                "rg_hits": len(graph.search_hits)
+                + int(discovery_metrics.get("rg_hits_unique", 0)),
+                "rg_queries_recon": graph.rg_queries,
+                "rg_queries_discovery": int(discovery_metrics.get("queries_raw", 0)),
+                "rg_hits_recon": len(graph.search_hits),
+                "rg_hits_discovery": int(discovery_metrics.get("rg_hits_unique", 0)),
                 "config_source": config.source_ref,
                 "target_code_executed": False,
                 "ai_reviews": ai_reviewed,
@@ -669,12 +664,18 @@ class SastPipeline:
                 "ai_scan_incomplete": ai_scan_incomplete,
                 "ai_search_query_failures": ai_search_query_failures,
                 "ai_search_query_errors": list(getattr(deep_hunt_agent, "search_query_errors", [])),
+                "ai_knowledge_failures": ai_knowledge_failures,
+                "ai_knowledge_errors": list(getattr(deep_hunt_agent, "knowledge_errors", [])),
                 "ai_patch_proposals": ai_patch_proposals,
                 "ai_patch_verified": ai_patch_verified,
                 "ai_patch_unverified": ai_patch_unverified,
                 "ai_patch_proposal_failures": ai_patch_proposal_failures,
                 "ai_patch_unexpected_failures": ai_patch_unexpected_failures,
                 "deep_budget_demotions": deep_budget_demotions,
+                "verification_started": ai_reviewed + ai_failures,
+                "verification_supported": ai_supported,
+                "verification_rejected": rejected_count,
+                "verification_unresolved": ai_failures,
                 "checkpoint_enabled": checkpoint is not None,
                 "checkpoint_units_reused": checkpoint.hits if checkpoint is not None else 0,
                 "checkpoint_units_saved": checkpoint.writes if checkpoint is not None else 0,
@@ -683,7 +684,7 @@ class SastPipeline:
                     sum(
                         count
                         for status, count in checkpoint.status_counts().items()
-                        if status != "completed"
+                        if status not in {"completed", "superseded"}
                     )
                     if checkpoint is not None
                     else 0
@@ -696,6 +697,9 @@ class SastPipeline:
                 ),
                 "checkpoint_units_completed": (
                     checkpoint.status_counts().get("completed", 0) if checkpoint is not None else 0
+                ),
+                "checkpoint_units_superseded": (
+                    checkpoint.status_counts().get("superseded", 0) if checkpoint is not None else 0
                 ),
                 "checkpoint_resume_stage": checkpoint_resume_cursor.get("stage", ""),
                 "checkpoint_resume_operation": checkpoint_resume_cursor.get("operation", ""),
@@ -712,6 +716,7 @@ class SastPipeline:
                 **prompt_cache_metrics,
                 **model_input_metrics,
                 **model_budget_metrics,
+                **discovery_metrics,
             },
             repository_context=repository_context,
         )

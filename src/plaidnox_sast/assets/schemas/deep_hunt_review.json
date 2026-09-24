@@ -12,11 +12,11 @@
     },
     "title": {
       "type": "string",
-      "maxLength": 240
+      "maxLength": 200
     },
     "vulnerability_class": {
       "type": "string",
-      "maxLength": 120
+      "maxLength": 100
     },
     "severity": {
       "type": "string",
@@ -30,52 +30,55 @@
     },
     "message": {
       "type": "string",
-      "maxLength": 1600
+      "maxLength": 600
     },
     "business_impact": {
       "type": "string",
-      "maxLength": 1600
+      "maxLength": 600
     },
     "reasoning": {
       "type": "string",
-      "maxLength": 1200
+      "maxLength": 600
     },
     "attack_path": {
       "type": "string",
-      "maxLength": 1200
+      "maxLength": 600
     },
     "remediation_note": {
       "type": "string",
-      "maxLength": 1600
+      "maxLength": 600
     },
     "falsification_attempts": {
       "type": "array",
       "items": {
         "type": "string",
-        "maxLength": 800
-      }
+        "maxLength": 300
+      },
+      "maxItems": 4
     },
     "required_preconditions": {
       "type": "array",
       "items": {
         "type": "string",
-        "maxLength": 800
-      }
+        "maxLength": 300
+      },
+      "maxItems": 4
     },
     "evidence_gaps": {
       "type": "array",
       "items": {
         "type": "string",
-        "maxLength": 800
-      }
+        "maxLength": 300
+      },
+      "maxItems": 4
     },
     "security_invariant": {
       "type": "string",
-      "maxLength": 1600
+      "maxLength": 600
     },
     "rejection_reason": {
       "type": "string",
-      "maxLength": 1600
+      "maxLength": 600
     },
     "gate_results": {
       "type": "array",
@@ -110,12 +113,13 @@
             "type": "array",
             "items": {
               "type": "string",
-              "maxLength": 800
-            }
+              "maxLength": 300
+            },
+            "maxItems": 3
           },
           "explanation": {
             "type": "string",
-            "maxLength": 1200
+            "maxLength": 300
           }
         },
         "required": [
@@ -161,15 +165,16 @@
           "end_line",
           "role"
         ]
-      }
+      },
+      "maxItems": 8
     },
     "proof_plan": {
       "type": "string",
-      "maxLength": 2400
+      "maxLength": 800
     },
     "regression_test": {
       "type": "string",
-      "maxLength": 2400
+      "maxLength": 800
     },
     "classification_references": {
       "type": "array",
@@ -202,11 +207,12 @@
           "name",
           "source_url"
         ]
-      }
+      },
+      "maxItems": 3
     },
     "context_requests": {
       "type": "array",
-      "maxItems": 5,
+      "maxItems": 3,
       "items": {
         "type": "object",
         "additionalProperties": false,

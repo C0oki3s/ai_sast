@@ -11,9 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +26,24 @@ from .ai import (
     PlaidNoxDeepHuntAgent,
     _candidate_from_ai_item,
     _enclosing_symbol,
+    _is_generated_path,
     _related_ir,
+    _resolve_context_request,
+    _source_window,
     _source_segments,
-    _tasks_for_segment,
 )
-from .assets import load_json
+from .assets import load_json, load_text
 from .checkpoint import candidate_from_dict, candidate_to_dict, unit_key
 from .errors import AIStageError
 from .fingerprint import CandidateIndex
-from .graph import RipgrepDiscovery, RipgrepQueryError, SearchHit, StructuralGraph, source_files
+from .graph import (
+    RipgrepDiscovery,
+    RipgrepQueryError,
+    SearchHit,
+    StructuralGraph,
+    source_file_is_admitted,
+    source_files,
+)
 from .models import Candidate
 from .redaction import redact
 
@@ -59,6 +70,7 @@ class DiscoveryRegion:
     query_ids: set[str] = field(default_factory=set)
     coverage_refs: set[str] = field(default_factory=set)
     obligations: set[str] = field(default_factory=set)
+    obligation_specs: dict[str, "DiscoveryObligation"] = field(default_factory=dict)
     vulnerability_themes: set[str] = field(default_factory=set)
     security_ir_slice: dict[str, Any] = field(default_factory=dict)
 
@@ -87,7 +99,10 @@ class DiscoveryRegion:
                 "anchor_id": self.anchor_id,
                 "content_hash": self.content_hash,
                 "security_ir_hash": self.security_ir_hash,
-                "obligations": sorted(self.obligations),
+                "obligations": [
+                    self.obligation_specs[key].to_dict()
+                    for key in sorted(self.obligation_specs)
+                ],
                 "vulnerability_themes": sorted(self.vulnerability_themes),
                 "prompt_version": prompt_version,
             },
@@ -108,8 +123,161 @@ class DiscoveryRegion:
             "task_ids": sorted(self.task_ids),
             "coverage_refs": sorted(self.coverage_refs),
             "obligations": sorted(self.obligations),
+            "obligation_ids": sorted(self.obligation_specs),
             "vulnerability_themes": sorted(self.vulnerability_themes),
             "security_ir_slice": self.security_ir_slice,
+        }
+
+
+class ObligationStatus(StrEnum):
+    NO_ISSUE = "NO_ISSUE"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    CANDIDATE_FOUND = "CANDIDATE_FOUND"
+    NEEDS_CONTEXT = "NEEDS_CONTEXT"
+    UNRESOLVED = "UNRESOLVED"
+
+
+_TERMINAL_OBLIGATION_STATUSES = {
+    ObligationStatus.NO_ISSUE,
+    ObligationStatus.NOT_APPLICABLE,
+    ObligationStatus.CANDIDATE_FOUND,
+    ObligationStatus.UNRESOLVED,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryObligation:
+    obligation_id: str
+    obligation_type: str
+    question: str
+    scope: str = "LOCAL"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "obligation_id": self.obligation_id,
+            "type": self.obligation_type,
+            "scope": self.scope,
+            "question": self.question,
+        }
+
+
+@dataclass(slots=True)
+class DiscoveryCoverageState:
+    region_id: str
+    obligations: dict[str, DiscoveryObligation]
+    dispositions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    requested_context: set[str] = field(default_factory=set)
+    resolved_context: set[str] = field(default_factory=set)
+    candidate_ids: set[str] = field(default_factory=set)
+    needs_context_ids: set[str] = field(default_factory=set)
+    contract_issues: list[str] = field(default_factory=list)
+
+    @property
+    def processing_complete(self) -> bool:
+        return bool(self.obligations) and all(
+            ObligationStatus(str(self.dispositions.get(obligation_id, {}).get("status", "NEEDS_CONTEXT")))
+            in _TERMINAL_OBLIGATION_STATUSES
+            for obligation_id in self.obligations
+        )
+
+    @property
+    def coverage_complete(self) -> bool:
+        return self.processing_complete and all(
+            ObligationStatus(str(self.dispositions.get(obligation_id, {}).get("status", "NEEDS_CONTEXT")))
+            is not ObligationStatus.UNRESOLVED
+            for obligation_id in self.obligations
+        )
+
+    @property
+    def complete(self) -> bool:
+        """Compatibility alias for operational completion, not security coverage."""
+        return self.processing_complete
+
+    def unresolved_ids(self) -> list[str]:
+        return [
+            obligation_id
+            for obligation_id in self.obligations
+            if ObligationStatus(str(self.dispositions.get(obligation_id, {}).get("status", "NEEDS_CONTEXT")))
+            == ObligationStatus.NEEDS_CONTEXT
+        ]
+
+    def apply(self, results: list[dict[str, Any]], candidate_ids: set[str]) -> None:
+        expected = set(self.unresolved_ids()) if self.dispositions else set(self.obligations)
+        results_by_id: dict[str, list[dict[str, Any]]] = {}
+        for result in results:
+            results_by_id.setdefault(str(result.get("obligation_id", "")), []).append(result)
+        unknown = sorted(set(results_by_id) - set(self.obligations))
+        if unknown:
+            self.contract_issues.append("response included unknown obligation identifiers")
+        for obligation_id in expected:
+            matching = results_by_id.get(obligation_id, [])
+            if len(matching) != 1:
+                issue = "response omitted an obligation disposition" if not matching else "response duplicated an obligation disposition"
+                self.contract_issues.append(issue)
+                self.mark_unresolved([obligation_id], issue)
+                continue
+            result = matching[0]
+            try:
+                status = ObligationStatus(str(result["status"]))
+                linked_candidates = {str(item) for item in result.get("candidate_ids", [])}
+                requests = [dict(item) for item in result.get("context_requests", [])]
+            except (KeyError, TypeError, ValueError):
+                self.contract_issues.append("response contained a malformed obligation disposition")
+                self.mark_unresolved([obligation_id], "Malformed obligation disposition; manual or later re-review required.")
+                continue
+            if status is ObligationStatus.CANDIDATE_FOUND:
+                if not linked_candidates or not linked_candidates <= candidate_ids:
+                    self.contract_issues.append("candidate disposition did not link to a grounded candidate")
+                    self.mark_unresolved(
+                        [obligation_id],
+                        "Candidate evidence could not be grounded to an accepted source location.",
+                    )
+                    continue
+            elif linked_candidates:
+                self.contract_issues.append("non-candidate disposition linked candidate identifiers")
+                self.mark_unresolved([obligation_id], "Invalid candidate link in obligation disposition.")
+                continue
+            if status is ObligationStatus.NEEDS_CONTEXT and not requests:
+                self.contract_issues.append("NEEDS_CONTEXT disposition omitted a typed context request")
+                self.mark_unresolved([obligation_id], "No resolvable context request was supplied.")
+                continue
+            if status is not ObligationStatus.NEEDS_CONTEXT and requests:
+                self.contract_issues.append("terminal obligation disposition included context requests")
+                self.mark_unresolved([obligation_id], "Terminal disposition contained an invalid context request.")
+                continue
+            self.dispositions[obligation_id] = dict(result)
+            self.candidate_ids.update(linked_candidates)
+            self.needs_context_ids.discard(obligation_id)
+            if status is ObligationStatus.NEEDS_CONTEXT:
+                self.needs_context_ids.add(obligation_id)
+
+    def mark_unresolved(self, obligation_ids: list[str], reason: str) -> None:
+        for obligation_id in obligation_ids:
+            prior = dict(self.dispositions.get(obligation_id, {}))
+            prior.update(
+                {
+                    "obligation_id": obligation_id,
+                    "status": ObligationStatus.UNRESOLVED.value,
+                    "candidate_ids": [],
+                    "context_requests": [],
+                    "reason": reason,
+                }
+            )
+            self.dispositions[obligation_id] = prior
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "region_id": self.region_id,
+            "obligations": [item.to_dict() for item in self.obligations.values()],
+            "dispositions": list(self.dispositions.values()),
+            "requested_context": sorted(self.requested_context),
+            "resolved_context": sorted(self.resolved_context),
+            "candidate_ids": sorted(self.candidate_ids),
+            "needs_context_ids": sorted(self.needs_context_ids),
+            "contract_issues": list(self.contract_issues),
+            "processing_complete": self.processing_complete,
+            "coverage_complete": self.coverage_complete,
+            "complete": self.complete,
         }
 
 
@@ -174,12 +342,161 @@ def _region_from_range(
 
 
 def _enrich_region_requirements(region: DiscoveryRegion, plan: HuntPlan) -> None:
+    region.obligations.clear()
+    region.obligation_specs.clear()
+    region.vulnerability_themes.clear()
+    selected = _tasks_relevant_to_region(region, plan)
+    aggregate: dict[str, dict[str, set[str]]] = {}
+    objectives: set[str] = set()
+    for task in selected:
+        task_data = _region_task_payload(task, region)
+        region.obligations.update(str(item) for item in task_data["coverage_obligations"])
+        region.vulnerability_themes.update(str(item) for item in task_data["vulnerability_themes"])
+        grouped_requirements = {
+            "security_invariant": {
+                "business_invariants": task_data["business_invariants"],
+                "vulnerability_themes": task_data["vulnerability_themes"],
+            },
+            "coverage": {
+                "coverage_obligations": task_data["coverage_obligations"],
+                "entry_points": task_data["entry_points"],
+                "focus_paths": task_data["focus_paths"],
+                "inventory_refs": task_data["inventory_refs"],
+                "evidence_requirements": task_data["evidence_requirements"],
+                "falsification_requirements": task_data["falsification_requirements"],
+            },
+            "sensitive_effect": {
+                "sensitive_effect_refs": task_data["sensitive_effect_refs"],
+                "authentication_path_refs": task_data["authentication_path_refs"],
+            },
+        }
+        for obligation_type, fields in grouped_requirements.items():
+            grouped = aggregate.setdefault(obligation_type, {})
+            for name, values in fields.items():
+                grouped.setdefault(name, set()).update(str(item).strip() for item in values if str(item).strip())
+        if task_data["objective"].strip():
+            objectives.add(task_data["objective"].strip())
+
+    for obligation_type, fields in aggregate.items():
+        requirements = {name: sorted(values) for name, values in fields.items() if values}
+        if not requirements:
+            continue
+        question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        obligation_id = f"obl-{_stable_hash({'type': obligation_type, 'requirements': requirements})[:20]}"
+        region.obligation_specs[obligation_id] = DiscoveryObligation(obligation_id, obligation_type, question)
+    if not region.obligation_specs and objectives:
+        requirements = {"objectives": sorted(objectives)}
+        question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        obligation_id = f"obl-{_stable_hash({'type': 'task_objective', 'requirements': requirements})[:20]}"
+        region.obligation_specs[obligation_id] = DiscoveryObligation(obligation_id, "task_objective", question)
+    if not region.obligation_specs:
+        local_review = load_text(
+            "prompts/operations/vulnerability_discovery/local_obligations.md"
+        ).strip()
+        requirements = {
+            "scope": region.anchor_type,
+            "anchor": region.anchor_id,
+            "path": region.path,
+            "review": local_review,
+        }
+        question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        obligation_id = f"obl-{_stable_hash({'type': 'local_review', 'requirements': requirements})[:20]}"
+        region.obligations.add(local_review)
+        region.obligation_specs[obligation_id] = DiscoveryObligation(
+            obligation_id, "local_review", question, "LOCAL"
+        )
+
+
+def _tasks_relevant_to_region(region: DiscoveryRegion, plan: HuntPlan) -> list[Any]:
     selected = [task for task in plan.tasks if task.task_id in region.task_ids]
     if not selected:
-        selected = plan.tasks
-    for task in selected:
-        region.obligations.update(str(item) for item in task.coverage_obligations)
-        region.vulnerability_themes.update(str(item) for item in task.vulnerability_themes)
+        selected = list(plan.tasks)
+
+    def normalize_path(value: str) -> str:
+        return value.replace("\\", "/").removeprefix("./").strip("/")
+
+    route_matches: list[Any] = []
+    if region.anchor_type == "route":
+        route_name = region.anchor_id.removeprefix("route:").strip().casefold()
+        route_matches = [
+            task
+            for task in selected
+            if route_name in {str(entry).strip().casefold() for entry in task.entry_points}
+        ]
+    elif region.anchor_type == "line_range":
+        region_routes = {
+            str(symbol.get("qualified_name") or symbol.get("name") or "")
+            .removeprefix("route:")
+            .casefold()
+            for symbol in region.security_ir_slice.get("symbols", [])
+            if symbol.get("kind") == "route"
+            and int(symbol.get("line", 0)) <= region.end_line
+            and int(symbol.get("end_line", 0)) >= region.start_line
+        }
+        route_matches = [
+            task
+            for task in selected
+            if region_routes
+            & {str(entry).strip().casefold() for entry in task.entry_points}
+        ]
+    if route_matches:
+        return route_matches
+    if region.anchor_type == "route" or (
+        region.anchor_type == "line_range" and region_routes
+    ):
+        # A route-anchored region must not inherit every task that happens to
+        # mention the same controller file. Global application obligations are
+        # handled by planning/context stages, not copied into each route review.
+        return []
+
+    focus_matches = [
+        task
+        for task in selected
+        if not task.focus_paths
+        or any(
+            normalize_path(region.path) == normalize_path(str(focus))
+            or normalize_path(region.path).startswith(normalize_path(str(focus)).rstrip("/") + "/")
+            for focus in task.focus_paths
+        )
+    ]
+    return focus_matches
+
+
+def _region_task_payload(task: Any, region: DiscoveryRegion) -> dict[str, Any]:
+    """Project a plan task onto the local region before it reaches discovery."""
+    value = task.to_dict()
+    value["scope"] = "LOCAL"
+    value["region_anchor"] = {
+        "type": region.anchor_type,
+        "id": region.anchor_id,
+        "path": region.path,
+        "start_line": region.start_line,
+        "end_line": region.end_line,
+    }
+    if region.anchor_type != "route":
+        return value
+
+    route = region.anchor_id.removeprefix("route:").strip()
+    path = region.path
+    value["focus_paths"] = [path]
+    value["entry_points"] = [route]
+    route_terms = {route.casefold(), path.casefold()}
+    for field_name in (
+        "coverage_obligations",
+        "evidence_requirements",
+        "falsification_requirements",
+        "inventory_refs",
+        "sensitive_effect_refs",
+        "authentication_path_refs",
+    ):
+        values = [str(item) for item in value.get(field_name, [])]
+        matches = [
+            item
+            for item in values
+            if any(term and term in item.casefold() for term in route_terms)
+        ]
+        value[field_name] = matches or (values[:1] if len(values) == 1 else [])
+    return value
 
 
 def _can_merge_regions(first: DiscoveryRegion, second: DiscoveryRegion, ratio: float, gap: int) -> bool:
@@ -236,6 +553,10 @@ def _merge_discovery_regions(
                 )
                 if candidate is not None and len(candidate.content) <= limit:
                     candidate.obligations = current.obligations | item.obligations
+                    candidate.obligation_specs = {
+                        **current.obligation_specs,
+                        **item.obligation_specs,
+                    }
                     candidate.vulnerability_themes = (
                         current.vulnerability_themes | item.vulnerability_themes
                     )
@@ -336,6 +657,7 @@ def _search_discovery_regions(
         path.relative_to(root).as_posix()
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
+        and not _is_generated_path(path)
         and (include_paths is None or path.relative_to(root).as_posix() in include_paths)
     }
     rg = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
@@ -423,6 +745,8 @@ def _search_discovery_regions(
         stats["windows_raw"] = len(windows)
 
     regions, merged_windows = _merge_discovery_regions(root, windows, graph, runtime_agent)
+    for region in regions:
+        _enrich_region_requirements(region, plan)
     if stats is not None:
         stats["windows_merged"] = merged_windows
         stats["regions_after_merge"] = len(regions)
@@ -496,27 +820,199 @@ def _is_sensitive_path(path: Path) -> bool:
     )
 
 
-def _discovery_progress(
-    payload: Mapping[str, Any],
-    *,
-    new_candidates: int,
-    previous_obligations: set[str],
-    previous_branches: set[str],
-    seen_focuses: set[str],
-) -> tuple[bool, set[str], set[str], str]:
-    coverage = payload.get("coverage") or {}
-    obligations = {
-        str(item) for item in coverage.get("obligations_reviewed", []) if str(item).strip()
-    }
-    branches = {str(item) for item in coverage.get("branches_reviewed", []) if str(item).strip()}
-    next_focus = str(payload.get("next_focus", "")).strip()
-    progressed = (
-        new_candidates > 0
-        or bool(obligations - previous_obligations)
-        or bool(branches - previous_branches)
-        or (bool(next_focus) and next_focus not in seen_focuses)
+_DISCOVERY_CONTEXT_SEARCH_KINDS = {
+    "references",
+    "readers",
+    "writers",
+    "middleware",
+    "authorization_decision",
+    "security_control",
+    "configuration",
+    "environment_usage",
+    "store_relationship",
+    "credential_consumer",
+}
+
+
+def _context_request_key(request: Mapping[str, Any]) -> str:
+    return _stable_hash({str(key): request[key] for key in sorted(request)})
+
+
+def _has_context_evidence(result: Mapping[str, Any]) -> bool:
+    if not bool(result.get("resolved")):
+        return False
+    return any(
+        bool(result.get(key))
+        for key in ("content", "edges", "definitions", "imports", "routes", "matches", "entries")
     )
-    return progressed, obligations, branches, next_focus
+
+
+def _source_windows_from_context(context_packets: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return only broker records whose actual source text was included in a prompt."""
+    windows: list[dict[str, Any]] = []
+    for packet in context_packets:
+        if packet.get("content") and packet.get("path"):
+            content = str(packet["content"])
+            visible_lines = [
+                int(number.strip())
+                for source_line in content.splitlines()
+                for number, separator, _text in [source_line.partition(":")]
+                if separator and number.strip().isdigit()
+            ]
+            start = min(visible_lines) if visible_lines else int(
+                packet.get("start_line", packet.get("line", 1)) or 1
+            )
+            end = max(visible_lines) if visible_lines else int(
+                packet.get("end_line", start) or start
+            )
+            if end >= start:
+                windows.append({"path": str(packet["path"]), "start_line": start, "end_line": end})
+        for collection_name in ("edges", "definitions", "routes", "matches"):
+            records = packet.get(collection_name, [])
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, Mapping) or not record.get("content"):
+                    continue
+                path = str(record.get("path", ""))
+                if not path:
+                    continue
+                content = str(record["content"])
+                visible_lines = []
+                for source_line in content.splitlines():
+                    number, separator, _text = source_line.partition(":")
+                    if separator and number.strip().isdigit():
+                        visible_lines.append(int(number.strip()))
+                start = min(visible_lines) if visible_lines else int(
+                    record.get("line", record.get("start_line", 1)) or 1
+                )
+                end = max(visible_lines) if visible_lines else int(
+                    record.get("end_line", start) or start
+                )
+                if end >= start:
+                    windows.append({"path": path, "start_line": start, "end_line": end})
+    return windows
+
+
+def _add_context_source_windows(
+    root: Path,
+    result: dict[str, Any],
+    *,
+    source_excludes: list[str],
+    max_file_bytes: int | None,
+) -> dict[str, Any]:
+    runtime = load_json("runtime/agent.json")
+    limit = int(runtime["discovery_context_per_request_max_characters"])
+    used = 0
+    enriched = dict(result)
+    for collection_name in ("edges", "definitions", "routes", "matches"):
+        enriched_items: list[dict[str, Any]] = []
+        for raw_item in result.get(collection_name, []):
+            item = dict(raw_item)
+            path = str(item.get("path", ""))
+            line = int(item.get("line", item.get("start_line", 1)) or 1)
+            end_line = int(item.get("end_line", line) or line)
+            if path and used < limit:
+                try:
+                    content = _source_window(
+                        root,
+                        path,
+                        line,
+                        end_line,
+                        exclude=source_excludes,
+                        max_file_bytes=max_file_bytes,
+                    )
+                except (AIResponseError, OSError):
+                    content = ""
+                if content:
+                    remaining = max(0, limit - used)
+                    item["content"] = content[:remaining]
+                    used += len(item["content"])
+            enriched_items.append(item)
+        if enriched_items:
+            enriched[collection_name] = enriched_items
+    enriched["context_characters"] = used
+    return enriched
+
+
+def _resolve_discovery_context_request(
+    agent: "OptimizedPlaidNoxDeepHuntAgent",
+    root: Path,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    kind = str(request.get("kind", ""))
+    normalized = dict(request)
+    if kind in _DISCOVERY_CONTEXT_SEARCH_KINDS:
+        normalized["kind"] = "search"
+        normalized["pattern"] = str(request.get("pattern") or request.get("symbol") or "")
+    result = _resolve_context_request(
+        root,
+        agent.security_graph,
+        normalized,
+        source_excludes=agent.source_excludes,
+        max_file_bytes=agent.max_file_bytes,
+        knowledge_store=agent.knowledge_coordinator.store if agent.knowledge_coordinator else None,
+    )
+    result["requested_kind"] = kind
+    return _add_context_source_windows(
+        root,
+        result,
+        source_excludes=agent.source_excludes,
+        max_file_bytes=agent.max_file_bytes,
+    )
+
+
+def _continuation_is_exceptional(
+    region: DiscoveryRegion,
+    context: AIRepositoryContext,
+) -> bool:
+    obligation_types = {item.obligation_type for item in region.obligation_specs.values()}
+    return (
+        bool(context.trust_boundaries)
+        and bool(context.sensitive_effects)
+        and bool(obligation_types & {"security_invariant", "sensitive_effect"})
+    )
+
+
+def _candidate_summary(candidate: Candidate) -> dict[str, Any]:
+    return {
+        "candidate_id": str(candidate.metadata.get("candidate_id", "")),
+        "root_cause": dict(candidate.metadata.get("root_cause") or {}),
+        "attacker_influence": str(candidate.metadata.get("attacker_influence", "")),
+        "broken_invariant": str(candidate.metadata.get("broken_invariant", "")),
+        "gained_capability": str(candidate.metadata.get("gained_capability", "")),
+        "path": candidate.evidence.path,
+        "start_line": candidate.evidence.start_line,
+        "end_line": candidate.evidence.end_line,
+    }
+
+
+def _validate_obligation_evidence(
+    root: Path,
+    results: list[dict[str, Any]],
+    *,
+    source_excludes: list[str],
+    max_file_bytes: int | None,
+) -> None:
+    for result in results:
+        for evidence in result["evidence"]:
+            relative = str(evidence["path"])
+            target = (root / relative).resolve()
+            if (
+                root.resolve() not in target.parents
+                or not source_file_is_admitted(
+                    root,
+                    target,
+                    exclude=source_excludes,
+                    max_file_bytes=max_file_bytes,
+                )
+            ):
+                raise AIResponseError("obligation result cited an inadmissible evidence path")
+            start = int(evidence["start_line"])
+            end = int(evidence["end_line"])
+            line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+            if start < 1 or end < start or end > line_count:
+                raise AIResponseError("obligation result cited an invalid evidence line range")
 
 
 class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
@@ -536,6 +1032,9 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
         self.discovery_error_types = []
         self.discovery_errors = []
         self.discovery_unexpected_failures = 0
+        self.discovery_contract_failures = 0
+        self.discovery_metrics = {}
+        self.discovery_unresolved_obligations = 0
         runtime = load_json("runtime/agent.json")
         queries = self._create_search_plan(context, plan)
         search_errors: list[RipgrepQueryError] = []
@@ -557,16 +1056,37 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
 
         candidate_index = CandidateIndex()
-        prompt_version = str(load_json("prompts/manifest.json")["version"])
+        prompt_manifest = load_json("prompts/manifest.json")
+        prompt_version = str(
+            prompt_manifest["operations"]["vulnerability_discovery"].get(
+                "contract_version", prompt_manifest["version"]
+            )
+        )
         telemetry = {
+            "regions_planned": len(regions),
+            "initial_region_calls": 0,
             "discovery_model_calls": 0,
             "checkpoint_discovery_hits": 0,
+            "obligations_total": sum(len(region.obligation_specs) for region in regions),
+            "obligations_no_issue": 0,
+            "obligations_not_applicable": 0,
+            "obligations_candidate_found": 0,
+            "obligations_needs_context": 0,
+            "obligations_unresolved": 0,
+            "discovery_contract_failures": 0,
+            "context_requests_total": 0,
+            "context_requests_unique": 0,
+            "context_requests_resolved": 0,
+            "context_requests_empty": 0,
+            "context_requests_deferred": 0,
             "continuations_requested": 0,
             "continuations_executed": 0,
-            "continuations_no_progress": 0,
+            "continuations_blocked_no_new_context": 0,
+            "initial_input_characters": 0,
+            "continuation_input_characters": 0,
             "candidates_raw": 0,
-            "candidates_unique": 0,
-            "candidate_duplicates_absorbed": 0,
+            "candidates_semantic_unique": 0,
+            "candidate_evidence_merges": 0,
         }
         telemetry_lock = threading.Lock()
 
@@ -583,6 +1103,25 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                 saved = self.checkpoint.get("discovery", checkpoint_key)
                 if saved is not None:
                     bump("checkpoint_discovery_hits")
+                    bump(
+                        "discovery_contract_failures",
+                        len(saved.get("coverage_state", {}).get("contract_issues", [])),
+                    )
+                    for disposition in saved.get("coverage_state", {}).get("dispositions", []):
+                        status = str(disposition.get("status", ""))
+                        metric = {
+                            ObligationStatus.NO_ISSUE.value: "obligations_no_issue",
+                            ObligationStatus.NOT_APPLICABLE.value: "obligations_not_applicable",
+                            ObligationStatus.CANDIDATE_FOUND.value: "obligations_candidate_found",
+                            ObligationStatus.NEEDS_CONTEXT.value: "obligations_needs_context",
+                            ObligationStatus.UNRESOLVED.value: "obligations_unresolved",
+                        }.get(status)
+                        if metric:
+                            bump(metric)
+                    bump(
+                        "obligations_needs_context",
+                        len(saved.get("coverage_state", {}).get("needs_context_ids", [])),
+                    )
                     self._emit(
                         "checkpoint_reused",
                         stage="discovery",
@@ -601,24 +1140,63 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                 anchor_type=region.anchor_type,
                 anchor_id=region.anchor_id,
             )
-            related_tasks = _tasks_for_segment(plan, region.path, region.task_ids)
-            next_focus = ""
-            seen_focuses: set[str] = set()
-            reviewed_obligations: set[str] = set()
-            reviewed_branches: set[str] = set()
-            max_continuations = int(runtime["discovery_max_continuations"])
+            related_tasks = [
+                _region_task_payload(task, region)
+                for task in _tasks_relevant_to_region(region, plan)
+            ]
+            coverage_state = DiscoveryCoverageState(region.region_id, dict(region.obligation_specs))
+            resolved_context: list[dict[str, Any]] = []
+            all_resolved_context: list[dict[str, Any]] = []
+            maximum = (
+                int(runtime["discovery_critical_max_continuations"])
+                if _continuation_is_exceptional(region, context)
+                else int(runtime["discovery_max_continuations"])
+            )
+            initial_latency_ms = 0
+            continuation_latency_ms = 0
 
-            for round_index in range(max_continuations + 1):
+            for round_index in range(maximum + 1):
                 if round_index > 0:
                     bump("continuations_executed")
-                request = {
-                    "repository_context": self._compact_context_for_discovery(context, region.path),
-                    "hunt_plan": {"strategy": plan.strategy, "tasks": related_tasks},
-                    "source_segment": segment,
-                    "continuation_focus": next_focus,
-                }
+                    active_ids = coverage_state.unresolved_ids()
+                    request = {
+                        "discovery_region": {
+                            "region_id": region.region_id,
+                            "path": region.path,
+                            "anchor_type": region.anchor_type,
+                            "anchor_id": region.anchor_id,
+                            "start_line": region.start_line,
+                            "end_line": region.end_line,
+                        },
+                        "root_cause_summary": [_candidate_summary(item) for item in segment_candidates],
+                        "security_obligations": [
+                            coverage_state.obligations[obligation_id].to_dict()
+                            for obligation_id in active_ids
+                        ],
+                        "previous_dispositions": [
+                            coverage_state.dispositions[obligation_id]
+                            for obligation_id in active_ids
+                            if obligation_id in coverage_state.dispositions
+                        ],
+                        "new_context": resolved_context,
+                    }
+                    bump("continuation_input_characters", len(json.dumps(request, default=str)))
+                else:
+                    bump("initial_region_calls")
+                    request = {
+                        "repository_context": self._compact_context_for_discovery(context, region.path),
+                        "hunt_plan": {"strategy": plan.strategy, "tasks": related_tasks},
+                        "source_segment": segment,
+                        "security_obligations": [
+                            item.to_dict() for item in coverage_state.obligations.values()
+                        ],
+                        "previous_dispositions": [],
+                        "new_context": [],
+                    }
+                    bump("initial_input_characters", len(json.dumps(request, default=str)))
                 try:
                     bump("discovery_model_calls")
+                    started_at = time.monotonic()
                     response = self._structured_response(
                         "plaidnox_vulnerability_discovery",
                         load_json("schemas/vulnerability_discovery.json"),
@@ -628,78 +1206,157 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                     from .llm import response_json
 
                     payload = response_json(response)
+                    elapsed = round((time.monotonic() - started_at) * 1000)
+                    if round_index:
+                        continuation_latency_ms += elapsed
+                    else:
+                        initial_latency_ms = elapsed
 
                     raw_items = list(payload["candidates"])
                     bump("candidates_raw", len(raw_items))
-                    new_candidates = 0
+                    valid_candidate_ids: set[str] = set()
                     for item in raw_items:
-                        candidate = _candidate_from_ai_item(root, item, segment)
+                        candidate = _candidate_from_ai_item(
+                            root,
+                            item,
+                            segment,
+                            allowed_source_windows=_source_windows_from_context(all_resolved_context),
+                        )
                         if candidate is None:
                             continue
+                        candidate_id = str(item["candidate_id"])
+                        candidate.metadata["candidate_id"] = candidate_id
+                        if all_resolved_context:
+                            candidate.metadata["discovery_context"] = list(all_resolved_context)
+                        valid_candidate_ids.add(candidate_id)
                         if not candidate_index.admit(candidate):
-                            bump("candidate_duplicates_absorbed")
+                            bump("candidate_evidence_merges")
                             continue
                         segment_candidates.append(candidate)
-                        new_candidates += 1
-                        bump("candidates_unique")
+                        bump("candidates_semantic_unique")
 
-                    if bool(payload["coverage_complete"]):
-                        break
-
-                    progressed, obligations, branches, proposed_focus = _discovery_progress(
-                        payload,
-                        new_candidates=new_candidates,
-                        previous_obligations=reviewed_obligations,
-                        previous_branches=reviewed_branches,
-                        seen_focuses=seen_focuses,
+                    obligation_results = list(payload["obligation_results"])
+                    _validate_obligation_evidence(
+                        root,
+                        obligation_results,
+                        source_excludes=self.source_excludes,
+                        max_file_bytes=self.max_file_bytes,
                     )
-                    reviewed_obligations.update(obligations)
-                    reviewed_branches.update(branches)
-
-                    if not proposed_focus:
-                        raise AIResponseError(
-                            "AI marked coverage incomplete without a continuation focus"
-                        )
+                    prior_contract_issues = len(coverage_state.contract_issues)
+                    coverage_state.apply(
+                        obligation_results,
+                        coverage_state.candidate_ids | valid_candidate_ids,
+                    )
+                    contract_failures = len(coverage_state.contract_issues) - prior_contract_issues
+                    if contract_failures:
+                        bump("discovery_contract_failures", contract_failures)
+                    needs_context = coverage_state.unresolved_ids()
+                    if not needs_context:
+                        break
                     bump("continuations_requested")
-                    if round_index >= max_continuations:
+                    if round_index >= maximum:
+                        coverage_state.mark_unresolved(needs_context, "continuation budget exhausted")
                         break
-                    if not progressed:
-                        bump("continuations_no_progress")
+
+                    requests = [
+                        dict(request_item)
+                        for obligation_id in needs_context
+                        for request_item in coverage_state.dispositions[obligation_id]["context_requests"]
+                    ]
+                    bump("context_requests_total", len(requests))
+                    request_policy = load_json("runtime/agent.json")
+                    priority = request_policy["discovery_context_request_priority"]
+                    unique_requests = {
+                        _context_request_key(item): item for item in requests
+                    }
+                    requests = sorted(
+                        unique_requests.values(),
+                        key=lambda item: (
+                            int(priority.get(str(item.get("kind", "")), 100)),
+                            _context_request_key(item),
+                        ),
+                    )
+                    request_limit = int(request_policy["discovery_context_requests_per_expansion"])
+                    bump("context_requests_deferred", max(0, len(requests) - request_limit))
+                    requests = requests[:request_limit]
+                    new_context: list[dict[str, Any]] = []
+                    new_context_characters = 0
+                    context_limit = int(runtime["discovery_context_max_characters"])
+                    for context_request in requests:
+                        request_key = _context_request_key(context_request)
+                        if request_key in coverage_state.requested_context:
+                            continue
+                        coverage_state.requested_context.add(request_key)
+                        bump("context_requests_unique")
+                        resolved = _resolve_discovery_context_request(self, root, context_request)
+                        if not _has_context_evidence(resolved):
+                            bump("context_requests_empty")
+                            continue
+                        evidence_key = _stable_hash(resolved)
+                        if evidence_key in coverage_state.resolved_context:
+                            continue
+                        context_characters = int(resolved.get("context_characters", 0))
+                        if new_context and new_context_characters + context_characters > context_limit:
+                            break
+                        coverage_state.resolved_context.add(evidence_key)
+                        new_context.append(resolved)
+                        new_context_characters += context_characters
+                        bump("context_requests_resolved")
+                    if not new_context:
+                        coverage_state.mark_unresolved(
+                            needs_context,
+                            "context broker produced no new evidence",
+                        )
+                        bump("continuations_blocked_no_new_context")
                         self._emit(
-                            "discovery_continuation_no_progress",
+                            "discovery_continuation_blocked_no_new_context",
                             region_id=region.region_id,
                             path=region.path,
-                            round=round_index,
+                            obligations=needs_context,
                         )
                         break
-                    if proposed_focus in seen_focuses and new_candidates == 0:
-                        bump("continuations_no_progress")
-                        self._emit(
-                            "discovery_continuation_repeated_focus",
-                            region_id=region.region_id,
-                            path=region.path,
-                            round=round_index,
-                        )
-                        break
-                    seen_focuses.add(proposed_focus)
-                    next_focus = proposed_focus
+                    resolved_context = new_context
+                    all_resolved_context.extend(new_context)
                 except Exception as exc:  # noqa: BLE001
                     errors.append(exc)
                     break
+
+            for candidate in segment_candidates:
+                if coverage_state.resolved_context:
+                    candidate.metadata["discovery_context"] = all_resolved_context
+            if not errors and not coverage_state.complete:
+                errors.append(AIResponseError("discovery region retained non-terminal obligations"))
+
+            final_statuses = [
+                str(result["status"]) for result in coverage_state.dispositions.values()
+            ]
+            bump("obligations_no_issue", final_statuses.count(ObligationStatus.NO_ISSUE.value))
+            bump(
+                "obligations_not_applicable",
+                final_statuses.count(ObligationStatus.NOT_APPLICABLE.value),
+            )
+            bump(
+                "obligations_candidate_found",
+                final_statuses.count(ObligationStatus.CANDIDATE_FOUND.value),
+            )
+            bump(
+                "obligations_needs_context",
+                len(coverage_state.needs_context_ids),
+            )
+            bump(
+                "obligations_unresolved",
+                final_statuses.count(ObligationStatus.UNRESOLVED.value),
+            )
 
             if self.checkpoint is not None and not errors:
                 self.checkpoint.put(
                     "discovery",
                     checkpoint_key,
-                    {"candidates": [candidate_to_dict(item) for item in segment_candidates]},
+                    {
+                        "candidates": [candidate_to_dict(item) for item in segment_candidates],
+                        "coverage_state": coverage_state.to_dict(),
+                    },
                 )
-            sink = self.candidate_sink
-            if sink is not None and not errors:
-                for candidate in segment_candidates:
-                    try:
-                        sink(candidate)
-                    except Exception:  # noqa: BLE001
-                        break
             self._emit(
                 "source_region_completed",
                 region_id=region.region_id,
@@ -708,6 +1365,25 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                 end_line=region.end_line,
                 candidates=len(segment_candidates),
                 errors=len(errors),
+                obligations=len(coverage_state.obligations),
+                initial_latency_milliseconds=initial_latency_ms,
+                continuation_latency_milliseconds=continuation_latency_ms,
+                context_requests=len(coverage_state.requested_context),
+                new_context_characters=sum(
+                    int(item.get("context_characters", 0)) for item in all_resolved_context
+                ),
+                stop_reason=(
+                    "error"
+                    if errors
+                    else "unresolved_obligations"
+                    if any(
+                        result["status"] == ObligationStatus.UNRESOLVED.value
+                        for result in coverage_state.dispositions.values()
+                    )
+                    else "obligations_terminal"
+                    if coverage_state.complete
+                    else "incomplete"
+                ),
             )
             return segment_candidates, errors
 
@@ -724,6 +1400,9 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
         telemetry["discovery_model_calls_per_unique_region"] = round(
             telemetry["discovery_model_calls"] / max(1, len(regions)), 3
         )
+        self.discovery_metrics = dict(region_stats) | dict(telemetry)
+        self.discovery_contract_failures = int(telemetry["discovery_contract_failures"])
+        self.discovery_unresolved_obligations = int(telemetry["obligations_unresolved"])
         self._emit("discovery_telemetry", **region_stats, **telemetry)
         return candidates, failures
 

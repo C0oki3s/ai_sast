@@ -160,6 +160,31 @@ class ScanCheckpoint:
                         load_text("sql/checkpoint/update_completed.sql"),
                         (text, stage, key),
                     )
+                completed = self._db.execute(
+                    load_text("sql/checkpoint/select_record.sql"), (stage, key)
+                ).fetchone()
+                if completed is not None:
+                    execution = json.loads(str(completed[4]))
+                    operation = str(execution.get("operation", ""))
+                    work_identity = str(execution.get("work_identity", ""))
+                    if operation and work_identity:
+                        retryable = self._db.execute(
+                            load_text("sql/checkpoint/select_retryable_by_stage.sql"),
+                            (stage, key),
+                        ).fetchall()
+                        for old_key, old_execution_text in retryable:
+                            try:
+                                old_execution = json.loads(str(old_execution_text))
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                old_execution.get("operation") == operation
+                                and old_execution.get("work_identity") == work_identity
+                            ):
+                                self._db.execute(
+                                    load_text("sql/checkpoint/supersede_unit.sql"),
+                                    (stage, str(old_key)),
+                                )
                 self._db.commit()
                 self._restrict_permissions()
                 self.writes += 1

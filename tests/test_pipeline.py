@@ -673,36 +673,34 @@ def test_pipeline_records_model_usage_for_the_tenant_cost_quota(sample_repo):
     assert all(event.tenant_id == "tenant-a" for event in events)
 
 
-class FakeStreamingDiscoveryAI(FakeContextualAI):
-    """Emits candidates through the sink, then keeps 'discovering' until review has started."""
-
-    candidate_sink = None
+class FakeMergedDiscoveryAI(FakeContextualAI):
+    """Records that verification starts only after discovery returns canonical candidates."""
 
     def __init__(self):
         import threading
 
         self.review_started = threading.Event()
+        self.discovery_ended = False
         self.reviewed_before_discovery_ended = False
         self.reviews = 0
 
     def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
         self.reviews += 1
+        self.reviewed_before_discovery_ended = not self.discovery_ended
         self.review_started.set()
         return super().review(root, candidate, finding, security_context, model_tier, route)
 
     def discover_candidates(self, root, context, plan=None):
         candidates, failures = super().discover_candidates(root, context, plan)
-        for candidate in candidates:
-            self.candidate_sink(candidate)
-        self.reviewed_before_discovery_ended = self.review_started.wait(timeout=10)
+        self.discovery_ended = True
         return candidates, failures
 
 
-def test_pipeline_reviews_candidates_while_discovery_is_still_running(sample_repo):
-    agent = FakeStreamingDiscoveryAI()
+def test_pipeline_merges_candidates_before_starting_independent_verification(sample_repo):
+    agent = FakeMergedDiscoveryAI()
     result = SastPipeline().scan_snapshot(sample_repo, "plaidnox/test-fixture", deep_hunt_agent=agent)
 
-    assert agent.reviewed_before_discovery_ended is True
-    assert agent.reviews == 1  # the early review is reused, not repeated, by the round loop
+    assert agent.reviewed_before_discovery_ended is False
+    assert agent.reviews == 1
     assert len(result.findings) == 1
     assert all(finding.state.value == "validated" for finding in result.findings)

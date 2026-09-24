@@ -4,7 +4,8 @@ import hashlib
 import re
 import threading
 
-from .models import Candidate
+from .assets import load_json
+from .models import Candidate, CandidateEvidencePacket
 
 
 def _normalize(value: str) -> str:
@@ -65,7 +66,7 @@ def _classification_ids(candidate: Candidate) -> frozenset[str]:
     )
 
 
-def root_cause_key(candidate: Candidate) -> str:
+def candidate_semantic_key(candidate: Candidate) -> str:
     """Semantic identity of one broken control at one code root.
 
     The symbol and security-control name identify the implementation point;
@@ -85,6 +86,56 @@ def root_cause_key(candidate: Candidate) -> str:
     return f"{_normalize(candidate.evidence.path)}|{symbol}|{control}{semantic_tail}"
 
 
+def root_cause_key(candidate: Candidate) -> str:
+    """Compatibility alias for the canonical semantic candidate identity."""
+
+    return candidate_semantic_key(candidate)
+
+
+def candidate_evidence_packet(candidate: Candidate) -> CandidateEvidencePacket:
+    """Compile merged discovery evidence into the Deep Hunt input contract."""
+
+    basis = dict(candidate.metadata.get("evidence_basis") or {})
+    root_cause = dict(candidate.metadata.get("root_cause") or {})
+    graph_path = [str(item) for item in candidate.evidence.graph_path if str(item)]
+    trace_edges = [
+        {"source": source, "target": target}
+        for source, target in zip(graph_path, graph_path[1:], strict=False)
+    ]
+    supporting = [
+        dict(item)
+        for item in candidate.metadata.get("supporting_evidence", [])
+        if isinstance(item, dict)
+    ]
+    discovery_context = [
+        dict(item)
+        for item in candidate.metadata.get("discovery_context", [])
+        if isinstance(item, dict)
+    ]
+    capability = str(
+        candidate.metadata.get("gained_capability")
+        or root_cause.get("capability", "")
+    ).strip()
+    invariant = str(
+        candidate.metadata.get("broken_invariant")
+        or root_cause.get("broken_invariant", "")
+    ).strip()
+    return CandidateEvidencePacket(
+        candidate_id=candidate_semantic_key(candidate) or candidate_fingerprint("", candidate),
+        root_cause=root_cause,
+        attacker_origins=[str(item) for item in basis.get("origin", [])],
+        security_boundary=[str(item) for item in basis.get("expected_boundary", [])],
+        invariant=invariant,
+        downstream_trust=supporting + discovery_context,
+        sensitive_effects=[str(item) for item in basis.get("sensitive_effect", [])],
+        gained_capabilities=[capability] if capability else [],
+        trace_nodes=graph_path,
+        trace_edges=trace_edges,
+        evidence_gaps=[str(item) for item in basis.get("missing_evidence", [])]
+        + [str(item) for item in candidate.metadata.get("required_context", [])],
+    )
+
+
 def absorb(kept: Candidate, duplicate: Candidate) -> None:
     """Fold a repeat report into the candidate already kept instead of dropping its evidence."""
     kept.metadata["duplicate_reports"] = int(kept.metadata.get("duplicate_reports", 0)) + 1
@@ -95,8 +146,24 @@ def absorb(kept: Candidate, duplicate: Candidate) -> None:
         "end_line": duplicate.evidence.end_line,
         "attack_path": duplicate.evidence.graph_path[-1] if duplicate.evidence.graph_path else "",
     }
-    if len(support) < 5 and entry not in support:
+    limit = int(load_json("runtime/agent.json")["candidate_supporting_evidence_limit"])
+    if len(support) < limit and entry not in support:
         support.append(entry)
+    for duplicate_support in duplicate.metadata.get("supporting_evidence", []):
+        if (
+            isinstance(duplicate_support, dict)
+            and len(support) < limit
+            and duplicate_support not in support
+        ):
+            support.append(dict(duplicate_support))
+    merged_context = kept.metadata.setdefault("discovery_context", [])
+    for context in duplicate.metadata.get("discovery_context", []):
+        if (
+            isinstance(context, dict)
+            and len(merged_context) < limit
+            and context not in merged_context
+        ):
+            merged_context.append(dict(context))
 
 
 def is_same_issue(first: Candidate, second: Candidate, nearby_lines: int = _NEARBY_LINES) -> bool:
@@ -152,8 +219,13 @@ def deduplicate(repository: str, candidates: list[Candidate]) -> tuple[list[Cand
     for candidate in candidates:
         fingerprint = candidate_fingerprint(repository, candidate)
         current = unique.get(fingerprint)
-        if current is None or candidate.confidence > current.confidence:
+        if current is None:
             unique[fingerprint] = candidate
+        elif candidate.confidence > current.confidence:
+            absorb(candidate, current)
+            unique[fingerprint] = candidate
+        else:
+            absorb(current, candidate)
     clusters: list[Candidate] = []
     for candidate in sorted(unique.values(), key=lambda item: -item.confidence):
         match = next((kept for kept in clusters if is_same_issue(kept, candidate)), None)

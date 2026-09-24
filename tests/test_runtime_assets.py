@@ -18,7 +18,14 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     models = load_json("runtime/models.json")
     assert len(models["agent_models"]) > 3
     assert all(item["cost"] != "high" for item in models["agent_models"])
-    assert "claude-opus-5" not in {item["name"] for item in models["agent_models"]}
+    configured_model_names = {item["name"] for item in models["agent_models"]}
+    assert "claude-opus-5" not in configured_model_names
+    assert {"gpt-5.4-mini", "gpt-5.4"}.issubset(configured_model_names)
+    assert models["agent_default_model"] == "gpt-5.4-mini"
+    assert all(
+        name.startswith(("claude-haiku-", "claude-sonnet-", "deepseek-", "glm-", "gpt-", "kimi-", "llama-", "qwen"))
+        for name in configured_model_names
+    )
     assert load_json("schemas/hunt_plan.json")["properties"]["tasks"]["minItems"] == 1
     assert "maxItems" not in load_json("schemas/vulnerability_discovery.json")["properties"]["candidates"]
     assert "Every production area" in render_prompt("operations/hunt_plan/system.md")
@@ -35,7 +42,16 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert "literal ripgrep search terms" in render_prompt("operations/search_query_plan/system.md")
     assert "perplexity_sonar" in load_json("research/providers.json")["providers"]
     assert "gate_results" in load_json("schemas/deep_hunt_review.json")["required"]
-    assert "coverage" in load_json("schemas/vulnerability_discovery.json")["required"]
+    discovery_schema = load_json("schemas/vulnerability_discovery.json")
+    assert "obligation_results" in discovery_schema["required"]
+    statuses = discovery_schema["properties"]["obligation_results"]["items"]["properties"]["status"]["enum"]
+    assert statuses == [
+        "NO_ISSUE",
+        "NOT_APPLICABLE",
+        "CANDIDATE_FOUND",
+        "NEEDS_CONTEXT",
+        "UNRESOLVED",
+    ]
     assert "security_invariants" in load_json("schemas/repository_context.json")["required"]
     assert "coverage_obligations" in (
         load_json("schemas/hunt_plan.json")["properties"]["tasks"]["items"]["required"]

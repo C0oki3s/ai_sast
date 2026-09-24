@@ -7,6 +7,7 @@ from plaidnox_sast.models import (
     PolicyResult,
     ScanMode,
     ScanResult,
+    ScanStatus,
     Severity,
 )
 from plaidnox_sast.policy import PolicyEngine
@@ -78,8 +79,47 @@ def test_markdown_report_is_human_readable_and_redacted(tmp_path):
     destination = tmp_path / "report.md"
     write_markdown(result, destination)
     report = destination.read_text()
-    assert "Policy decision:** **BLOCK" in report
+    assert "Scan status:** **SUCCESSFUL" in report
+    assert "Verified findings: **1**" in report
+    assert "Policy decision" not in report
     assert "[secret value redacted]" in report
     assert "Target Code Executed:** False" in report
     assert "Related evidence locations" in report
     assert "routes/admin.js:8-11" in report
+
+
+def test_scan_status_is_independent_of_findings_and_policy():
+    result = ScanResult(
+        codebase="org/repo",
+        revision="deadbeef",
+        mode=ScanMode.DEEP,
+        findings=[finding()],
+        policy=PolicyResult(PolicyDecision.BLOCK, ["merge policy reason"]),
+        metrics={"ai_scan_incomplete": False},
+    )
+
+    assert result.scan_status is ScanStatus.SUCCESSFUL
+    serialized = result.to_dict()
+    assert serialized["scan_status"] == "SUCCESSFUL"
+    assert serialized["findings_summary"] == {
+        "total": 1,
+        "critical": 0,
+        "high": 1,
+        "medium": 0,
+        "low": 0,
+        "info": 0,
+    }
+    assert "policy" not in serialized
+
+
+def test_required_failed_work_makes_scan_unsuccessful():
+    result = ScanResult(
+        codebase="org/repo",
+        revision="deadbeef",
+        mode=ScanMode.DEEP,
+        findings=[finding()],
+        policy=PolicyResult(PolicyDecision.BLOCK, ["merge policy reason"]),
+        metrics={"ai_review_failures": 1},
+    )
+
+    assert result.scan_status is ScanStatus.UNSUCCESSFUL

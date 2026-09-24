@@ -463,6 +463,33 @@ change this exit condition.
 
 ## 5. End-to-end validation — foundation implemented, evidence pending
 
+Scan20 follow-up fixes are implemented and covered by automated tests: discovery
+candidates can be grounded in immutable source windows returned by the Context
+Broker (with a regression test proving a cross-file candidate reaches the
+verification queue); route regions receive a local projection of only their
+matching hunt tasks; each expansion is capped at three ranked context requests;
+and operational completion is recorded separately from resolved coverage.
+Deep Hunt output is compacted by the external schema and Markdown prompt, with
+a 5,000-token operation ceiling. A later successful unit supersedes only a
+retryable attempt with the same operation and stable work identity. Reported
+ripgrep totals now combine reconnaissance and optimized-discovery counters,
+with per-stage breakdowns. These changes pass the full automated suite; they
+still require the pinned cold NSTCTF acceptance run below.
+
+The Scan20 discovery contract replaces model-directed `coverage_complete` /
+`next_focus` recursion. Structural regions now carry stable obligation IDs;
+every initial response dispositions each obligation; only `NEEDS_CONTEXT`
+reaches the Context Broker; and only a nonempty, previously unseen evidence
+delta permits a bounded continuation. Candidate evidence is merged before
+verification and compiled into `CandidateEvidencePacket`. Acceptance reports
+must include region/call ratio, obligation outcomes, Context Broker yield,
+blocked empty continuations, initial versus continuation input size, semantic
+candidate merges, and verification dispositions. The cold NSTCTF gate is at
+most 40 discovery calls, at most 1.5 calls per region, at most 15 executed
+continuations, duplicate candidate ratio below 40%, zero discovery failures,
+and a finding equivalent to the seeded root cause/invariant/capability. Warm
+checkpoint benchmarking follows the cold correctness run.
+
 - Repeatable acceptance scans against `C0oki3s/NSTCTF` plus multi-language
   fixtures with known positives, variants, and clean controls.
 - Measure coverage, validated recall, false positives, duplicates, IR/context

@@ -51,6 +51,11 @@ class PolicyDecision(StrEnum):
     INCOMPLETE = "incomplete"
 
 
+class ScanStatus(StrEnum):
+    SUCCESSFUL = "SUCCESSFUL"
+    UNSUCCESSFUL = "UNSUCCESSFUL"
+
+
 @dataclass(slots=True)
 class Evidence:
     path: str
@@ -72,6 +77,26 @@ class Candidate:
     message: str
     evidence: Evidence
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class CandidateEvidencePacket:
+    """Canonical, bounded evidence handed from discovery to independent verification."""
+
+    candidate_id: str
+    root_cause: dict[str, Any]
+    attacker_origins: list[str]
+    security_boundary: list[str]
+    invariant: str
+    downstream_trust: list[dict[str, Any]]
+    sensitive_effects: list[str]
+    gained_capabilities: list[str]
+    trace_nodes: list[str]
+    trace_edges: list[dict[str, str]]
+    evidence_gaps: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -137,5 +162,34 @@ class ScanResult:
     metrics: dict[str, Any]
     repository_context: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def scan_status(self) -> ScanStatus:
+        required_failures = (
+            "ai_context_failures",
+            "ai_planning_failures",
+            "ai_discovery_failures",
+            "ai_review_failures",
+            "ai_variant_failures",
+            "ai_capability_chain_failures",
+            "ai_consolidation_failures",
+            "ai_discovery_unresolved_obligations",
+            "ai_discovery_contract_failures",
+            "ai_search_query_failures",
+            "checkpoint_units_pending",
+        )
+        incomplete = bool(self.metrics.get("ai_scan_incomplete", False))
+        incomplete = incomplete or any(int(self.metrics.get(key, 0) or 0) > 0 for key in required_failures)
+        return ScanStatus.UNSUCCESSFUL if incomplete else ScanStatus.SUCCESSFUL
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value.pop("policy", None)
+        value["scan_status"] = self.scan_status.value
+        value["findings_summary"] = {
+            "total": len(self.findings),
+            **{
+                severity.value: sum(finding.severity is severity for finding in self.findings)
+                for severity in Severity
+            },
+        }
+        return value

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -60,9 +61,7 @@ from .redaction import redact as _redact
 from .redaction import redact_payload
 
 
-_TRANSIENT_ERROR_NAMES = frozenset(
-    {"RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError"}
-)
+_RATE_LIMIT_ERROR_NAMES = frozenset({"RateLimitError"})
 
 
 class AIConfigurationError(AIStageError):
@@ -264,7 +263,10 @@ class PlaidNoxDeepHuntAgent:
             str(tier): str(name)
             for tier, name in model_runtime["agent_fallback_model_by_tier"].items()
         }
-        self.max_output_tokens = max_output_tokens
+        configured_output_limit = int(model_runtime["agent_default_max_output_tokens"])
+        self.max_output_tokens = (
+            int(max_output_tokens) if max_output_tokens is not None else configured_output_limit
+        )
         self.knowledge_coordinator = knowledge_coordinator
         self.event_sink = event_sink
         self.cache_telemetry = cache_telemetry or LiteLLMCacheTelemetry()
@@ -272,7 +274,7 @@ class PlaidNoxDeepHuntAgent:
         self.frontier_router = frontier_router or FrontierRouter()
         self.retry_router = retry_router or RetryRouter()
         self.checkpoint: ScanCheckpoint | None = None
-        # Set by the pipeline to start reviewing candidates while discovery is still running.
+        # Compatibility hook for integrations predating canonical pre-verification merging.
         self.candidate_sink: Callable[[Candidate], None] | None = None
         self.model_execution_router = model_execution_router or ModelExecutionRouter()
         self.model_budget = model_budget or ModelUsageBudget()
@@ -284,6 +286,11 @@ class PlaidNoxDeepHuntAgent:
         self._model_input_audit: list[dict[str, Any]] = []
         self._model_execution_routes: dict[str, ModelExecutionDecision] = {}
         self.search_query_errors: list[dict[str, Any]] = []
+        self.knowledge_errors: list[dict[str, str]] = []
+        self.discovery_metrics: dict[str, int | float] = {}
+        self.discovery_unresolved_obligations = 0
+        self.rate_limit_waits = 0
+        self._telemetry_lock = threading.Lock()
 
     @classmethod
     def from_environment(
@@ -367,6 +374,7 @@ class PlaidNoxDeepHuntAgent:
 
         self._model_input_audit.clear()
         self._model_execution_routes.clear()
+        self.rate_limit_waits = 0
 
     def reset_search_query_errors(self) -> None:
         """Start a new scan-scoped AI search-query audit."""
@@ -389,6 +397,7 @@ class PlaidNoxDeepHuntAgent:
             "model_calls_with_repository_wide_context": sum(
                 int(bool(item["repository_wide_context"])) for item in self._model_input_audit
             ),
+            "rate_limit_waits": self.rate_limit_waits,
         }
 
     def web_knowledge_provider(self) -> PerplexityKnowledgeProvider:
@@ -503,6 +512,7 @@ class PlaidNoxDeepHuntAgent:
             "finding_impact": finding.impact,
             "graph_path": candidate.evidence.graph_path,
             "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
+            "candidate_evidence_packet": candidate.metadata.get("evidence_packet", {}),
             "security_ir_context": {} if metadata_only else _security_ir_context(
                 self.security_graph,
                 candidate.evidence.path,
@@ -1034,6 +1044,7 @@ class PlaidNoxDeepHuntAgent:
             raise AIResponseError(f"AI hunt plan did not match the required schema: {_schema_failure(exc)}") from exc
 
         tasks: list[HuntTask] = []
+        knowledge_failures = 0
         self._emit("hunt_plan_generated", codebase=context.codebase, tasks=len(task_values))
         for value in task_values:
             task = _hunt_task_from_value(value)
@@ -1043,14 +1054,29 @@ class PlaidNoxDeepHuntAgent:
                     task_id=task.task_id,
                     queries=len(task.knowledge_queries),
                 )
-                for _query, decision, entries in self.knowledge_coordinator.resolve_many(
-                    context.codebase,
-                    context.revision,
-                    task.to_dict(),
-                    task.knowledge_queries,
-                    _compact_repository_context(context, ""),
+                for query in dict.fromkeys(
+                    item.strip() for item in task.knowledge_queries if item.strip()
                 ):
-                    task.knowledge_context.extend(_knowledge_excerpts(entries, decision.action))
+                    try:
+                        _decision, entries = self.knowledge_coordinator.resolve(
+                            context.codebase,
+                            context.revision,
+                            {"task_id": task.task_id, "title": task.title, "vulnerability_themes": task.vulnerability_themes},
+                            query,
+                            {},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        knowledge_failures += 1
+                        error = {
+                            "task_id": task.task_id,
+                            "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                            "error_type": type(exc).__name__,
+                            "error": _redact(str(exc)[:240]),
+                        }
+                        self.knowledge_errors.append(error)
+                        self._emit("knowledge_resolution_failed", **error)
+                        continue
+                    task.knowledge_context.extend(_knowledge_excerpts(entries, _decision.action))
                 task.knowledge_context = list(
                     {item["knowledge_id"]: item for item in task.knowledge_context}.values()
                 )
@@ -1065,14 +1091,19 @@ class PlaidNoxDeepHuntAgent:
             raise AIResponseError("AI hunt plan contained no investigation tasks")
         _validate_hunt_plan_references(context, tasks)
         plan_id = ""
-        if self.knowledge_coordinator is not None:
+        if self.knowledge_coordinator is not None and knowledge_failures == 0:
             plan_id = self.knowledge_coordinator.store.save_plan(
                 context.codebase,
                 context.revision,
                 strategy,
                 [task.to_dict() for task in tasks],
             )
-        self._emit("hunt_plan_persisted", plan_id=plan_id, tasks=len(tasks))
+        self._emit(
+            "hunt_plan_persisted" if plan_id else "hunt_plan_not_persisted",
+            plan_id=plan_id,
+            tasks=len(tasks),
+            knowledge_failures=knowledge_failures,
+        )
         return HuntPlan(plan_id=plan_id, strategy=strategy, tasks=tasks)
 
     def discover_candidates(
@@ -1736,10 +1767,12 @@ class PlaidNoxDeepHuntAgent:
         return self.model_by_tier.get(model_tier.value, self.model)
 
     def _create_with_rate_limit_wait(self, request_kwargs: dict[str, Any], agent_runtime: Mapping[str, Any]) -> Any:
-        """Call the model, waiting out rate limits and dropped connections.
+        """Call the model, waiting only when a provider reports rate limiting.
 
-        Provider rate limits (TPM) clear within a minute, so the request waits
-        with exponential backoff rather than failing the whole segment.
+        LiteLLM already owns bounded transport retries. Connection failures,
+        timeouts, and provider errors must therefore escape to the durable
+        checkpoint as pending work rather than being mislabeled as rate-limit
+        waits and sleeping for several minutes.
         """
         max_waits = int(agent_runtime["rate_limit_max_waits"])
         base = float(agent_runtime["rate_limit_base_wait_seconds"])
@@ -1748,9 +1781,11 @@ class PlaidNoxDeepHuntAgent:
             try:
                 return self.client.responses.create(**request_kwargs)
             except Exception as exc:
-                if waited == max_waits or type(exc).__name__ not in _TRANSIENT_ERROR_NAMES:
+                if waited == max_waits or type(exc).__name__ not in _RATE_LIMIT_ERROR_NAMES:
                     raise
                 wait = min(ceiling, base * (2**waited))
+                with self._telemetry_lock:
+                    self.rate_limit_waits += 1
                 self._emit(
                     "model_request_rate_limited",
                     operation=str(request_kwargs["model"]),
@@ -1794,6 +1829,7 @@ class PlaidNoxDeepHuntAgent:
             hashlib.sha256(user_prompt.encode("utf-8")).hexdigest(),
             schema_hash,
         )
+        checkpoint_work_identity = _checkpoint_work_identity(prompt_operation, safe_payload)
         if self.checkpoint is not None:
             saved = self.checkpoint.get_record("llm_response", checkpoint_key)
             if saved is not None:
@@ -1844,7 +1880,12 @@ class PlaidNoxDeepHuntAgent:
             }
         )
         request_policy = _model_request_policy(agent_runtime, prompt_operation)
-        effective_max_output_tokens = max_output_tokens or self.max_output_tokens
+        operation_output_limits = agent_runtime.get("model_output_token_limit_by_operation", {})
+        effective_max_output_tokens = (
+            int(max_output_tokens)
+            if max_output_tokens is not None
+            else int(operation_output_limits.get(prompt_operation, self.max_output_tokens))
+        )
         request_kwargs: dict[str, Any] = {
             "model": model_execution.model_name,
             "reasoning": {"effort": effort},
@@ -1864,12 +1905,10 @@ class PlaidNoxDeepHuntAgent:
             request_kwargs["prompt_cache_key"] = (
                 f"{agent_runtime['prompt_cache_key_prefix']}:{prompt_operation}"
             )
-        if effective_max_output_tokens is not None:
-            # Only impose a cap when the caller explicitly wants one -- an
-            # unset cap here previously defaulted to a fixed value too low
-            # for reasoning models, which spend part of the budget on
-            # chain-of-thought before the final structured answer.
-            request_kwargs["max_output_tokens"] = effective_max_output_tokens
+        # Every provider request carries a configured upper bound. Without it,
+        # some gateways reserve the model's full context-window output budget
+        # and reject an otherwise small request before generation begins.
+        request_kwargs["max_output_tokens"] = effective_max_output_tokens
         if self.checkpoint is not None:
             self.checkpoint.begin(
                 "llm_response",
@@ -1888,6 +1927,7 @@ class PlaidNoxDeepHuntAgent:
                     "timeout_seconds": request_policy["timeout_seconds"],
                     "max_retries": request_policy["max_retries"],
                     "max_output_tokens": effective_max_output_tokens,
+                    "work_identity": checkpoint_work_identity,
                 },
             )
         shape_retries = request_policy["structured_shape_retries"]
@@ -1999,6 +2039,25 @@ class PlaidNoxDeepHuntAgent:
             reason=decision.reason,
         )
         return decision
+
+
+def _checkpoint_work_identity(operation: str, payload: Mapping[str, Any]) -> str:
+    """Identify the semantic work item across prompt/schema revisions."""
+    segment = payload.get("source_segment")
+    if isinstance(segment, Mapping) and segment.get("region_id"):
+        return unit_key(operation, "region", segment["region_id"])
+    region = payload.get("discovery_region")
+    if isinstance(region, Mapping) and region.get("region_id"):
+        return unit_key(operation, "region", region["region_id"])
+    packet = payload.get("candidate_evidence_packet")
+    if isinstance(packet, Mapping) and packet.get("candidate_id"):
+        return unit_key(operation, "candidate", packet["candidate_id"])
+    stable_candidate = {
+        key: payload.get(key)
+        for key in ("rule_id", "path", "start_line", "end_line", "title", "candidate_id")
+        if payload.get(key) is not None
+    }
+    return unit_key(operation, stable_candidate) if stable_candidate else ""
 
 
 def _model_request_policy(runtime: Mapping[str, Any], operation: str) -> dict[str, int | float]:
@@ -2533,6 +2592,7 @@ def _evidence_paths(
             for item in value:
                 walk(item)
 
+    walk(candidate.metadata.get("evidence_packet", {}))
     walk(context_expansions)
     paths.update(_EVIDENCE_PATH.findall(security_context))
     return frozenset(paths)
@@ -3216,20 +3276,33 @@ def _query_budget(runtime: Mapping[str, Any], file_count: int, task_count: int) 
     return max(1, total)
 
 
-def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str, Any]) -> Candidate | None:
+def _candidate_from_ai_item(
+    root: Path,
+    item: dict[str, Any],
+    segment: dict[str, Any],
+    *,
+    allowed_source_windows: list[dict[str, Any]] | None = None,
+) -> Candidate | None:
     """Build a Candidate from a discovery/sweep/chain hypothesis.
 
     Every item surfaced at this stage is an unverified hypothesis, never a verdict: this
     stage identifies open-vocabulary vulnerability classes and gained capabilities, but
     only PlaidNox Deep Hunt independently reviews and can mark a candidate confirmed.
     """
-    if str(item.get("path", "")) != segment["path"]:
-        return None
     start = int(item["start_line"])
     end = int(item["end_line"])
-    if start < int(segment["start_line"]) or end < start or end > int(segment["end_line"]):
+    candidate_path = str(item.get("path", ""))
+    windows = [segment, *(allowed_source_windows or [])]
+    grounded = any(
+        candidate_path == str(window.get("path", ""))
+        and start >= int(window.get("start_line", 1))
+        and end >= start
+        and end <= int(window.get("end_line", 0))
+        for window in windows
+    )
+    if not grounded:
         return None
-    target = (root / str(item["path"])).resolve()
+    target = (root / candidate_path).resolve()
     if root.resolve() not in target.parents or not target.is_file():
         return None
     source_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -3240,6 +3313,7 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
     title = str(item["title"]).strip()
     if not title:
         return None
+    root_cause = {key: str(value) for key, value in dict(item.get("root_cause") or {}).items()}
     snippet = _redact("\n".join(source_lines[start - 1 : end])[:2000])
     return Candidate(
         rule_id=f"plaidnox.ai.{category}",
@@ -3249,7 +3323,7 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
         confidence=float(item["confidence"]),
         message=str(item["message"]),
         evidence=Evidence(
-            path=str(item["path"]),
+            path=candidate_path,
             start_line=start,
             end_line=end,
             snippet=snippet,
@@ -3264,7 +3338,14 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
             "ai_business_impact": str(item["business_impact"]),
             "classification_references": [dict(reference) for reference in item["classification_references"]],
             "evidence_basis": dict(item.get("evidence_basis", {})),
-            "root_cause": {key: str(value) for key, value in dict(item.get("root_cause") or {}).items()},
+            "root_cause": root_cause,
+            "attacker_influence": str(item.get("attacker_influence", "")),
+            "security_control": str(item.get("security_control", "")),
+            "broken_invariant": str(item.get("broken_invariant", "")),
+            "sensitive_effect": str(item.get("sensitive_effect", "")),
+            "gained_capability": str(item.get("gained_capability", "")),
+            "required_context": [str(value) for value in item.get("required_context", [])],
+            "candidate_id": str(item.get("candidate_id", "")),
         },
     )
 

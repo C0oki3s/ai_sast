@@ -89,8 +89,13 @@ immutable source snapshot + codebase/revision + business/security context
   -> knowledge action per task (stored -> broadened -> web)
        -> reuse exact knowledge | retrieve broader knowledge | research current web
   -> Context Compiler selects minimum complete evidence slice
-  -> broad AI-native candidate discovery
-  -> recursive continuation until assigned coverage is complete
+  -> structural DiscoveryRegions with explicit security obligations
+  -> one initial AI discovery review per region
+  -> per-obligation disposition
+       -> terminal | typed Context Broker request
+  -> delta-only continuation only when new evidence was acquired
+  -> canonical candidate/evidence merge by root + control + invariant + capability
+  -> CandidateEvidencePacket
   -> PlaidNox Deep Hunt for every candidate
        -> attacker-controlled source and reachable entry point
        -> source-to-sink/control path
@@ -217,6 +222,14 @@ PostgreSQL database, retry without duplicates, and recover after interruption.
 
 ### Phase 4 — complete AI hunt and evidence lifecycle
 
+- Use obligation-owned structural discovery: one initial review per region,
+  typed dispositions for every obligation, Context Broker expansion as the
+  only continuation trigger, and no continuation without newly acquired
+  evidence. Normal regions receive at most one delta continuation; a second is
+  reserved for a trust-boundary region with a remaining sensitive effect.
+- Merge equivalent root-cause evidence before Deep Hunt and compile a canonical
+  evidence packet containing attacker origins, boundary, invariant, downstream
+  trust branches, effects, gained capabilities, trace, and gaps.
 - Ensure the planner owns every eligible source segment and reachable attack
   surface; incomplete coverage makes the scan incomplete.
 - Route FAST/STANDARD/DEEP to actual LiteLLM model policies rather than metadata.
