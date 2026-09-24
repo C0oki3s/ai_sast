@@ -16,6 +16,9 @@ from plaidnox_sast.redaction import redact
 from . import attempts, context_store, triage
 from .api_models import (
     FindingEvidence,
+    FindingTrace,
+    FindingTraceEdge,
+    FindingTraceNode,
     PolicyAction,
     PromoteBaselineResponse,
     ReviewAttemptStatus,
@@ -24,6 +27,7 @@ from .api_models import (
     ReviewResponse,
     TriageResponse,
     TriageStatus,
+    VulnerableSnippet,
 )
 from .assets import load_json
 from .baseline import FindingBaselineClassification
@@ -79,6 +83,7 @@ class _LeaseHeartbeat:
         while not self._stop.wait(self._heartbeat_seconds):
             with attempts.unit_of_work(self._session_factory, self._tenant_id) as repository:
                 repository.renew(self._review_id, self._lease_owner, self._lease_seconds)
+
 
 _POLICY_ACTIONS = {
     "PASS": PolicyAction.ALLOW,
@@ -275,7 +280,7 @@ class ReviewService:
         actor: str,
         reason: str | None,
     ) -> TriageResponse | None:
-        """Applies one triage command, keyed on the finding rather than this review.
+        """Applies one `!valid`/`!fp`/`!accepted_risk`/`!fixed` command, keyed on the finding rather than this review.
 
         `finding_id` is deliberately not checked against this `review_id`'s
         own persisted `attempt.findings`: `baseline.py`'s
@@ -325,10 +330,24 @@ class ReviewService:
             states = repository.get_states(item.finding_fingerprint for item in classifications)
         policy = evaluate_merge_policy(classifications, coverage_complete=True, triage_states=states)
         action = _POLICY_ACTIONS[policy.decision]
-        counters = {**(attempt.counters or {}), "blocking": policy.blocking_count, "in_triage": policy.in_triage_count}
-        summary = _summary_text(policy.decision, len(attempt.findings), policy.blocking_count, policy.in_triage_count)
+        counters = {
+            **(attempt.counters or {}),
+            "blocking": policy.blocking_count,
+            "in_triage": policy.in_triage_count,
+        }
+        summary = _summary_text(
+            policy.decision,
+            len(attempt.findings),
+            policy.blocking_count,
+            policy.in_triage_count,
+        )
         with attempts.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
-            repository.update_policy(attempt.review_id, action=action.value, summary=summary, counters=counters)
+            repository.update_policy(
+                attempt.review_id,
+                action=action.value,
+                summary=summary,
+                counters=counters,
+            )
         return action, summary
 
     def _record_fix_validations(self, tenant_id: str, review_id: str, result: ReviewResult) -> None:
@@ -341,9 +360,17 @@ class ReviewService:
         with triage.unit_of_work(self.session_factory, tenant_id) as repository:
             for item in result.baseline_classifications:
                 if item.relationship == "RESOLVED":
-                    repository.record_fix_validation(item.finding_fingerprint, review_id, resolved=True)
+                    repository.record_fix_validation(
+                        item.finding_fingerprint,
+                        review_id,
+                        resolved=True,
+                    )
                 elif item.verification_state == "verified":
-                    repository.record_fix_validation(item.finding_fingerprint, review_id, resolved=False)
+                    repository.record_fix_validation(
+                        item.finding_fingerprint,
+                        review_id,
+                        resolved=False,
+                    )
 
     def get_triage(self, review_id: str, finding_id: str) -> TriageStatus | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
@@ -406,6 +433,12 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                 root_cause_start_line=candidate.changed_lines.start,
                 root_cause_end_line=candidate.changed_lines.end,
                 root_cause_changed_in_pr=classification.root_cause_changed_in_review,
+                vulnerable_snippet=_api_vulnerable_snippet(
+                    getattr(verification, "vulnerable_snippet", None)
+                ),
+                evidence_trace=_api_evidence_trace(
+                    getattr(verification, "evidence_trace", None)
+                ),
                 proof_of_concept=None,
                 remediation=redact(verification.remediation.strip()) or None,
                 remediation_invariant=redact(verification.security_invariant.strip()) or None,
@@ -417,12 +450,22 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                 repository_id=request.repository_id,
                 base_revision=request.base_sha,
                 head_revision=request.head_sha,
-                attacker_origin=_evidence_summary(verification.evidence, EvidenceRole.ATTACKER_ORIGIN),
-                security_boundary=_evidence_summary(verification.evidence, EvidenceRole.SECURITY_BOUNDARY),
-                defense_removed_or_bypassed=_evidence_summary(
-                    verification.evidence, EvidenceRole.DEFENSE_REMOVED_OR_BYPASSED
+                attacker_origin=_evidence_summary(
+                    verification.evidence,
+                    EvidenceRole.ATTACKER_ORIGIN,
                 ),
-                downstream_trust=_evidence_summary(verification.evidence, EvidenceRole.DOWNSTREAM_TRUST),
+                security_boundary=_evidence_summary(
+                    verification.evidence,
+                    EvidenceRole.SECURITY_BOUNDARY,
+                ),
+                defense_removed_or_bypassed=_evidence_summary(
+                    verification.evidence,
+                    EvidenceRole.DEFENSE_REMOVED_OR_BYPASSED,
+                ),
+                downstream_trust=_evidence_summary(
+                    verification.evidence,
+                    EvidenceRole.DOWNSTREAM_TRUST,
+                ),
                 sensitive_effects=[
                     redact(item.summary.strip())
                     for item in verification.evidence
@@ -450,13 +493,19 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
     incomplete_reason = None
     if action is PolicyAction.INCOMPLETE:
         reasons = (*result.coverage_gaps, *result.policy.reasons)
-        incomplete_reason = " ".join(dict.fromkeys(value.strip() for value in reasons if value.strip())) or result.detail
+        incomplete_reason = (
+            " ".join(dict.fromkeys(value.strip() for value in reasons if value.strip()))
+            or result.detail
+        )
     return ReviewResponse(
         review_id=_review_id(request),
         head_sha=request.head_sha,
         action=action,
         summary=_summary_text(
-            result.policy.decision, len(findings), result.counters.blocking, result.counters.in_triage
+            result.policy.decision,
+            len(findings),
+            result.counters.blocking,
+            result.counters.in_triage,
         ),
         findings=findings,
         incomplete_reason=incomplete_reason,
@@ -477,7 +526,66 @@ def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
 
 def _capabilities(candidate: object, verification: object) -> list[str]:
     raw = (verification.gained_capability, candidate.provisional_attacker_capability)
-    return list(dict.fromkeys(redact(value.strip()) for value in raw if value and value.strip()))
+    return list(
+        dict.fromkeys(redact(value.strip()) for value in raw if value and value.strip())
+    )
+
+
+def _api_vulnerable_snippet(value: object) -> VulnerableSnippet | None:
+    if value is None:
+        return None
+    try:
+        return VulnerableSnippet(
+            path=str(value.path),
+            start_line=int(value.start_line),
+            end_line=int(value.end_line),
+            content=redact(str(value.content)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _api_evidence_trace(value: object) -> FindingTrace | None:
+    if value is None:
+        return None
+    try:
+        nodes = [
+            FindingTraceNode(
+                node_id=str(item.node_id),
+                role=getattr(item.role, "value", str(item.role)),
+                path=str(item.path),
+                start_line=item.start_line,
+                end_line=item.end_line,
+                label=redact(str(item.label)),
+                summary=redact(str(item.summary)),
+            )
+            for item in value.nodes
+        ]
+        edges = [
+            FindingTraceEdge(
+                source=str(item.source),
+                target=str(item.target),
+                relation=str(item.relation),
+            )
+            for item in value.edges
+        ]
+        return FindingTrace(
+            trace_type=str(getattr(value, "trace_type", "taint_and_trust")),
+            nodes=nodes,
+            edges=edges,
+            entry_nodes=[str(item) for item in value.entry_nodes],
+            terminal_nodes=[str(item) for item in value.terminal_nodes],
+            attack_path=redact(str(value.attack_path)),
+            gained_capability=redact(str(value.gained_capability)),
+            complete=bool(getattr(value, "complete", True)),
+            evidence_gaps=[
+                redact(str(item))
+                for item in getattr(value, "evidence_gaps", ())
+                if str(item).strip()
+            ],
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _review_id(request: ReviewRequest) -> str:
