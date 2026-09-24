@@ -174,6 +174,9 @@ class SastDeepHuntVerifier:
                     expansion,
                     review.evidence_locations,
                 )
+                combined_evidence_gaps = tuple(
+                    dict.fromkeys((*(review.evidence_gaps or ()), *expansion.unresolved_gaps))
+                )
                 results.append(
                     CandidateVerification(
                         candidate_id=hypothesis.candidate_id,
@@ -194,7 +197,7 @@ class SastDeepHuntVerifier:
                         classification_references=tuple(
                             dict(item) for item in review.classification_references
                         ),
-                        evidence_gaps=(*(review.evidence_gaps or ()), *expansion.unresolved_gaps),
+                        evidence_gaps=combined_evidence_gaps,
                         route=route,
                         evidence=review_evidence,
                         context_expansion=expansion,
@@ -206,6 +209,7 @@ class SastDeepHuntVerifier:
                             review_evidence,
                             attack_path=review.attack_path,
                             gained_capability=review.gained_capability,
+                            evidence_gaps=combined_evidence_gaps,
                         ),
                     )
                 )
