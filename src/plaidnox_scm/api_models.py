@@ -55,6 +55,57 @@ class FindingEvidence(BaseModel):
     summary: str
 
 
+class VulnerableSnippet(BaseModel):
+    """Redacted root-cause code range captured from the reviewed head revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    start_line: int = Field(gt=0)
+    end_line: int = Field(gt=0)
+    content: str
+
+
+class FindingTraceNode(BaseModel):
+    """One machine-validated evidence node in a taint/trust trace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    role: str
+    path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    label: str
+    summary: str
+
+
+class FindingTraceEdge(BaseModel):
+    """Directed relationship between two verified trace nodes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    target: str
+    relation: str
+
+
+class FindingTrace(BaseModel):
+    """Provider-neutral branching evidence graph for one verified finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trace_type: str = "taint_and_trust"
+    nodes: list[FindingTraceNode] = Field(default_factory=list)
+    edges: list[FindingTraceEdge] = Field(default_factory=list)
+    entry_nodes: list[str] = Field(default_factory=list)
+    terminal_nodes: list[str] = Field(default_factory=list)
+    attack_path: str
+    gained_capability: str
+    complete: bool = True
+    evidence_gaps: list[str] = Field(default_factory=list)
+
+
 class ReviewFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,6 +121,8 @@ class ReviewFinding(BaseModel):
     root_cause_start_line: int = Field(gt=0)
     root_cause_end_line: int | None = Field(default=None, gt=0)
     root_cause_changed_in_pr: bool
+    vulnerable_snippet: VulnerableSnippet | None = None
+    evidence_trace: FindingTrace | None = None
     proof_of_concept: str | None = None
     remediation: str | None = None
     remediation_invariant: str | None = None
