@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class PolicyAction(StrEnum):
@@ -144,6 +144,18 @@ class ReviewFinding(BaseModel):
     context_facts: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)
     verified_at: datetime
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        # Existing bot versions expect the pre-trace schema. Omit only the new
+        # optional fields when unavailable, while emitting them for verified
+        # findings that actually carry a snippet/trace.
+        if self.vulnerable_snippet is None:
+            data.pop("vulnerable_snippet", None)
+        if self.evidence_trace is None:
+            data.pop("evidence_trace", None)
+        return data
 
 
 class ReviewResponse(BaseModel):
