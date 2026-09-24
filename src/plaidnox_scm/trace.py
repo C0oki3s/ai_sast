@@ -35,17 +35,20 @@ class EvidenceTraceNode:
 class EvidenceTraceEdge:
     source: str
     target: str
-    relation: str = "enables"
+    relation: str = "supports_transition"
 
 
 @dataclass(frozen=True, slots=True)
 class EvidenceTrace:
+    trace_type: str
     nodes: tuple[EvidenceTraceNode, ...]
     edges: tuple[EvidenceTraceEdge, ...]
     entry_nodes: tuple[str, ...]
     terminal_nodes: tuple[str, ...]
     attack_path: str
     gained_capability: str
+    complete: bool
+    evidence_gaps: tuple[str, ...]
 
 
 _ROLE_LAYER = {
@@ -83,14 +86,18 @@ def build_evidence_trace(
     *,
     attack_path: str,
     gained_capability: str,
+    evidence_gaps: tuple[str, ...] = (),
 ) -> EvidenceTrace | None:
-    """Build a small branching graph from verified semantic evidence roles.
+    """Build a small branching graph from independently verified evidence roles.
 
-    The trace is not a guessed taint graph: it only links evidence that the
-    verifier already returned and that the evidence-role adapter accepted.
-    Multiple downstream-trust or sensitive-effect nodes naturally branch.
+    The graph is deliberately conservative. Nodes come only from evidence the
+    verifier/context broker already accepted. Edges express an evidence-backed
+    semantic transition between adjacent role layers; they do not claim a
+    byte-level data-flow edge that static analysis has not proved. Multiple
+    downstream-trust or sensitive-effect nodes naturally render as branches.
     """
 
+    del candidate  # candidate identity is already represented by ROOT_CAUSE evidence
     nodes: list[EvidenceTraceNode] = []
     seen: set[tuple[str, str, int | None, int | None, str]] = set()
     for item in evidence:
@@ -119,6 +126,9 @@ def build_evidence_trace(
     for node in nodes:
         by_layer.setdefault(_ROLE_LAYER[node.role], []).append(node)
     populated_layers = sorted(by_layer)
+
+    # Connect only adjacent *populated* semantic layers. This gives the UI a
+    # useful path while avoiding invented intermediate source-code hops.
     edges: list[EvidenceTraceEdge] = []
     for index in range(len(populated_layers) - 1):
         sources = by_layer[populated_layers[index]]
@@ -135,13 +145,24 @@ def build_evidence_trace(
 
     first_layer = by_layer[populated_layers[0]]
     last_layer = by_layer[populated_layers[-1]]
+    gaps = tuple(dict.fromkeys(redact(value.strip()) for value in evidence_gaps if value.strip()))
+    complete = not gaps and bool(
+        any(node.role == EvidenceRole.ROOT_CAUSE_CHANGED_CODE for node in nodes)
+        and any(
+            node.role in {EvidenceRole.DOWNSTREAM_TRUST, EvidenceRole.SENSITIVE_EFFECT}
+            for node in nodes
+        )
+    )
     return EvidenceTrace(
+        trace_type="taint_and_trust",
         nodes=tuple(nodes),
         edges=tuple(edges),
         entry_nodes=tuple(item.node_id for item in first_layer),
         terminal_nodes=tuple(item.node_id for item in last_layer),
         attack_path=redact(attack_path.strip()),
         gained_capability=redact(gained_capability.strip()),
+        complete=complete,
+        evidence_gaps=gaps,
     )
 
 
