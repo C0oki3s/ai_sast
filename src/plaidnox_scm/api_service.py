@@ -16,6 +16,8 @@ from plaidnox_sast.redaction import redact
 from . import attempts, context_store, triage
 from .api_models import (
     FindingEvidence,
+    FindingReproduction,
+    FindingRootCause,
     FindingTrace,
     FindingTraceEdge,
     FindingTraceNode,
@@ -199,29 +201,12 @@ class ReviewService:
         if completed:
             self._record_fix_validations(tenant_id, review_id, result)
         if not completed:
-            # Another worker's reclaim already won the lease -- e.g. this one
-            # stalled past its lease and a duplicate delivery took over. That
-            # worker's result is the one of record; this result must not be
-            # published, so surface it as the same 409 a live conflict gets.
             raise attempts.ReviewAttemptConflictError(
                 f"review {review_id} lease was lost before completion"
             )
         return response
 
     def promote_to_baseline(self, review_id: str, merge_revision: str) -> PromoteBaselineResponse | None:
-        """Promotes a merged review's still-open findings into the persistent baseline.
-
-        Called once the reviewed pull/merge request has actually merged (a
-        provider webhook adapter reacting to a "merged" event), so a later
-        review with `base_sha == merge_revision` sees these findings as
-        already `existing` instead of re-flagging them as newly
-        `introduced`. `attempt.findings` already excludes anything
-        `review.py`'s baseline classification resolved to `RESOLVED` --
-        `_response()` only ever appends `verification_state == "verified"`
-        findings -- so nothing here needs to re-filter by relationship or
-        carry resolved findings forward.
-        """
-
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
             attempt = repository.get(review_id)
         if attempt is None:
@@ -280,18 +265,6 @@ class ReviewService:
         actor: str,
         reason: str | None,
     ) -> TriageResponse | None:
-        """Applies one `!valid`/`!fp`/`!accepted_risk`/`!fixed` command, keyed on the finding rather than this review.
-
-        `finding_id` is deliberately not checked against this `review_id`'s
-        own persisted `attempt.findings`: `baseline.py`'s
-        `classify_against_baseline()` can leave a still-open finding at
-        `verification_state == "baseline"` when a review's coverage did not
-        happen to re-verify it, and `_response()` only ever appends
-        `"verified"` findings to `attempt.findings` -- so a real, previously
-        established finding can legitimately be absent from one review's
-        list while still needing to be triageable against it.
-        """
-
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
             attempt = repository.get(review_id)
         if attempt is None:
@@ -314,15 +287,6 @@ class ReviewService:
         )
 
     def _reevaluate_policy(self, attempt: attempts.ReviewAttempt) -> tuple[PolicyAction, str] | None:
-        """Recomputes a completed review's merge action against current triage states.
-
-        Only the persisted verified findings can carry a non-PASS decision
-        (baseline-only and unverified classifications always PASS), so the
-        policy over `attempt.findings` reproduces the original decision
-        exactly, now with triage applied. An INCOMPLETE review is left alone:
-        triage never substitutes for missing coverage.
-        """
-
         if attempt.state != "completed" or attempt.action in (None, PolicyAction.INCOMPLETE.value):
             return None
         classifications = tuple(_classification_from_finding(item) for item in attempt.findings)
@@ -351,12 +315,6 @@ class ReviewService:
         return action, summary
 
     def _record_fix_validations(self, tenant_id: str, review_id: str, result: ReviewResult) -> None:
-        """A later review's independent classification is the only fix validation.
-
-        `RESOLVED` proves the root cause is gone at this revision; a finding
-        re-verified while `fix_pending` proves the claimed fix did not land.
-        """
-
         with triage.unit_of_work(self.session_factory, tenant_id) as repository:
             for item in result.baseline_classifications:
                 if item.relationship == "RESOLVED":
@@ -419,6 +377,13 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
         verification = verification_by_id.get(classification.candidate_id)
         if candidate is None or verification is None:
             continue
+
+        proof_plan = redact(verification.proof_plan.strip()) or None
+        regression_test = redact(verification.regression_test.strip()) or None
+        security_invariant = redact(verification.security_invariant.strip()) or None
+        gained_capability = redact(verification.gained_capability.strip()) or None
+        attack_path = redact(verification.attack_path.strip()) or None
+
         findings.append(
             ReviewFinding(
                 finding_id=classification.finding_fingerprint,
@@ -433,17 +398,35 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                 root_cause_start_line=candidate.changed_lines.start,
                 root_cause_end_line=candidate.changed_lines.end,
                 root_cause_changed_in_pr=classification.root_cause_changed_in_review,
+                root_cause=FindingRootCause(
+                    path=classification.root_cause_path,
+                    symbol=classification.root_cause_symbol,
+                    start_line=candidate.changed_lines.start,
+                    end_line=candidate.changed_lines.end,
+                    changed_in_pr=classification.root_cause_changed_in_review,
+                ),
                 vulnerable_snippet=_api_vulnerable_snippet(
                     getattr(verification, "vulnerable_snippet", None)
                 ),
                 evidence_trace=_api_evidence_trace(
                     getattr(verification, "evidence_trace", None)
                 ),
+                attack_path=attack_path,
+                security_invariant=security_invariant,
+                gained_capability=gained_capability,
+                reproduction=(
+                    FindingReproduction(
+                        proof_plan=proof_plan,
+                        regression_test_expectation=regression_test,
+                    )
+                    if proof_plan or regression_test
+                    else None
+                ),
                 proof_of_concept=None,
                 remediation=redact(verification.remediation.strip()) or None,
-                remediation_invariant=redact(verification.security_invariant.strip()) or None,
-                proof_plan=redact(verification.proof_plan.strip()) or None,
-                regression_test_expectation=redact(verification.regression_test.strip()) or None,
+                remediation_invariant=security_invariant,
+                proof_plan=proof_plan,
+                regression_test_expectation=regression_test,
                 category=classification.vulnerability_class,
                 baseline_relationship=classification.relationship.lower(),
                 tenant_id=_tenant_id(request),
@@ -535,11 +518,13 @@ def _api_vulnerable_snippet(value: object) -> VulnerableSnippet | None:
     if value is None:
         return None
     try:
+        code = redact(str(value.content))
         return VulnerableSnippet(
             path=str(value.path),
             start_line=int(value.start_line),
             end_line=int(value.end_line),
-            content=redact(str(value.content)),
+            code=code,
+            content=code,
         )
     except (AttributeError, TypeError, ValueError):
         return None
@@ -553,11 +538,15 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
             FindingTraceNode(
                 node_id=str(item.node_id),
                 role=getattr(item.role, "value", str(item.role)),
+                kind=str(item.kind),
                 path=str(item.path),
                 start_line=item.start_line,
                 end_line=item.end_line,
+                symbol=redact(str(item.symbol)),
+                expression=redact(str(item.expression)),
                 label=redact(str(item.label)),
                 summary=redact(str(item.summary)),
+                provenance=redact(str(item.provenance)),
             )
             for item in value.nodes
         ]
@@ -566,11 +555,14 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
                 source=str(item.source),
                 target=str(item.target),
                 relation=str(item.relation),
+                via=redact(str(item.via)),
             )
             for item in value.edges
         ]
         return FindingTrace(
             trace_type=str(getattr(value, "trace_type", "taint_and_trust")),
+            step_count=int(getattr(value, "step_count", len(nodes))),
+            file_count=int(getattr(value, "file_count", len({item.path for item in nodes}))),
             nodes=nodes,
             edges=edges,
             entry_nodes=[str(item) for item in value.entry_nodes],
@@ -589,10 +581,6 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
 
 
 def _review_id(request: ReviewRequest) -> str:
-    # `base_sha` is part of the identity, not just `head_sha`: if the target
-    # branch advances while the same PR head is still open, `base...head`
-    # names a different diff and must get its own review, not a replay of
-    # the review completed against the old base.
     identity = ":".join(
         (
             request.provider,
