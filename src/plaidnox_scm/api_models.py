@@ -39,12 +39,6 @@ class ReviewRequest(BaseModel):
 
 
 class FindingEvidence(BaseModel):
-    """One role-tagged piece of evidence backing a verified finding.
-
-    `role` mirrors `plaidnox_scm.evidence.EvidenceRole` as a plain string so
-    this HTTP contract does not depend on that internal enum type.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
     role: str
@@ -53,6 +47,18 @@ class FindingEvidence(BaseModel):
     start_line: int | None = None
     end_line: int | None = None
     summary: str
+
+
+class FindingRootCause(BaseModel):
+    """Provider-neutral root-cause anchor on the immutable reviewed revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    symbol: str
+    start_line: int = Field(gt=0)
+    end_line: int | None = Field(default=None, gt=0)
+    changed_in_pr: bool
 
 
 class VulnerableSnippet(BaseModel):
@@ -63,39 +69,48 @@ class VulnerableSnippet(BaseModel):
     path: str
     start_line: int = Field(gt=0)
     end_line: int = Field(gt=0)
-    content: str
+    code: str
+    # Kept for one compatibility window with the first trace-contract draft.
+    content: str | None = None
 
 
 class FindingTraceNode(BaseModel):
-    """One machine-validated evidence node in a taint/trust trace."""
+    """One machine-validated source/propagation/boundary/sink node."""
 
     model_config = ConfigDict(extra="forbid")
 
     node_id: str
     role: str
+    kind: str
     path: str
     start_line: int | None = None
     end_line: int | None = None
+    symbol: str
+    expression: str
     label: str
     summary: str
+    provenance: str
 
 
 class FindingTraceEdge(BaseModel):
-    """Directed relationship between two verified trace nodes."""
+    """One machine-supported relationship between verified trace nodes."""
 
     model_config = ConfigDict(extra="forbid")
 
     source: str
     target: str
     relation: str
+    via: str
 
 
 class FindingTrace(BaseModel):
-    """Provider-neutral branching evidence graph for one verified finding."""
+    """Provider-neutral branching taint + trust graph for one verified finding."""
 
     model_config = ConfigDict(extra="forbid")
 
     trace_type: str = "taint_and_trust"
+    step_count: int = Field(ge=0)
+    file_count: int = Field(ge=0)
     nodes: list[FindingTraceNode] = Field(default_factory=list)
     edges: list[FindingTraceEdge] = Field(default_factory=list)
     entry_nodes: list[str] = Field(default_factory=list)
@@ -104,6 +119,15 @@ class FindingTrace(BaseModel):
     gained_capability: str
     complete: bool = True
     evidence_gaps: list[str] = Field(default_factory=list)
+
+
+class FindingReproduction(BaseModel):
+    """Verifier-produced proof/remediation expectations; never an invented exploit recipe."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proof_plan: str | None = None
+    regression_test_expectation: str | None = None
 
 
 class ReviewFinding(BaseModel):
@@ -116,13 +140,23 @@ class ReviewFinding(BaseModel):
     confidence: float = Field(ge=0, le=1)
     description: str
     impact: str | None = None
+
+    # Flat fields stay for current bot compatibility. `root_cause` is the
+    # canonical grouped representation new consumers should prefer.
     root_cause_path: str
     root_cause_symbol: str
     root_cause_start_line: int = Field(gt=0)
     root_cause_end_line: int | None = Field(default=None, gt=0)
     root_cause_changed_in_pr: bool
+    root_cause: FindingRootCause | None = None
+
     vulnerable_snippet: VulnerableSnippet | None = None
     evidence_trace: FindingTrace | None = None
+    attack_path: str | None = None
+    security_invariant: str | None = None
+    gained_capability: str | None = None
+    reproduction: FindingReproduction | None = None
+
     proof_of_concept: str | None = None
     remediation: str | None = None
     remediation_invariant: str | None = None
@@ -148,13 +182,19 @@ class ReviewFinding(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        # Existing bot versions expect the pre-trace schema. Omit only the new
-        # optional fields when unavailable, while emitting them for verified
-        # findings that actually carry a snippet/trace.
-        if self.vulnerable_snippet is None:
-            data.pop("vulnerable_snippet", None)
-        if self.evidence_trace is None:
-            data.pop("evidence_trace", None)
+        # Old persisted findings and old bot versions remain valid. New grouped
+        # fields are emitted only when the verifier actually produced them.
+        for field_name in (
+            "root_cause",
+            "vulnerable_snippet",
+            "evidence_trace",
+            "attack_path",
+            "security_invariant",
+            "gained_capability",
+            "reproduction",
+        ):
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 
@@ -171,12 +211,6 @@ class ReviewResponse(BaseModel):
 
 
 class PromoteBaselineRequest(BaseModel):
-    """Promotes a completed review's still-open findings into the persistent
-    baseline once its pull/merge request has actually merged, so a later
-    review against the new base revision sees them as already `existing`
-    instead of re-flagging them as newly `introduced`.
-    """
-
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     merge_revision: str = Field(min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
@@ -192,11 +226,6 @@ class PromoteBaselineResponse(BaseModel):
 
 
 class TriageRequest(BaseModel):
-    """One `!valid`/`!fp`/`!accepted_risk`/`!fixed` command, already parsed and
-    already authorized by the provider bot -- this contract carries only the
-    resulting command + actor identity, not the raw comment or webhook.
-    """
-
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     command: str = Field(pattern=r"^(valid|fp|accepted_risk|fixed)$")
@@ -215,8 +244,6 @@ class TriageResponse(BaseModel):
     reason: str | None = None
     applied: bool
     updated_at: datetime
-    # The owning review's merge action re-evaluated with this triage applied;
-    # absent when the review has not completed or ended INCOMPLETE.
     review_action: PolicyAction | None = None
     review_summary: str | None = None
 
@@ -233,8 +260,6 @@ class TriageStatus(BaseModel):
 
 
 class ReviewAttemptStatus(BaseModel):
-    """Live status/counters for one review attempt (`GET /v1/reviews/{review_id}`)."""
-
     model_config = ConfigDict(extra="forbid")
 
     review_id: str
