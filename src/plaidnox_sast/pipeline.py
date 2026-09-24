@@ -680,7 +680,19 @@ class SastPipeline:
                 "checkpoint_units_saved": checkpoint.writes if checkpoint is not None else 0,
                 "checkpoint_units_discarded_stale": checkpoint.discarded if checkpoint is not None else 0,
                 "checkpoint_units_pending": (
-                    checkpoint.status_counts().get("pending", 0) if checkpoint is not None else 0
+                    sum(
+                        count
+                        for status, count in checkpoint.status_counts().items()
+                        if status != "completed"
+                    )
+                    if checkpoint is not None
+                    else 0
+                ),
+                "checkpoint_units_failed_retryable": (
+                    checkpoint.status_counts().get("failed_retryable", 0) if checkpoint is not None else 0
+                ),
+                "checkpoint_units_failed_final": (
+                    checkpoint.status_counts().get("failed_final", 0) if checkpoint is not None else 0
                 ),
                 "checkpoint_units_completed": (
                     checkpoint.status_counts().get("completed", 0) if checkpoint is not None else 0

@@ -1,0 +1,1 @@
+ALTER TABLE checkpoint_units ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0

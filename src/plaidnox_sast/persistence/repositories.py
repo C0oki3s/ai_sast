@@ -1854,8 +1854,9 @@ def security_ir_inputs(
         source_files.append(SourceFileInput(file_ir.path, file_ir.language, file_ir.content_hash, size_bytes))
         lines = text.splitlines()
         entries = sorted(symbols_by_path.get(file_ir.path, []), key=lambda item: item.line)
-        if not entries:
-            entries = [Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file")]
+        if not any(entry.kind != "route" for entry in entries):
+            # Routes alone leave module-level code unowned; keep the file symbol too.
+            entries = [*entries, Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file")]
         identity_counts: dict[tuple[str, str], int] = {}
         for entry in entries:
             name = entry.qualified_name or entry.name

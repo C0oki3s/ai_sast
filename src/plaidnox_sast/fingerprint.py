@@ -65,6 +65,33 @@ def _classification_ids(candidate: Candidate) -> frozenset[str]:
     )
 
 
+def root_cause_key(candidate: Candidate) -> str:
+    """Model-declared identity: where the control lives and which control is broken.
+
+    Empty when the model did not name both, so callers fall back to location heuristics.
+    """
+    root = candidate.metadata.get("root_cause") or {}
+    symbol = _normalize(str(root.get("symbol", "")))
+    control = re.sub(r"[^a-z0-9]+", "-", str(root.get("security_control", "")).lower()).strip("-")
+    if not symbol or not control:
+        return ""
+    return f"{_normalize(candidate.evidence.path)}|{symbol}|{control}"
+
+
+def absorb(kept: Candidate, duplicate: Candidate) -> None:
+    """Fold a repeat report into the candidate already kept instead of dropping its evidence."""
+    kept.metadata["duplicate_reports"] = int(kept.metadata.get("duplicate_reports", 0)) + 1
+    support = kept.metadata.setdefault("supporting_evidence", [])
+    entry = {
+        "path": duplicate.evidence.path,
+        "start_line": duplicate.evidence.start_line,
+        "end_line": duplicate.evidence.end_line,
+        "attack_path": duplicate.evidence.graph_path[-1] if duplicate.evidence.graph_path else "",
+    }
+    if len(support) < 5 and entry not in support:
+        support.append(entry)
+
+
 def is_same_issue(first: Candidate, second: Candidate, nearby_lines: int = _NEARBY_LINES) -> bool:
     """Whether two candidates describe one root cause at one place in the code.
 
@@ -78,6 +105,9 @@ def is_same_issue(first: Candidate, second: Candidate, nearby_lines: int = _NEAR
     a, b = first.evidence, second.evidence
     if a.path != b.path:
         return False
+    first_key = root_cause_key(first)
+    if first_key and first_key == root_cause_key(second):
+        return True
     shared_ids = _classification_ids(first) & _classification_ids(second)
     shared_words = _issue_tokens(first) & _issue_tokens(second)
     if abs(a.start_line - b.start_line) <= nearby_lines:
@@ -104,7 +134,7 @@ class CandidateIndex:
             kept = self._kept.setdefault(candidate.evidence.path, [])
             for existing in kept:
                 if is_same_issue(existing, candidate, self._nearby_lines):
-                    existing.metadata["duplicate_reports"] = int(existing.metadata.get("duplicate_reports", 0)) + 1
+                    absorb(existing, candidate)
                     return False
             kept.append(candidate)
             return True
@@ -123,7 +153,7 @@ def deduplicate(repository: str, candidates: list[Candidate]) -> tuple[list[Cand
         if match is None:
             clusters.append(candidate)
         else:
-            match.metadata["duplicate_reports"] = int(match.metadata.get("duplicate_reports", 0)) + 1
+            absorb(match, candidate)
     order = {id(candidate): index for index, candidate in enumerate(unique.values())}
     clusters.sort(key=lambda item: order[id(item)])
     return clusters, len(candidates) - len(clusters)

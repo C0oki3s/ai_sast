@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-24.1",
+  "version": "2026-09-24.2",
   "operations": {
     "recon_search_plan": {
       "system": "operations/recon_search_plan/system.md",

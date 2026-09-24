@@ -60,6 +60,11 @@ from .redaction import redact as _redact
 from .redaction import redact_payload
 
 
+_TRANSIENT_ERROR_NAMES = frozenset(
+    {"RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError"}
+)
+
+
 class AIConfigurationError(AIStageError):
     pass
 
@@ -1085,6 +1090,7 @@ class PlaidNoxDeepHuntAgent:
         runtime = load_json("runtime/agent.json")
         queries = self._create_search_plan(context, plan)
         search_errors: list[RipgrepQueryError] = []
+        region_stats: dict[str, int] = {}
         segments = _search_segments(
             root,
             queries,
@@ -1094,7 +1100,9 @@ class PlaidNoxDeepHuntAgent:
             self.max_file_bytes,
             include_paths=set(context.analysis_scope_paths) or None,
             error_sink=search_errors.append,
+            stats=region_stats,
         )
+        self._emit("discovery_regions_planned", **region_stats)
         self._record_search_query_errors("candidate_discovery", context, search_errors)
         if not segments:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
@@ -1106,7 +1114,12 @@ class PlaidNoxDeepHuntAgent:
         def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], list[Exception]]:
             segment_candidates: list[Candidate] = []
             errors: list[Exception] = []
-            checkpoint_key = unit_key("discovery", segment)
+            # Identity is the code region itself; task/query ids are provenance and
+            # must not force a re-review of unchanged code.
+            checkpoint_key = unit_key(
+                "discovery-v2",
+                {key: segment[key] for key in ("path", "start_line", "end_line", "content")},
+            )
             if self.checkpoint is not None:
                 saved = self.checkpoint.get("discovery", checkpoint_key)
                 if saved is not None:
@@ -1148,9 +1161,17 @@ class PlaidNoxDeepHuntAgent:
                         new_candidates += 1
                     if bool(payload["coverage_complete"]):
                         break
+                    if not new_candidates and not segment_candidates:
+                        # Nothing found on the first pass: a second pass over the same
+                        # source is the duplicated call, so treat the region as covered.
+                        self._emit("discovery_continuation_skipped", path=segment["path"], round=_continuation)
+                        break
                     if _continuation > 0 and not new_candidates:
                         # A continuation that only repeats known candidates is not
                         # widening coverage; stop paying to resend the segment.
+                        self._emit("discovery_continuation_exhausted", path=segment["path"], round=_continuation)
+                        break
+                    if str(payload["next_focus"]) == next_focus:
                         self._emit("discovery_continuation_exhausted", path=segment["path"], round=_continuation)
                         break
                     next_focus = str(payload["next_focus"])
@@ -1538,11 +1559,17 @@ class PlaidNoxDeepHuntAgent:
             for task in plan.tasks
             for i, obligation in enumerate(task.coverage_obligations)
         ]
+        runtime = load_json("runtime/code_intelligence.json")
+        query_budget = _query_budget(runtime, len(context.analysis_scope_paths), len(plan.tasks))
         request = {
             "repository_context": _compact_repository_context(context, ""),
             "hunt_plan": {"plan_id": plan.plan_id, "strategy": plan.strategy, "tasks": compact_tasks},
             "verified_roots": verified_roots or [],
             "coverage_obligation_refs": obligation_index,
+            "query_budget": {
+                "maximum_queries": query_budget,
+                "guidance": "Share one query across tasks (task_ids may list several) instead of repeating it.",
+            },
         }
         response = self._structured_response(
             "plaidnox_search_query_plan",
@@ -1568,13 +1595,13 @@ class PlaidNoxDeepHuntAgent:
         missing_refs = all_obligation_refs - covered_refs
         if missing_refs:
             raise AIResponseError("AI search plan did not cover every coverage obligation")
-        runtime = load_json("runtime/code_intelligence.json")
-        maximum = int(runtime["maximum_dynamic_queries_per_task"]) * len(plan.tasks)
+        maximum = int(query_budget * float(runtime["query_budget_enforcement_factor"]))
         if len(queries) > maximum:
             raise AIResponseError("AI search plan exceeded the configured query limit")
         self._emit(
             "search_plan_generated",
             queries=len(queries),
+            query_budget=query_budget,
             tasks=len(task_ids),
             variant_sweep=bool(verified_roots),
         )
@@ -1707,6 +1734,32 @@ class PlaidNoxDeepHuntAgent:
         if model_tier is None:
             return self.model
         return self.model_by_tier.get(model_tier.value, self.model)
+
+    def _create_with_rate_limit_wait(self, request_kwargs: dict[str, Any], agent_runtime: Mapping[str, Any]) -> Any:
+        """Call the model, waiting out rate limits and dropped connections.
+
+        Provider rate limits (TPM) clear within a minute, so the request waits
+        with exponential backoff rather than failing the whole segment.
+        """
+        max_waits = int(agent_runtime["rate_limit_max_waits"])
+        base = float(agent_runtime["rate_limit_base_wait_seconds"])
+        ceiling = float(agent_runtime["rate_limit_max_wait_seconds"])
+        for waited in range(max_waits + 1):
+            try:
+                return self.client.responses.create(**request_kwargs)
+            except Exception as exc:
+                if waited == max_waits or type(exc).__name__ not in _TRANSIENT_ERROR_NAMES:
+                    raise
+                wait = min(ceiling, base * (2**waited))
+                self._emit(
+                    "model_request_rate_limited",
+                    operation=str(request_kwargs["model"]),
+                    error_type=type(exc).__name__,
+                    wait_seconds=wait,
+                    wait_number=waited + 1,
+                )
+                time.sleep(wait)
+        raise AssertionError("unreachable")
 
     def _structured_response(
         self,
@@ -1855,7 +1908,7 @@ class PlaidNoxDeepHuntAgent:
                 max_retries=request_policy["max_retries"],
             )
             try:
-                response = self.client.responses.create(**request_kwargs)
+                response = self._create_with_rate_limit_wait(request_kwargs, agent_runtime)
             except BaseException as exc:
                 self.model_budget.cancel(reservation)
                 if self.checkpoint is not None:
@@ -2527,6 +2580,18 @@ def _validate_patch_proposal(root: Path, proposal: PatchProposal) -> None:
             raise AIResponseError("AI patch proposal referenced a file outside the supplied repository")
 
 
+_GENERATED_NAMES = frozenset(
+    {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json", "composer.lock",
+     "poetry.lock", "pipfile.lock", "cargo.lock", "gemfile.lock", "go.sum", "uv.lock"}
+)
+
+
+def _is_generated_path(path: Path) -> bool:
+    """Lockfiles and minified bundles carry no reviewable application logic."""
+    name = path.name.lower()
+    return name in _GENERATED_NAMES or name.endswith((".min.js", ".min.css", ".map"))
+
+
 def _is_sensitive_path(path: Path) -> bool:
     name = path.name.lower()
     return name.startswith(".env") or any(term in name for term in ("credential", "secret", "id_rsa", "service-account"))
@@ -2615,6 +2680,7 @@ def _execute_recon_search_plan(
         path.relative_to(root).as_posix()
         for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes)
         if not _is_sensitive_path(path)
+        and not _is_generated_path(path)
         and (include_paths is None or path.relative_to(root).as_posix() in include_paths)
     }
     discovery = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
@@ -2698,7 +2764,7 @@ def _source_segments(
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     for path in source_files(root, exclude=exclude, max_file_bytes=max_file_bytes):
-        if _is_sensitive_path(path):
+        if _is_sensitive_path(path) or _is_generated_path(path):
             continue
         relative = path.relative_to(root).as_posix()
         if include_paths is not None and relative not in include_paths:
@@ -2732,8 +2798,13 @@ def _search_segments(
     max_file_bytes: int | None,
     include_paths: set[str] | None = None,
     error_sink: Callable[[RipgrepQueryError], None] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run AI-created rg queries and expand hits with Tree-sitter Security IR."""
+    """Run AI-created rg queries and expand hits with Tree-sitter Security IR.
+
+    Hits become overlapping windows; windows that overlap or sit close together
+    are merged into one region so the same code is reviewed once for every task.
+    """
 
     if plan is None:
         return []
@@ -2746,7 +2817,18 @@ def _search_segments(
     rg = RipgrepDiscovery(root, exclude=exclude or [], max_file_bytes=max_file_bytes)
     hits_with_tasks: list[tuple[SearchHit, set[str]]] = []
     tasks_with_hits: set[str] = set()
+    canonical: dict[tuple[tuple[str, ...], tuple[str, ...]], dict[str, Any]] = {}
     for query in queries:
+        identity = (
+            tuple(sorted({str(item).strip().lower() for item in query["search_terms"]})),
+            tuple(sorted({str(item) for item in query["include_globs"]})),
+        )
+        merged = canonical.setdefault(identity, {**query, "task_ids": []})
+        merged["task_ids"] = sorted({*map(str, merged["task_ids"]), *map(str, query["task_ids"])})
+    if stats is not None:
+        stats["queries_raw"] = len(queries)
+        stats["queries_unique"] = len(canonical)
+    for query in canonical.values():
         task_ids = {str(item) for item in query["task_ids"]}
         try:
             hits = rg.search_literals(
@@ -2765,6 +2847,7 @@ def _search_segments(
                 tasks_with_hits.update(task_ids)
 
     runtime = load_json("runtime/code_intelligence.json")
+    runtime_agent = load_json("runtime/agent.json")
     before = int(runtime["context_lines_before"])
     after = int(runtime["context_lines_after"])
     segments_by_key: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -2803,20 +2886,90 @@ def _search_segments(
             for path in eligible:
                 if path == focus or path.startswith(focus.rstrip("/") + "/") or fnmatch.fnmatch(path, focus):
                     focus_paths.setdefault(path, set()).add(task.task_id)
+    if stats is not None:
+        stats["windows_raw"] = len(segments_by_key)
+    regions = _merge_regions(root, list(segments_by_key.values()), graph, runtime_agent)
     fallback_segments = _source_segments(
         root,
-        int(load_json("runtime/agent.json")["source_segment_characters"]),
+        int(runtime_agent["source_segment_characters"]),
         include_paths=set(focus_paths),
         exclude=exclude,
         max_file_bytes=max_file_bytes,
     )
+    fallback_added = 0
     for segment in fallback_segments:
         segment["query_ids"] = []
         segment["task_ids"] = sorted(focus_paths[str(segment["path"])])
+        covering = _covering_region(regions, segment, float(runtime_agent["region_overlap_ratio"]))
+        if covering is not None:
+            # Already reviewed as part of another region: only record the extra obligation.
+            covering["task_ids"] = sorted({*covering["task_ids"], *segment["task_ids"]})
+            continue
         segment["security_ir_slice"] = _related_ir(graph, str(segment["path"]), "")
-        key = (str(segment["path"]), int(segment["start_line"]), int(segment["end_line"]))
-        segments_by_key.setdefault(key, segment)
-    return sorted(segments_by_key.values(), key=lambda item: (str(item["path"]), int(item["start_line"])))
+        regions.append(segment)
+        fallback_added += 1
+    if stats is not None:
+        stats["regions"] = len(regions)
+        stats["fallback_regions"] = fallback_added
+    return sorted(regions, key=lambda item: (str(item["path"]), int(item["start_line"])))
+
+
+def _covering_region(regions: list[dict[str, Any]], segment: dict[str, Any], ratio: float) -> dict[str, Any] | None:
+    length = max(1, int(segment["end_line"]) - int(segment["start_line"]) + 1)
+    for region in regions:
+        if region["path"] != segment["path"]:
+            continue
+        overlap = min(int(region["end_line"]), int(segment["end_line"])) - max(
+            int(region["start_line"]), int(segment["start_line"])
+        ) + 1
+        if overlap / length >= ratio:
+            return region
+    return None
+
+
+def _merge_regions(
+    root: Path,
+    windows: list[dict[str, Any]],
+    graph: StructuralGraph | None,
+    runtime_agent: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Merge same-file windows that overlap by the configured ratio or sit within the gap."""
+    ratio = float(runtime_agent["region_overlap_ratio"])
+    gap = int(runtime_agent["region_max_gap_lines"])
+    limit = int(runtime_agent["region_max_characters"])
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for window in windows:
+        by_path.setdefault(str(window["path"]), []).append(window)
+    merged_all: list[dict[str, Any]] = []
+    for path, items in by_path.items():
+        items.sort(key=lambda item: (int(item["start_line"]), int(item["end_line"])))
+        current: dict[str, Any] | None = None
+        for item in items:
+            if current is not None:
+                overlap = min(int(current["end_line"]), int(item["end_line"])) - int(item["start_line"]) + 1
+                length = max(1, int(item["end_line"]) - int(item["start_line"]) + 1)
+                close = int(item["start_line"]) - int(current["end_line"]) <= gap
+                span_chars = len(str(current["content"])) + len(str(item["content"]))
+                if (overlap / length >= ratio or close) and span_chars <= limit:
+                    current["end_line"] = max(int(current["end_line"]), int(item["end_line"]))
+                    current["query_ids"] = sorted({*current["query_ids"], *item["query_ids"]})
+                    current["task_ids"] = sorted({*current["task_ids"], *item["task_ids"]})
+                    current["merged_windows"] = int(current.get("merged_windows", 1)) + 1
+                    continue
+                merged_all.append(current)
+            current = dict(item)
+        if current is not None:
+            merged_all.append(current)
+    for region in merged_all:
+        if int(region.get("merged_windows", 1)) > 1:
+            try:
+                lines = (root / str(region["path"])).read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            region["content"] = _redact("\n".join(lines[int(region["start_line"]) - 1 : int(region["end_line"])]))
+            region["security_ir_slice"] = _related_ir(graph, str(region["path"]), "")
+        region.pop("merged_windows", None)
+    return merged_all
 
 
 def _enclosing_symbol(graph: StructuralGraph | None, path: str, line: int):
@@ -2824,7 +2977,7 @@ def _enclosing_symbol(graph: StructuralGraph | None, path: str, line: int):
         return None
     matches = [
         symbol
-        for symbol in graph.symbols
+        for symbol in [*graph.symbols, *graph.routes]
         if symbol.path == path and symbol.line <= line and (symbol.end_line <= 0 or line <= symbol.end_line)
     ]
     return min(matches, key=lambda item: max(1, item.end_line - item.line)) if matches else None
@@ -3051,6 +3204,18 @@ def _contains_repository_wide_context(value: Any) -> bool:
     return False
 
 
+def _query_budget(runtime: Mapping[str, Any], file_count: int, task_count: int) -> int:
+    """Search queries the planner may use: tight for small repositories, per-task otherwise."""
+    per_task = int(runtime["maximum_dynamic_queries_per_task"])
+    total = per_task * task_count
+    if 0 < file_count <= int(runtime["small_repository_file_limit"]):
+        total = min(
+            int(runtime["small_repository_queries_per_task"]) * task_count,
+            int(runtime["small_repository_total_queries"]),
+        )
+    return max(1, total)
+
+
 def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str, Any]) -> Candidate | None:
     """Build a Candidate from a discovery/sweep/chain hypothesis.
 
@@ -3099,6 +3264,7 @@ def _candidate_from_ai_item(root: Path, item: dict[str, Any], segment: dict[str,
             "ai_business_impact": str(item["business_impact"]),
             "classification_references": [dict(reference) for reference in item["classification_references"]],
             "evidence_basis": dict(item.get("evidence_basis", {})),
+            "root_cause": {key: str(value) for key, value in dict(item.get("root_cause") or {}).items()},
         },
     )
 

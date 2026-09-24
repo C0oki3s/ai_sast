@@ -283,6 +283,43 @@ app.post("/reports", async (req, res) => {
     assert "<redacted-mongodb-uri>" in supplied
 
 
+def test_rate_limited_request_waits_and_retries_instead_of_failing(sample_repo, monkeypatch):
+    class RateLimitError(Exception):
+        pass
+
+    inner = FakeClient()
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            raise RateLimitError("Rate limit reached")
+        return FakeResponse(inner.responses.payload)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    waits = []
+    monkeypatch.setattr("plaidnox_sast.ai.time.sleep", waits.append)
+    review = PlaidNoxDeepHuntAgent(client, model="test-model").review(sample_repo, deep_candidate(), finding())
+
+    assert review.supported is True
+    assert len(calls) == 3
+    assert waits == [8.0, 16.0]
+
+
+def test_non_transient_request_error_is_not_retried(sample_repo, monkeypatch):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise ValueError("bad request")
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    monkeypatch.setattr("plaidnox_sast.ai.time.sleep", lambda _s: calls.append("slept"))
+    with pytest.raises(ValueError):
+        PlaidNoxDeepHuntAgent(client, model="test-model").review(sample_repo, deep_candidate(), finding())
+    assert calls.count("slept") == 0
+
+
 def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo):
     (sample_repo / "app.js").write_text(
         "const express = require('express');\n"

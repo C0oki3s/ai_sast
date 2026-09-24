@@ -5,6 +5,8 @@
     "context_hash",
     "execution_payload",
     "last_error_type",
-    "updated_at"
+    "updated_at",
+    "attempt_count",
+    "started_at"
   ]
 }

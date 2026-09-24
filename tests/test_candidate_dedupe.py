@@ -64,3 +64,29 @@ def test_variant_index_compares_exact_locations_so_siblings_survive():
     assert index.admit(candidate("Missing ownership check", "CWE-639", "authorization", 10, 12, cwe="CWE-639"))
     assert index.admit(candidate("Sibling missing ownership check", "CWE-639", "authorization", 14, 16, cwe="CWE-639"))
     assert not index.admit(candidate("Missing ownership check again", "CWE-639", "authorization", 10, 12, cwe="CWE-639"))
+
+
+def _rooted(title, start, symbol, control, attack=""):
+    item = candidate(title, "unrelated words " + title, "x" + title[:3], start, start + 2)
+    item.metadata["root_cause"] = {"symbol": symbol, "security_control": control}
+    item.evidence.graph_path = ["app.js", attack]
+    return item
+
+
+def test_declared_root_cause_merges_reports_far_apart_and_keeps_their_evidence():
+    index = CandidateIndex()
+    first = _rooted("Forged token accepted", 20, "authCheck", "JWT Authenticity", "forge cookie")
+    far = _rooted("Signature never verified", 260, "authcheck", "jwt-authenticity", "replay token")
+
+    assert index.admit(first) is True
+    assert index.admit(far) is False
+    assert first.metadata["duplicate_reports"] == 1
+    assert first.metadata["supporting_evidence"] == [
+        {"path": "app.js", "start_line": 260, "end_line": 262, "attack_path": "replay token"}
+    ]
+
+
+def test_different_declared_controls_in_one_symbol_stay_separate():
+    index = CandidateIndex()
+    assert index.admit(_rooted("Alpha issue", 20, "authCheck", "jwt-authenticity")) is True
+    assert index.admit(_rooted("Zulu problem", 260, "authCheck", "ownership-check")) is True

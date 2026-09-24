@@ -58,5 +58,9 @@
     "build_time_variants",
     "coverage_ledger",
     "analysis_scope_paths"
-  ]
+  ],
+  "small_repository_file_limit": 25,
+  "small_repository_queries_per_task": 8,
+  "small_repository_total_queries": 60,
+  "query_budget_enforcement_factor": 1.5
 }

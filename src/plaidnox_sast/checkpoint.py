@@ -5,7 +5,9 @@ candidate review, a variant or capability-chain sweep) is persisted the moment
 it succeeds. A later run against the same snapshot replays completed units from
 the store and only re-executes units that failed or never ran, so a scan can be
 stopped at any point -- provider credit exhausted, crash, ^C -- and resumed with
-new credits or a different model. Failed units are never stored.
+new credits or a different model. Units move RUNNING -> COMPLETED, FAILED_RETRYABLE or FAILED_FINAL; only
+completed units are ever replayed, and a unit still RUNNING when a new process opens the
+store is recorded as abandoned (FAILED_RETRYABLE).
 
 The store is bound to a scope (codebase, revision, tree hash, prompt version).
 Models are deliberately not part of the scope: switching or falling back to a
@@ -24,6 +26,20 @@ from typing import Any
 
 from .assets import load_json, load_text
 from .models import Candidate, Evidence, Finding, FindingState, Severity
+
+
+# Deterministic failures that replaying the identical request cannot fix. Everything
+# else (rate limits, resets, timeouts, interrupts, exhausted credits) is retryable.
+_FINAL_ERROR_TYPES = frozenset(
+    {
+        "BadRequestError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+        "UnprocessableEntityError",
+        "AIResponseError",
+    }
+)
 
 
 class CheckpointError(RuntimeError):
@@ -52,6 +68,8 @@ class ScanCheckpoint:
             if row is not None and row[0] != self.scope:
                 self.discarded = self._db.execute(load_text("sql/checkpoint/count_units.sql")).fetchone()[0]
                 self._db.execute(load_text("sql/checkpoint/delete_units.sql"))
+            # This process owns the store: anything still "running" belongs to a dead one.
+            self._db.execute(load_text("sql/checkpoint/abandon_running.sql"))
             self._db.execute(load_text("sql/checkpoint/upsert_scope.sql"), (self.scope,))
             self._db.commit()
             self._restrict_permissions()
@@ -115,7 +133,12 @@ class ScanCheckpoint:
             with self._lock:
                 self._db.execute(
                     load_text("sql/checkpoint/fail_unit.sql"),
-                    (error_type[:120], stage, key),
+                    (
+                        "failed_final" if error_type in _FINAL_ERROR_TYPES else "failed_retryable",
+                        error_type[:120],
+                        stage,
+                        key,
+                    ),
                 )
                 self._db.commit()
                 self._restrict_permissions()

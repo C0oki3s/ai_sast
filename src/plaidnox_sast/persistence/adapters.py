@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import load_json
 from ..context_fabric import (
+    extractor_outdated,
     ContextBase,
     ContextOverlay,
     PreparedContext,
@@ -105,7 +106,7 @@ class PostgresContextFabricStore:
         current = self.create_base(repository, commit, root, graph)
         with unit_of_work(self.session_factory, self.tenant_id) as repo:
             cached = repo.get_repository_context(snapshot_id)
-            if cached is not None:
+            if cached is not None and not extractor_outdated(cached, graph):
                 return PreparedContext(current, None, None, None, cached, [], True)
             prior_value = repo.latest_snapshot(codebase_id, exclude_snapshot_id=snapshot_id)
             if prior_value is None:

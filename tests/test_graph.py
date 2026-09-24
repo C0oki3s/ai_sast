@@ -13,13 +13,13 @@ def test_structural_graph_uses_tree_sitter_without_baked_in_searches(sample_repo
     graph = build_structural_graph(sample_repo)
     assert graph.tree_sitter_files >= 1
     assert graph.rg_queries == 0
-    assert graph.routes == []
+    assert [route.name for route in graph.routes] == ["POST /signin"]
 
 
 def test_structural_graph_returns_changed_attack_surface(sample_repo):
     surface = build_structural_graph(sample_repo).affected_surface(["app.js"])
     assert surface["changed_paths"] == ["app.js"]
-    assert surface["routes"] == []
+    assert [route["name"] for route in surface["routes"]] == ["POST /signin"]
 
 
 def test_structural_graph_keeps_symbol_references_for_incremental_navigation(tmp_path):

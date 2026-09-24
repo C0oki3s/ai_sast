@@ -111,7 +111,7 @@ def test_pending_llm_context_and_execution_survive_restart(tmp_path):
     assert len(pending["context_hash"]) == 64
     assert pending["execution"] == execution
     assert pending["last_error_type"] == "InsufficientCreditsError"
-    assert resumed.status_counts() == {"pending": 1}
+    assert resumed.status_counts() == {"failed_retryable": 1}
     assert resumed.resume_cursor() == {
         "stage": "llm_response",
         "operation": "hunt_plan",
@@ -224,7 +224,7 @@ def test_llm_failure_resumes_exact_call_then_replays_without_provider_cost(tmp_p
         assert str(exc) == "credits exhausted"
     else:
         raise AssertionError("the provider failure must be surfaced")
-    assert first_store.status_counts() == {"pending": 1}
+    assert first_store.status_counts() == {"failed_retryable": 1}
     first_store.close()
 
     second_store = ScanCheckpoint(path, "scope")
@@ -259,6 +259,35 @@ def test_ctrl_c_leaves_the_llm_operation_pending_for_resume(tmp_path):
     else:
         raise AssertionError("Ctrl-C must remain observable to the caller")
 
-    assert store.status_counts() == {"pending": 1}
+    assert store.status_counts() == {"failed_retryable": 1}
     assert store.resume_cursor()["last_error_type"] == "KeyboardInterrupt"
     store.close()
+
+
+def test_units_move_through_running_retryable_final_and_abandoned_states(tmp_path):
+    path = tmp_path / "cp.sqlite"
+    store = ScanCheckpoint(path, "scope")
+    store.begin("llm_response", "live", {}, {"operation": "a"})
+    assert store.status_counts() == {"running": 1}
+
+    store.begin("llm_response", "rate", {}, {"operation": "b"})
+    store.fail("llm_response", "rate", "RateLimitError")
+    store.begin("llm_response", "bad", {}, {"operation": "c"})
+    store.fail("llm_response", "bad", "BadRequestError")
+    assert store.status_counts() == {"running": 1, "failed_retryable": 1, "failed_final": 1}
+    store.close()
+
+    # A new process cannot still be running the unit: it is recorded as abandoned.
+    resumed = ScanCheckpoint(path, "scope")
+    assert resumed.status_counts() == {"failed_retryable": 2, "failed_final": 1}
+    assert resumed.pending("llm_response", "live")["last_error_type"] == "abandoned"
+    assert resumed.pending("llm_response", "rate")["last_error_type"] == "RateLimitError"
+
+    resumed.begin("llm_response", "rate", {}, {"operation": "b"})
+    row = resumed._db.execute(
+        "SELECT status, attempt_count FROM checkpoint_units WHERE unit_key = 'rate'"
+    ).fetchone()
+    assert row == ("running", 2)
+    resumed.complete("llm_response", "rate", {"ok": True})
+    assert resumed.get("llm_response", "rate") == {"ok": True}
+    resumed.close()

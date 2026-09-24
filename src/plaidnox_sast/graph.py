@@ -87,6 +87,7 @@ class FileSecurityIR:
     calls: list[Call] = field(default_factory=list)
     references: list[Reference] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    routes: list[Symbol] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -383,6 +384,7 @@ def build_structural_graph(
             graph.tree_sitter_files += 1
         graph.files.append(file_ir)
         graph.symbols.extend(file_ir.symbols)
+        graph.routes.extend(file_ir.routes)
         graph.calls.extend(file_ir.calls)
         graph.references.extend(file_ir.references)
 
@@ -442,6 +444,7 @@ def _tree_sitter_ir(
     calls: list[Call] = []
     references: list[Reference] = []
     imports: list[str] = []
+    routes: list[Symbol] = []
 
     def visit(node: Any, enclosing: str = "") -> None:
         current = enclosing
@@ -463,6 +466,10 @@ def _tree_sitter_ir(
                         _symbol_signature(node, content),
                     )
                 )
+        if node.type == "call_expression":
+            route = _express_route(node, content, relative)
+            if route is not None:
+                routes.append(route)
         if node.type in import_types:
             imports.append(_node_text(node, content))
         if node.type in call_types:
@@ -507,7 +514,34 @@ def _tree_sitter_ir(
             }.values()
         ),
         imports=list(dict.fromkeys(imports)),
+        routes=routes,
     )
+
+
+def _express_route(node: Any, content: bytes, relative: str) -> Symbol | None:
+    """Recognise `app.post('/x', ...)` / `router.use('/x', ...)` as a route symbol."""
+
+    function_node = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    if function_node is None or arguments is None or function_node.type != "member_expression":
+        return None
+    method_node = function_node.child_by_field_name("property")
+    owner_node = function_node.child_by_field_name("object")
+    if method_node is None or owner_node is None:
+        return None
+    method = _node_text(method_node, content).lower()
+    if method not in _EXPRESS_METHODS or _node_text(owner_node, content) not in _EXPRESS_OWNERS:
+        return None
+    first = next((child for child in arguments.children if child.is_named), None)
+    if first is None or first.type not in {"string", "template_string"}:
+        return None
+    route = _node_text(first, content).strip("'\"`")
+    name = f"{method.upper()} {route}"
+    return Symbol(name, relative, node.start_point[0] + 1, node.end_point[0] + 1, "route", f"route:{name}", "")
+
+
+_EXPRESS_METHODS = frozenset({"get", "post", "put", "patch", "delete", "all", "use"})
+_EXPRESS_OWNERS = frozenset({"app", "router", "api", "server", "routes"})
 
 
 def _fallback_ir(

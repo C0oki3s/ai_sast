@@ -10,10 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .assets import load_json, load_text
 from .graph import StructuralGraph, Symbol
@@ -218,7 +218,7 @@ class ContextFabricStore:
             ).fetchone()
             if exact is not None:
                 cached = self._load_repository_context(conn, exact["context_id"])
-                if cached is not None:
+                if cached is not None and not extractor_outdated(cached, graph):
                     count = conn.execute(
                         load_text("sql/context/count_symbols.sql"), (exact["context_id"],)
                     ).fetchone()[0]
@@ -258,7 +258,7 @@ class ContextFabricStore:
             reused=True,
         )
         current = self.create_base(repository, commit, root, graph)
-        if not changed_paths:
+        if not changed_paths and not extractor_outdated(previous_context, graph):
             return PreparedContext(current, previous, None, None, previous_context, [], True)
         overlay = self.create_overlay(previous, commit, root, changed_paths, graph)
         packet = self.compile_packet(overlay, profile)
@@ -430,6 +430,13 @@ class ContextFabricStore:
             affected.update(next_frontier)
             frontier = next_frontier
         return sorted(affected)
+
+
+def extractor_outdated(cached: Mapping[str, Any] | None, graph: StructuralGraph) -> bool:
+    """A cached context built before route extraction existed must be rebuilt once."""
+    if cached is None:
+        return False
+    return bool(graph.routes) and int(cached.get("graph_routes", 0) or 0) == 0
 
 
 def _snapshot_symbols(
