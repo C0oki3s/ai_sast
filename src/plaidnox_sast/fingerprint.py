@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
+from dataclasses import dataclass, field
 
 from .assets import load_json
 from .models import Candidate, CandidateEvidencePacket
@@ -25,6 +26,8 @@ def candidate_fingerprint(repository: str, candidate: Candidate) -> str:
         ev.source_symbol or ev.path,
         ev.sink_symbol or candidate.rule_id,
         graph_path,
+        candidate_semantic_key(candidate),
+        root_equivalence_key(candidate),
     )
     canonical = "\x1f".join(_normalize(part) for part in parts)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
@@ -92,6 +95,96 @@ def root_cause_key(candidate: Candidate) -> str:
     return candidate_semantic_key(candidate)
 
 
+def root_equivalence_key(candidate: Candidate) -> str:
+    """Structural root plus open-taxonomy effect/capability families.
+
+    Family IDs are model-classified under the external discovery contract. An
+    unresolved family deliberately disables cross-hypothesis clustering.
+    """
+
+    families = candidate.metadata.get("root_equivalence") or {}
+    root = candidate.metadata.get("root_cause") or {}
+    path = _normalize(candidate.evidence.path)
+    symbol = _normalize(str(root.get("symbol", "")))
+    effect = _normalize(str(families.get("effect_family_id", "")))
+    capability = _normalize(str(families.get("capability_family_id", "")))
+    if not path or not symbol or not effect or not capability:
+        return ""
+    if effect == "unresolved" or capability == "unresolved":
+        return ""
+    return "|".join((path, symbol, effect, capability))
+
+
+def _same_candidate_or_cluster(first: Candidate, second: Candidate, nearby_lines: int = _NEARBY_LINES) -> bool:
+    first_key = root_equivalence_key(first)
+    second_key = root_equivalence_key(second)
+    if first_key and second_key and first_key != second_key:
+        return False
+    return is_same_issue(first, second, nearby_lines) or bool(first_key and first_key == second_key)
+
+
+@dataclass(slots=True)
+class CandidateCluster:
+    """Hypotheses with one structural root and one effect/capability family."""
+
+    canonical: Candidate
+    equivalence_key: str = ""
+    members: list[Candidate] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.members:
+            self.members = [self.canonical]
+
+
+def _cluster_hypothesis(candidate: Candidate) -> dict[str, object]:
+    return {
+        "rule_id": candidate.rule_id,
+        "title": candidate.title,
+        "vulnerability_class": candidate.vulnerability_class,
+        "root_cause": dict(candidate.metadata.get("root_cause") or {}),
+        "root_equivalence": dict(candidate.metadata.get("root_equivalence") or {}),
+        "evidence": {
+            "path": candidate.evidence.path,
+            "start_line": candidate.evidence.start_line,
+            "end_line": candidate.evidence.end_line,
+            "snippet": candidate.evidence.snippet[:1200],
+        },
+        "attacker_influence": str(candidate.metadata.get("attacker_influence", ""))[:300],
+        "evidence_basis": dict(candidate.metadata.get("evidence_basis") or {}),
+    }
+
+
+def absorb_cluster(kept: Candidate, duplicate: Candidate) -> None:
+    """Retain paraphrased hypotheses and evidence under one verifiable root."""
+
+    members = kept.metadata.setdefault("candidate_cluster_variants", [_cluster_hypothesis(kept)])
+    hypothesis = _cluster_hypothesis(duplicate)
+    identity = (
+        hypothesis["root_cause"].get("symbol"),
+        hypothesis["root_equivalence"].get("effect_family_id"),
+        hypothesis["root_equivalence"].get("capability_family_id"),
+        hypothesis["evidence"].get("path"),
+        hypothesis["evidence"].get("start_line"),
+        hypothesis["evidence"].get("end_line"),
+    )
+    for existing in members:
+        existing_identity = (
+            existing.get("root_cause", {}).get("symbol"),
+            existing.get("root_equivalence", {}).get("effect_family_id"),
+            existing.get("root_equivalence", {}).get("capability_family_id"),
+            existing.get("evidence", {}).get("path"),
+            existing.get("evidence", {}).get("start_line"),
+            existing.get("evidence", {}).get("end_line"),
+        )
+        if identity == existing_identity:
+            break
+    else:
+        maximum = int(load_json("runtime/agent.json")["candidate_cluster_member_limit"])
+        if len(members) < maximum:
+            members.append(hypothesis)
+    absorb(kept, duplicate)
+
+
 def candidate_evidence_packet(candidate: Candidate) -> CandidateEvidencePacket:
     """Compile merged discovery evidence into the Deep Hunt input contract."""
 
@@ -133,6 +226,11 @@ def candidate_evidence_packet(candidate: Candidate) -> CandidateEvidencePacket:
         trace_edges=trace_edges,
         evidence_gaps=[str(item) for item in basis.get("missing_evidence", [])]
         + [str(item) for item in candidate.metadata.get("required_context", [])],
+        candidate_cluster_variants=[
+            dict(item)
+            for item in candidate.metadata.get("candidate_cluster_variants", [])
+            if isinstance(item, dict)
+        ],
     )
 
 
@@ -171,17 +269,17 @@ def is_same_issue(first: Candidate, second: Candidate, nearby_lines: int = _NEAR
 
     The model names the same bug differently on every call (class, category and
     symbols are free text), so exact-fingerprint matching lets one bug fan out
-    into dozens of reviews. Identity here is location plus meaning: same file,
-    starting lines close together (or broadly overlapping with stronger agreement), and either a shared classification id or a
-    shared specific word. Nearby but unrelated bugs (an injection next to a
-    JWT flaw) share neither and stay separate.
+    into dozens of reviews. Rich semantic identities are authoritative: a
+    mismatch never falls back to lexical similarity. Older candidates without
+    that identity use a nearby-line/classification heuristic.
     """
     a, b = first.evidence, second.evidence
     if a.path != b.path:
         return False
-    first_key = root_cause_key(first)
-    if first_key and first_key == root_cause_key(second):
-        return True
+    first_key = candidate_semantic_key(first)
+    second_key = candidate_semantic_key(second)
+    if first_key and second_key:
+        return first_key == second_key
     shared_ids = _classification_ids(first) & _classification_ids(second)
     shared_words = _issue_tokens(first) & _issue_tokens(second)
     if abs(a.start_line - b.start_line) <= nearby_lines:
@@ -200,17 +298,23 @@ class CandidateIndex:
         # exact locations (nearby_lines=0); discovery collapses restatements.
         self._nearby_lines = nearby_lines
         self._lock = threading.Lock()
-        self._kept: dict[str, list[Candidate]] = {}
+        self._kept: dict[str, list[CandidateCluster]] = {}
 
     def admit(self, candidate: Candidate) -> bool:
         """Record the candidate; False when it repeats one already seen."""
         with self._lock:
             kept = self._kept.setdefault(candidate.evidence.path, [])
-            for existing in kept:
-                if is_same_issue(existing, candidate, self._nearby_lines):
-                    absorb(existing, candidate)
+            equivalence = root_equivalence_key(candidate)
+            for cluster in kept:
+                existing = cluster.canonical
+                if _same_candidate_or_cluster(existing, candidate, self._nearby_lines):
+                    if equivalence and equivalence == cluster.equivalence_key:
+                        cluster.members.append(candidate)
+                        absorb_cluster(existing, candidate)
+                    else:
+                        absorb(existing, candidate)
                     return False
-            kept.append(candidate)
+            kept.append(CandidateCluster(candidate, equivalence))
             return True
 
 
@@ -228,9 +332,18 @@ def deduplicate(repository: str, candidates: list[Candidate]) -> tuple[list[Cand
             absorb(current, candidate)
     clusters: list[Candidate] = []
     for candidate in sorted(unique.values(), key=lambda item: -item.confidence):
-        match = next((kept for kept in clusters if is_same_issue(kept, candidate)), None)
+        match = next(
+            (
+                kept
+                for kept in clusters
+                if _same_candidate_or_cluster(kept, candidate)
+            ),
+            None,
+        )
         if match is None:
             clusters.append(candidate)
+        elif root_equivalence_key(match) and root_equivalence_key(match) == root_equivalence_key(candidate):
+            absorb_cluster(match, candidate)
         else:
             absorb(match, candidate)
     order = {id(candidate): index for index, candidate in enumerate(unique.values())}

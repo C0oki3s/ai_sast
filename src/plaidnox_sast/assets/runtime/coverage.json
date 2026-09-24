@@ -1,0 +1,38 @@
+{
+  "default_importance": "SUPPORTING",
+  "importance_by_type": {
+    "security_invariant": "REQUIRED",
+    "sensitive_effect": "REQUIRED",
+    "task_objective": "REQUIRED",
+    "coverage": "SUPPORTING",
+    "local_review": "SUPPORTING"
+  },
+  "required_coverage_fields_by_type": {
+    "coverage": [
+      "coverage_obligations",
+      "entry_points"
+    ]
+  },
+  "canonical_fields_by_type": {
+    "security_invariant": [
+      "business_invariants"
+    ],
+    "sensitive_effect": [
+      "sensitive_effect_refs"
+    ],
+    "coverage": [
+      "coverage_obligations",
+      "entry_points",
+      "evidence_requirements",
+      "falsification_requirements"
+    ],
+    "task_objective": [
+      "objectives"
+    ]
+  },
+  "resolved_statuses": [
+    "NO_ISSUE",
+    "NOT_APPLICABLE",
+    "CANDIDATE_FOUND"
+  ]
+}

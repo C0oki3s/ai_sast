@@ -94,6 +94,7 @@ class CandidateEvidencePacket:
     trace_nodes: list[str]
     trace_edges: list[dict[str, str]]
     evidence_gaps: list[str]
+    candidate_cluster_variants: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -172,12 +173,18 @@ class ScanResult:
             "ai_variant_failures",
             "ai_capability_chain_failures",
             "ai_consolidation_failures",
-            "ai_discovery_unresolved_obligations",
+            "ai_required_coverage_unresolved",
             "ai_discovery_contract_failures",
             "ai_search_query_failures",
             "checkpoint_units_pending",
         )
         incomplete = bool(self.metrics.get("ai_scan_incomplete", False))
+        if "ai_required_coverage_unresolved" not in self.metrics:
+            # Compatibility for stored reports produced before global coverage
+            # reconciliation was introduced.
+            incomplete = incomplete or int(
+                self.metrics.get("ai_discovery_unresolved_obligations", 0) or 0
+            ) > 0
         incomplete = incomplete or any(int(self.metrics.get(key, 0) or 0) > 0 for key in required_failures)
         return ScanStatus.UNSUCCESSFUL if incomplete else ScanStatus.SUCCESSFUL
 

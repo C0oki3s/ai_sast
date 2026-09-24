@@ -454,7 +454,7 @@ knowledge whenever production persistence is configured.
   Covered by `tests/test_routing.py`, `tests/test_knowledge.py` and `tests/test_pipeline.py`.
 
 Exit condition: every accepted or rejected candidate has a complete audit trail,
-and incomplete coverage can never produce a passing scan — met for the
+and unresolved required canonical coverage can never produce a successful scan — met for the
 in-process pipeline (proven by `tests/test_pipeline.py`'s
 `test_pipeline_marks_the_scan_incomplete_when_contextual_ai_discovery_fails`
 and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`); the
@@ -489,6 +489,24 @@ most 40 discovery calls, at most 1.5 calls per region, at most 15 executed
 continuations, duplicate candidate ratio below 40%, zero discovery failures,
 and a finding equivalent to the seeded root cause/invariant/capability. Warm
 checkpoint benchmarking follows the cold correctness run.
+
+Scan23 follow-up (implemented locally; source-scan acceptance pending):
+scan health now uses global canonical obligation reconciliation rather than
+raw per-region unresolved counts. Each invariant/effect/coverage item receives
+its own canonical identity so a sibling region resolving one item does not
+mask a different unresolved item. Obligations carry REQUIRED or SUPPORTING
+importance; only unresolved REQUIRED canonical work affects scan health, while
+all raw region results remain available as telemetry. Candidate discovery now
+groups paraphrased hypotheses by immutable source root plus open-taxonomy
+effect/capability family IDs and preserves member hypotheses in the single
+Deep Hunt evidence packet. Conflicting nonempty family IDs never merge.
+Typed Context Broker operations consult Security IR references and route spans
+first, with ripgrep as an explicit fallback; reference matches do not claim
+dataflow direction that the IR does not prove. Covered by
+`tests/test_coverage.py`, `tests/test_fingerprint.py`, and the graph-first
+resolver tests in `tests/test_optimized_discovery.py`. The next pinned cold
+NSTCTF scan must verify that all required canonical obligations reach a
+terminal result and that the Scan23 findings remain intact.
 
 - Repeatable acceptance scans against `C0oki3s/NSTCTF` plus multi-language
   fixtures with known positives, variants, and clean controls.

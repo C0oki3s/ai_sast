@@ -123,3 +123,37 @@ def test_required_failed_work_makes_scan_unsuccessful():
     )
 
     assert result.scan_status is ScanStatus.UNSUCCESSFUL
+
+
+def test_reconciled_supporting_obligations_do_not_fail_scan_health():
+    result = ScanResult(
+        codebase="org/repo",
+        revision="deadbeef",
+        mode=ScanMode.DEEP,
+        findings=[],
+        policy=PolicyResult(PolicyDecision.PASS, []),
+        metrics={
+            "ai_scan_incomplete": False,
+            "ai_discovery_unresolved_obligations": 27,
+            "ai_required_coverage_unresolved": 0,
+        },
+    )
+
+    assert result.scan_status is ScanStatus.SUCCESSFUL
+
+
+def test_unresolved_required_canonical_coverage_fails_scan_health():
+    result = ScanResult(
+        codebase="org/repo",
+        revision="deadbeef",
+        mode=ScanMode.DEEP,
+        findings=[],
+        policy=PolicyResult(PolicyDecision.PASS, []),
+        metrics={
+            "ai_scan_incomplete": False,
+            "ai_discovery_unresolved_obligations": 1,
+            "ai_required_coverage_unresolved": 1,
+        },
+    )
+
+    assert result.scan_status is ScanStatus.UNSUCCESSFUL

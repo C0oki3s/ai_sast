@@ -289,6 +289,7 @@ class PlaidNoxDeepHuntAgent:
         self.knowledge_errors: list[dict[str, str]] = []
         self.discovery_metrics: dict[str, int | float] = {}
         self.discovery_unresolved_obligations = 0
+        self.discovery_required_coverage_unresolved = 0
         self.rate_limit_waits = 0
         self._telemetry_lock = threading.Lock()
 
@@ -1813,9 +1814,12 @@ class PlaidNoxDeepHuntAgent:
         source_context_characters = _payload_characters_for_keys(safe_payload, source_keys)
         repository_wide_context = _contains_repository_wide_context(safe_payload)
         agent_runtime = load_json("runtime/agent.json")
-        configured_effort = str(
-            agent_runtime["reasoning_effort_by_operation"].get(prompt_operation, "low")
+        configured_effort = str(agent_runtime["reasoning_effort_by_operation"].get(prompt_operation, "low"))
+        tier_efforts = agent_runtime.get("reasoning_effort_by_operation_by_tier", {}).get(
+            prompt_operation, {}
         )
+        requested_tier = model_tier.value if model_tier is not None else "standard"
+        configured_effort = str(tier_efforts.get(requested_tier, configured_effort))
         effort = _stronger_effort(configured_effort, reasoning_effort_override)
         system_prompt, user_prompt = render_operation(prompt_operation, safe_payload, output_schema=schema)
         schema_hash = hashlib.sha256(
@@ -1867,6 +1871,19 @@ class PlaidNoxDeepHuntAgent:
             model_tier,
             effort,
         )
+        routed_effort = str(tier_efforts.get(model_execution.model_tier.value, configured_effort))
+        routed_effort = _stronger_effort(routed_effort, reasoning_effort_override)
+        if routed_effort != effort:
+            effort = routed_effort
+            model_execution = self._model_execution_route(
+                prompt_operation,
+                safe_payload,
+                len(serialized_payload),
+                source_context_characters,
+                repository_wide_context,
+                model_execution.model_tier,
+                effort,
+            )
         self._model_input_audit.append(
             {
                 "operation": prompt_operation,
@@ -1881,10 +1898,18 @@ class PlaidNoxDeepHuntAgent:
         )
         request_policy = _model_request_policy(agent_runtime, prompt_operation)
         operation_output_limits = agent_runtime.get("model_output_token_limit_by_operation", {})
+        tier_output_limits = agent_runtime.get(
+            "model_output_token_limit_by_operation_by_tier", {}
+        ).get(prompt_operation, {})
         effective_max_output_tokens = (
             int(max_output_tokens)
             if max_output_tokens is not None
-            else int(operation_output_limits.get(prompt_operation, self.max_output_tokens))
+            else int(
+                tier_output_limits.get(
+                    model_execution.model_tier.value,
+                    operation_output_limits.get(prompt_operation, self.max_output_tokens),
+                )
+            )
         )
         request_kwargs: dict[str, Any] = {
             "model": model_execution.model_name,
@@ -1909,30 +1934,34 @@ class PlaidNoxDeepHuntAgent:
         # some gateways reserve the model's full context-window output budget
         # and reject an otherwise small request before generation begins.
         request_kwargs["max_output_tokens"] = effective_max_output_tokens
+        checkpoint_context = {
+            "schema_name": name,
+            "schema": schema,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+        }
+        checkpoint_execution = {
+            "operation": prompt_operation,
+            "model": model_execution.model_name,
+            "model_tier": model_execution.model_tier.value,
+            "reasoning_effort": effort,
+            "timeout_seconds": request_policy["timeout_seconds"],
+            "max_retries": request_policy["max_retries"],
+            "max_output_tokens": effective_max_output_tokens,
+            "work_identity": checkpoint_work_identity,
+        }
         if self.checkpoint is not None:
-            self.checkpoint.begin(
-                "llm_response",
-                checkpoint_key,
-                {
-                    "schema_name": name,
-                    "schema": schema,
-                    "system_prompt": system_prompt,
-                    "user_prompt": user_prompt,
-                },
-                {
-                    "operation": prompt_operation,
-                    "model": model_execution.model_name,
-                    "model_tier": model_execution.model_tier.value,
-                    "reasoning_effort": effort,
-                    "timeout_seconds": request_policy["timeout_seconds"],
-                    "max_retries": request_policy["max_retries"],
-                    "max_output_tokens": effective_max_output_tokens,
-                    "work_identity": checkpoint_work_identity,
-                },
-            )
+            self.checkpoint.begin("llm_response", checkpoint_key, checkpoint_context, checkpoint_execution)
         shape_retries = request_policy["structured_shape_retries"]
+        truncation_policy = agent_runtime.get("output_truncation_retry_by_operation", {}).get(
+            prompt_operation, {}
+        )
+        max_output_retries = int(truncation_policy.get("max_retries", 0))
+        retry_limits = truncation_policy.get("retry_output_tokens_by_tier", {})
+        output_retry_count = 0
+        total_attempts = int(shape_retries) + max_output_retries + 1
         best: Any = None
-        for attempt in range(shape_retries + 1):
+        for attempt in range(total_attempts):
             reservation = self.model_budget.reserve(
                 str(request_kwargs["model"]),
                 len(system_prompt) + len(user_prompt),
@@ -1976,6 +2005,32 @@ class PlaidNoxDeepHuntAgent:
                 reason = getattr(detail, "reason", "unknown") if detail else "unknown"
                 if self.checkpoint is not None:
                     self.checkpoint.fail("llm_response", checkpoint_key, f"incomplete:{reason}")
+                retry_limit = int(retry_limits.get(model_execution.model_tier.value, 0))
+                if (
+                    reason == "max_output_tokens"
+                    and output_retry_count < max_output_retries
+                    and retry_limit > effective_max_output_tokens
+                ):
+                    output_retry_count += 1
+                    effective_max_output_tokens = retry_limit
+                    request_kwargs["max_output_tokens"] = retry_limit
+                    checkpoint_execution["max_output_tokens"] = retry_limit
+                    checkpoint_execution["output_retry"] = output_retry_count
+                    if self.checkpoint is not None:
+                        self.checkpoint.begin(
+                            "llm_response",
+                            checkpoint_key,
+                            checkpoint_context,
+                            checkpoint_execution,
+                        )
+                    self._emit(
+                        "model_output_truncation_retry",
+                        operation=prompt_operation,
+                        model_tier=model_execution.model_tier.value,
+                        retry=output_retry_count,
+                        max_output_tokens=retry_limit,
+                    )
+                    continue
                 raise AIResponseError(f"AI request was incomplete: {reason}")
             try:
                 payload, matches = parse_structured(response_text(response), schema)
@@ -3339,6 +3394,10 @@ def _candidate_from_ai_item(
             "classification_references": [dict(reference) for reference in item["classification_references"]],
             "evidence_basis": dict(item.get("evidence_basis", {})),
             "root_cause": root_cause,
+            "root_equivalence": {
+                key: str(value)
+                for key, value in dict(item.get("root_equivalence") or {}).items()
+            },
             "attacker_influence": str(item.get("attacker_influence", "")),
             "security_control": str(item.get("security_control", "")),
             "broken_invariant": str(item.get("broken_invariant", "")),

@@ -8,6 +8,16 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - ".github/workflows/discovery-fixes.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/plaidnox_sast/**"
+      - "src/plaidnox_scm/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/discovery-fixes.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

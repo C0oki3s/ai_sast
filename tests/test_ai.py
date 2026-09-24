@@ -275,8 +275,8 @@ app.post("/reports", async (req, res) => {
     request = client.responses.kwargs
     assert request["model"] == load_json("runtime/models.json")["agent_fallback_model_by_tier"]["standard"]
     assert request["max_output_tokens"] == load_json("runtime/agent.json")[
-        "model_output_token_limit_by_operation"
-    ]["security_review"]
+        "model_output_token_limit_by_operation_by_tier"
+    ]["security_review"]["standard"]
     if request["model"].startswith("gpt-"):
         assert request["prompt_cache_key"] == "plaidnox-sast:security_review"
     else:
@@ -363,12 +363,52 @@ def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
     assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
     assert client.responses.kwargs["model"] != "test-model"
+    assert client.responses.kwargs["max_output_tokens"] == 12000
+    assert client.responses.kwargs["reasoning"]["effort"] == "high"
 
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
     assert client.responses.kwargs["model"] == agent.model_by_tier["fast"]
 
     agent.review(sample_repo, deep_candidate(), finding())
     assert client.responses.kwargs["model"] == agent.model_by_tier["standard"]
+    assert client.responses.kwargs["max_output_tokens"] == 8000
+    assert client.responses.kwargs["reasoning"]["effort"] == "medium"
+
+
+def test_security_review_retries_max_output_truncation_once_with_larger_budget(sample_repo):
+    (sample_repo / "app.js").write_text(
+        "const app = express();\n"
+        "app.post('/reports', async (req, res) => {\n"
+        "  return html_to_pdf.generatePdf({ content: req.body.name });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    requests = []
+    responses = [
+        type(
+            "IncompleteResponse",
+            (),
+            {
+                "status": "incomplete",
+                "incomplete_details": type("Details", (), {"reason": "max_output_tokens"})(),
+                "output_text": "",
+                "usage": {},
+            },
+        )(),
+        FakeResponse(review_payload()),
+    ]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+
+    result = agent.review(sample_repo, deep_candidate(), finding())
+
+    assert result.supported is True
+    assert [request["max_output_tokens"] for request in requests] == [8000, 10000]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
@@ -1412,7 +1452,9 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
 
     agent.review(sample_repo, deep_candidate(), finding())
 
-    expected = load_json("runtime/agent.json")["reasoning_effort_by_operation"]["security_review"]
+    expected = load_json("runtime/agent.json")[
+        "reasoning_effort_by_operation_by_tier"
+    ]["security_review"]["standard"]
     assert client.responses.kwargs["reasoning"]["effort"] == expected
 
 
@@ -1452,6 +1494,7 @@ def test_structured_response_falls_back_to_low_effort_for_an_unlisted_operation(
         if name == "runtime/agent.json":
             data = dict(data)
             data["reasoning_effort_by_operation"] = {}
+            data["reasoning_effort_by_operation_by_tier"] = {}
         return data
 
     monkeypatch.setattr(ai_module, "load_json", patched_load_json)

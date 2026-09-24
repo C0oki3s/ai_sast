@@ -31,6 +31,12 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert "Every production area" in render_prompt("operations/hunt_plan/system.md")
     assert load_json("schemas/finding_consolidation.json")["type"] == "object"
     assert load_json("schemas/finding_group_narratives.json")["type"] == "object"
+    capability_schema = load_json("schemas/capability_chain.json")
+    assert capability_schema["properties"]["candidates"]["maxItems"] == 3
+    assert capability_schema["properties"]["coverage"]["properties"]["unresolved_areas"]["maxItems"] == 5
+    capability_runtime = load_json("runtime/agent.json")
+    assert capability_runtime["reasoning_effort_by_operation_by_tier"]["capability_chain"]["standard"] == "medium"
+    assert capability_runtime["output_truncation_retry_by_operation"]["capability_chain"]["max_retries"] == 1
     assert load_json("schemas/finding_group.json")["type"] == "object"
     assert "same exploitable root cause" in render_prompt("operations/finding_consolidation/system.md")
     assert load_json("policy/priority.json")["maximum_score"] == 100
@@ -38,6 +44,7 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert load_json("runtime/code_intelligence.json")["maximum_dynamic_queries_per_task"] > 0
     assert load_json("runtime/models.json")["agent_default_model"]
     assert load_json("runtime/production_controls.json")["model_budget"]["maximum_calls_per_scan"] > 0
+    assert load_json("runtime/coverage.json")["importance_by_type"]["security_invariant"] == "REQUIRED"
     assert load_json("schemas/search_query_plan.json")["properties"]["queries"]["minItems"] == 1
     assert "literal ripgrep search terms" in render_prompt("operations/search_query_plan/system.md")
     assert "perplexity_sonar" in load_json("research/providers.json")["providers"]

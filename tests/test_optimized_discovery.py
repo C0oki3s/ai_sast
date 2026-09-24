@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import json
 
 from plaidnox_sast.ai import AIRepositoryContext, HuntPlan, HuntTask
-from plaidnox_sast.graph import build_structural_graph
+from plaidnox_sast.graph import Reference, StructuralGraph, Symbol, build_structural_graph
 from plaidnox_sast.optimized_ai import (
     DiscoveryCoverageState,
     DiscoveryObligation,
@@ -13,6 +13,7 @@ from plaidnox_sast.optimized_ai import (
     _enrich_region_requirements,
     _merge_discovery_regions,
     _region_from_range,
+    _resolve_discovery_context_request,
     _subtract_covered_ranges,
     _tasks_relevant_to_region,
 )
@@ -227,12 +228,34 @@ def test_related_tasks_are_aggregated_into_region_scoped_obligations():
 
     _enrich_region_requirements(region, plan)
 
-    assert len(region.obligation_specs) == 2
+    assert len(region.obligation_specs) == 5
     combined = " ".join(item.question for item in region.obligation_specs.values())
     assert "Verified identity is immutable." in combined
     assert "Resources stay tenant scoped." in combined
     assert "Trace identity consumers." in combined
     assert "Trace object access." in combined
+
+
+def test_global_coverage_reconciliation_ids_match_one_invariant_in_a_larger_local_set():
+    first_task = HuntTask(
+        "auth-all", "Authentication", "Review authentication.", [], [], [], [], [], [],
+        business_invariants=["Verified identity is immutable.", "Refresh state is principal-bound."],
+    )
+    second_task = HuntTask(
+        "auth-single", "Authentication", "Review authentication.", [], [], [], [], [], [],
+        business_invariants=["Verified identity is immutable."],
+    )
+    first_region = DiscoveryRegion("auth.js", 1, 20, "x", "symbol", "auth", "a", "a", task_ids={"auth-all"})
+    second_region = DiscoveryRegion("auth.js", 21, 40, "y", "symbol", "auth2", "b", "b", task_ids={"auth-single"})
+
+    _enrich_region_requirements(first_region, HuntPlan("p1", "Review", [first_task]))
+    _enrich_region_requirements(second_region, HuntPlan("p2", "Review", [second_task]))
+
+    first_ids = {item.canonical_id for item in first_region.obligation_specs.values()}
+    second_ids = {item.canonical_id for item in second_region.obligation_specs.values()}
+    assert first_ids & second_ids
+    assert len(first_ids) == 2
+    assert len(second_ids) == 1
 
 
 def test_obligations_are_scoped_by_focus_path_and_exact_route():
@@ -317,6 +340,23 @@ def test_route_task_payload_drops_unrelated_entry_points_and_global_obligations(
     assert payload["focus_paths"] == ["app.js"]
     assert payload["evidence_requirements"] == ["Check POST /reports object authorization"]
     assert payload["coverage_obligations"] == ["POST /reports must enforce tenant scope"]
+
+
+def test_focus_path_with_line_range_matches_only_overlapping_structural_region():
+    task = HuntTask(
+        "auth", "Authentication", "Review auth.", ["middleware/ValidateToken.js:35-72"],
+        [], ["authentication"], [], [], [],
+    )
+    plan = HuntPlan("plan", "Review focused code.", [task])
+    overlapping = DiscoveryRegion(
+        "middleware/ValidateToken.js", 60, 80, "source", "symbol", "authCheck", "hash", "ir",
+    )
+    disjoint = DiscoveryRegion(
+        "middleware/ValidateToken.js", 100, 120, "source", "symbol", "other", "hash2", "ir2",
+    )
+
+    assert _tasks_relevant_to_region(overlapping, plan) == [task]
+    assert _tasks_relevant_to_region(disjoint, plan) == []
 
 
 def test_only_resolved_context_with_material_evidence_can_trigger_continuation():
@@ -610,6 +650,12 @@ def test_continuation_candidate_from_broker_source_reaches_candidate_queue(tmp_p
                             "broken_invariant": "Unverified identity cannot select a record.",
                             "capability": "revoke another user's token",
                         },
+                        "root_equivalence": {
+                            "control_family_id": "TOKEN_VERIFICATION",
+                            "invariant_family_id": "VERIFIED_IDENTITY_ONLY",
+                            "effect_family_id": "AUTH_STATE_WRITE",
+                            "capability_family_id": "CROSS_USER_TOKEN_REVOCATION",
+                        },
                         "attacker_influence": "Cookie token",
                         "security_control": "Cognito verification",
                         "broken_invariant": "Unverified identity cannot select a record.",
@@ -674,3 +720,82 @@ def test_continuation_candidate_from_broker_source_reaches_candidate_queue(tmp_p
     assert len(candidates) == 1
     assert candidates[0].evidence.path == "middleware.js"
     assert candidates[0].metadata["candidate_id"] == "cross-file-auth"
+
+
+def test_typed_context_uses_security_ir_before_ripgrep_for_references(tmp_path):
+    (tmp_path / "routes.js").write_text(
+        "app.get('/reports', authCheck, reportHandler);\n",
+        encoding="utf-8",
+    )
+    graph = StructuralGraph(
+        references=[Reference("routes.js", "authCheck", "routes.js", 1, "identifier")]
+    )
+    agent = SimpleNamespace(
+        security_graph=graph,
+        source_excludes=[],
+        max_file_bytes=None,
+        knowledge_coordinator=None,
+    )
+
+    result = _resolve_discovery_context_request(
+        agent,
+        tmp_path,
+        {"kind": "readers", "symbol": "authCheck"},
+    )
+
+    assert result["resolved"] is True
+    assert result["resolution_source"] == "security_ir"
+    assert result["matches"][0]["relationship"] == "reference"
+    assert result["matches"][0]["direction_proven"] is False
+    assert "authCheck" in result["matches"][0]["content"]
+
+
+def test_typed_middleware_context_resolves_route_attachment_from_security_ir(tmp_path):
+    (tmp_path / "routes.js").write_text(
+        "app.get('/reports', authCheck, reportHandler);\n",
+        encoding="utf-8",
+    )
+    graph = StructuralGraph(
+        references=[Reference("routes.js", "authCheck", "routes.js", 1, "identifier")],
+        routes=[Symbol("GET /reports", "routes.js", 1, 1, "route")],
+    )
+    agent = SimpleNamespace(
+        security_graph=graph,
+        source_excludes=[],
+        max_file_bytes=None,
+        knowledge_coordinator=None,
+    )
+
+    result = _resolve_discovery_context_request(
+        agent,
+        tmp_path,
+        {"kind": "middleware", "symbol": "authCheck"},
+    )
+
+    assert result["resolved"] is True
+    assert result["resolution_source"] == "security_ir"
+    assert result["routes"][0]["name"] == "GET /reports"
+    assert "authCheck" in result["routes"][0]["content"]
+
+
+def test_typed_context_falls_back_to_ripgrep_when_security_ir_has_no_relationship(tmp_path):
+    (tmp_path / "routes.js").write_text(
+        "app.get('/reports', authCheck, reportHandler);\n",
+        encoding="utf-8",
+    )
+    agent = SimpleNamespace(
+        security_graph=StructuralGraph(),
+        source_excludes=[],
+        max_file_bytes=None,
+        knowledge_coordinator=None,
+    )
+
+    result = _resolve_discovery_context_request(
+        agent,
+        tmp_path,
+        {"kind": "middleware", "symbol": "authCheck"},
+    )
+
+    assert result["resolved"] is True
+    assert result["resolution_source"] == "ripgrep_fallback"
+    assert result["matches"][0]["content"]

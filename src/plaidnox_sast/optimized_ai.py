@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -34,6 +35,7 @@ from .ai import (
 )
 from .assets import load_json, load_text
 from .checkpoint import candidate_from_dict, candidate_to_dict, unit_key
+from .coverage import obligation_identity, reconcile_obligations
 from .errors import AIStageError
 from .fingerprint import CandidateIndex
 from .graph import (
@@ -52,6 +54,28 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _coverage_observations(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    obligations = {
+        str(item.get("obligation_id", "")): dict(item)
+        for item in state.get("obligations", [])
+        if isinstance(item, Mapping) and item.get("obligation_id")
+    }
+    dispositions = {
+        str(item.get("obligation_id", "")): dict(item)
+        for item in state.get("dispositions", [])
+        if isinstance(item, Mapping) and item.get("obligation_id")
+    }
+    region_id = str(state.get("region_id", ""))
+    return [
+        {
+            "region_id": region_id,
+            "obligation": obligation,
+            "status": str(dispositions.get(obligation_id, {}).get("status", "UNRESOLVED")),
+        }
+        for obligation_id, obligation in obligations.items()
+    ]
 
 
 @dataclass(slots=True)
@@ -151,12 +175,26 @@ class DiscoveryObligation:
     obligation_type: str
     question: str
     scope: str = "LOCAL"
+    canonical_id: str = ""
+    importance: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.canonical_id or not self.importance:
+            canonical_id, importance = obligation_identity(
+                self.obligation_type, self.question
+            )
+            if not self.canonical_id:
+                object.__setattr__(self, "canonical_id", canonical_id)
+            if not self.importance:
+                object.__setattr__(self, "importance", importance)
 
     def to_dict(self) -> dict[str, str]:
         return {
             "obligation_id": self.obligation_id,
             "type": self.obligation_type,
             "scope": self.scope,
+            "canonical_id": self.canonical_id,
+            "importance": self.importance,
             "question": self.question,
         }
 
@@ -171,6 +209,7 @@ class DiscoveryCoverageState:
     candidate_ids: set[str] = field(default_factory=set)
     needs_context_ids: set[str] = field(default_factory=set)
     contract_issues: list[str] = field(default_factory=list)
+    grounding_rejections: int = 0
 
     @property
     def processing_complete(self) -> bool:
@@ -201,7 +240,13 @@ class DiscoveryCoverageState:
             == ObligationStatus.NEEDS_CONTEXT
         ]
 
-    def apply(self, results: list[dict[str, Any]], candidate_ids: set[str]) -> None:
+    def apply(
+        self,
+        results: list[dict[str, Any]],
+        candidate_ids: set[str],
+        rejected_candidate_ids: set[str] | None = None,
+    ) -> None:
+        rejected_candidate_ids = rejected_candidate_ids or set()
         expected = set(self.unresolved_ids()) if self.dispositions else set(self.obligations)
         results_by_id: dict[str, list[dict[str, Any]]] = {}
         for result in results:
@@ -227,7 +272,11 @@ class DiscoveryCoverageState:
                 continue
             if status is ObligationStatus.CANDIDATE_FOUND:
                 if not linked_candidates or not linked_candidates <= candidate_ids:
-                    self.contract_issues.append("candidate disposition did not link to a grounded candidate")
+                    rejected_only = bool(linked_candidates) and linked_candidates <= rejected_candidate_ids
+                    if rejected_only:
+                        self.grounding_rejections += 1
+                    else:
+                        self.contract_issues.append("candidate disposition did not link to a grounded candidate")
                     self.mark_unresolved(
                         [obligation_id],
                         "Candidate evidence could not be grounded to an accepted source location.",
@@ -275,6 +324,7 @@ class DiscoveryCoverageState:
             "candidate_ids": sorted(self.candidate_ids),
             "needs_context_ids": sorted(self.needs_context_ids),
             "contract_issues": list(self.contract_issues),
+            "grounding_rejections": self.grounding_rejections,
             "processing_complete": self.processing_complete,
             "coverage_complete": self.coverage_complete,
             "complete": self.complete,
@@ -377,18 +427,44 @@ def _enrich_region_requirements(region: DiscoveryRegion, plan: HuntPlan) -> None
         if task_data["objective"].strip():
             objectives.add(task_data["objective"].strip())
 
+    canonical_fields = load_json("runtime/coverage.json")["canonical_fields_by_type"]
     for obligation_type, fields in aggregate.items():
-        requirements = {name: sorted(values) for name, values in fields.items() if values}
-        if not requirements:
-            continue
-        question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        obligation_id = f"obl-{_stable_hash({'type': obligation_type, 'requirements': requirements})[:20]}"
-        region.obligation_specs[obligation_id] = DiscoveryObligation(obligation_id, obligation_type, question)
+        identity_fields = canonical_fields.get(obligation_type, [])
+        # Keep independently meaningful obligations separate. If one region has
+        # two invariants and a sibling has only one, global reconciliation can
+        # now match the shared invariant without treating the pair as different
+        # work. Broad themes remain discovery guidance, not coverage identities.
+        for field_name in identity_fields:
+            for value in sorted(fields.get(field_name, set())):
+                requirements = {field_name: [value]}
+                question = json.dumps(
+                    requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                canonical_id, importance = obligation_identity(
+                    obligation_type, question, region_id=region.region_id
+                )
+                obligation_id = f"obl-{canonical_id[:20]}"
+                region.obligation_specs[obligation_id] = DiscoveryObligation(
+                    obligation_id,
+                    obligation_type,
+                    question,
+                    canonical_id=canonical_id,
+                    importance=importance,
+                )
     if not region.obligation_specs and objectives:
         requirements = {"objectives": sorted(objectives)}
         question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         obligation_id = f"obl-{_stable_hash({'type': 'task_objective', 'requirements': requirements})[:20]}"
-        region.obligation_specs[obligation_id] = DiscoveryObligation(obligation_id, "task_objective", question)
+        canonical_id, importance = obligation_identity(
+            "task_objective", question, region_id=region.region_id
+        )
+        region.obligation_specs[obligation_id] = DiscoveryObligation(
+            obligation_id,
+            "task_objective",
+            question,
+            canonical_id=canonical_id,
+            importance=importance,
+        )
     if not region.obligation_specs:
         local_review = load_text(
             "prompts/operations/vulnerability_discovery/local_obligations.md"
@@ -402,8 +478,16 @@ def _enrich_region_requirements(region: DiscoveryRegion, plan: HuntPlan) -> None
         question = json.dumps(requirements, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         obligation_id = f"obl-{_stable_hash({'type': 'local_review', 'requirements': requirements})[:20]}"
         region.obligations.add(local_review)
+        canonical_id, importance = obligation_identity(
+            "local_review", question, region_id=region.region_id
+        )
         region.obligation_specs[obligation_id] = DiscoveryObligation(
-            obligation_id, "local_review", question, "LOCAL"
+            obligation_id,
+            "local_review",
+            question,
+            "LOCAL",
+            canonical_id,
+            importance,
         )
 
 
@@ -411,9 +495,6 @@ def _tasks_relevant_to_region(region: DiscoveryRegion, plan: HuntPlan) -> list[A
     selected = [task for task in plan.tasks if task.task_id in region.task_ids]
     if not selected:
         selected = list(plan.tasks)
-
-    def normalize_path(value: str) -> str:
-        return value.replace("\\", "/").removeprefix("./").strip("/")
 
     route_matches: list[Any] = []
     if region.anchor_type == "route":
@@ -453,13 +534,25 @@ def _tasks_relevant_to_region(region: DiscoveryRegion, plan: HuntPlan) -> list[A
         task
         for task in selected
         if not task.focus_paths
-        or any(
-            normalize_path(region.path) == normalize_path(str(focus))
-            or normalize_path(region.path).startswith(normalize_path(str(focus)).rstrip("/") + "/")
-            for focus in task.focus_paths
-        )
+        or any(_focus_reference_overlaps_region(str(focus), region) for focus in task.focus_paths)
     ]
     return focus_matches
+
+
+def _focus_reference_overlaps_region(reference: str, region: DiscoveryRegion) -> bool:
+    """Match path-only or path:line[-line] hunt-plan references structurally."""
+    match = re.fullmatch(r"(?P<path>.*?)(?::(?P<start>\d+)(?:-(?P<end>\d+))?)?", reference.strip())
+    if not match:
+        return False
+    path = match.group("path").replace("\\", "/").removeprefix("./").strip("/")
+    region_path = region.path.replace("\\", "/").removeprefix("./").strip("/")
+    if region_path != path and not region_path.startswith(path.rstrip("/") + "/"):
+        return False
+    if path != region_path or match.group("start") is None:
+        return True
+    start = int(match.group("start"))
+    end = int(match.group("end") or start)
+    return start <= region.end_line and region.start_line <= end
 
 
 def _region_task_payload(task: Any, region: DiscoveryRegion) -> dict[str, Any]:
@@ -941,18 +1034,26 @@ def _resolve_discovery_context_request(
     request: dict[str, Any],
 ) -> dict[str, Any]:
     kind = str(request.get("kind", ""))
-    normalized = dict(request)
+    result: dict[str, Any] | None = None
     if kind in _DISCOVERY_CONTEXT_SEARCH_KINDS:
-        normalized["kind"] = "search"
-        normalized["pattern"] = str(request.get("pattern") or request.get("symbol") or "")
-    result = _resolve_context_request(
-        root,
-        agent.security_graph,
-        normalized,
-        source_excludes=agent.source_excludes,
-        max_file_bytes=agent.max_file_bytes,
-        knowledge_store=agent.knowledge_coordinator.store if agent.knowledge_coordinator else None,
-    )
+        result = _resolve_ir_relationship_request(agent.security_graph, request)
+    if result is None or not _has_context_evidence(result):
+        normalized = dict(request)
+        if kind in _DISCOVERY_CONTEXT_SEARCH_KINDS:
+            normalized["kind"] = "search"
+            normalized["pattern"] = str(request.get("pattern") or request.get("symbol") or "")
+        fallback = _resolve_context_request(
+            root,
+            agent.security_graph,
+            normalized,
+            source_excludes=agent.source_excludes,
+            max_file_bytes=agent.max_file_bytes,
+            knowledge_store=agent.knowledge_coordinator.store if agent.knowledge_coordinator else None,
+        )
+        if _has_context_evidence(fallback) or result is None:
+            result = fallback
+            result["resolution_source"] = "ripgrep_fallback" if kind in _DISCOVERY_CONTEXT_SEARCH_KINDS else "context_resolver"
+    assert result is not None
     result["requested_kind"] = kind
     return _add_context_source_windows(
         root,
@@ -960,6 +1061,84 @@ def _resolve_discovery_context_request(
         source_excludes=agent.source_excludes,
         max_file_bytes=agent.max_file_bytes,
     )
+
+
+def _resolve_ir_relationship_request(
+    graph: StructuralGraph | None,
+    request: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve typed relationship requests from indexed structure before text search.
+
+    The current Security IR records syntactic references, not taint direction or
+    dataflow. Consequently readers/writers are returned as reference occurrences
+    with their observed role explicitly labeled, never asserted as proven flows.
+    """
+    if graph is None:
+        return None
+    kind = str(request.get("kind", ""))
+    symbol = str(request.get("symbol") or request.get("pattern") or "").strip()
+    if not symbol:
+        return None
+
+    def aliases(value: str) -> set[str]:
+        clean = value.strip().strip("'\"` ")
+        return {clean.casefold(), clean.rsplit(".", 1)[-1].casefold()}
+
+    wanted = aliases(symbol)
+    if kind == "middleware":
+        route_records: list[dict[str, Any]] = []
+        for reference in graph.references:
+            if not (aliases(reference.target) & wanted or aliases(reference.source) & wanted):
+                continue
+            matching_routes = [
+                route for route in graph.routes
+                if route.path == reference.path and route.line <= reference.line <= (route.end_line or route.line)
+            ]
+            for route in matching_routes:
+                route_records.append({
+                    "name": route.name,
+                    "path": route.path,
+                    "line": route.line,
+                    "end_line": route.end_line or route.line,
+                    "middleware_symbol": symbol,
+                    "relationship": "route_reference_in_span",
+                })
+        # A call edge on the same route span also represents a structural
+        # attachment candidate when parser references are unavailable.
+        if not route_records:
+            for call in graph.calls:
+                if not (aliases(call.callee) & wanted):
+                    continue
+                for route in graph.routes:
+                    if route.path == call.path and route.line <= call.line <= (route.end_line or route.line):
+                        route_records.append({
+                            "name": route.name, "path": route.path, "line": route.line,
+                            "end_line": route.end_line or route.line,
+                            "middleware_symbol": symbol,
+                            "relationship": "route_call_in_span",
+                        })
+        if route_records:
+            return {"kind": kind, "symbol": symbol, "resolved": True,
+                    "routes": route_records, "resolution_source": "security_ir"}
+
+    references = [
+        {
+            "path": item.path,
+            "line": item.line,
+            "source": item.source,
+            "target": item.target,
+            "relationship": "reference",
+            "requested_relation": kind,
+            "direction_proven": False,
+        }
+        for item in graph.references
+        if aliases(item.target) & wanted or aliases(item.source) & wanted
+    ]
+    if kind in {"readers", "writers", "references", "authorization_decision", "security_control",
+                "configuration", "environment_usage", "store_relationship", "credential_consumer"} and references:
+        return {"kind": kind, "symbol": symbol, "resolved": True,
+                "matches": references, "resolution_source": "security_ir"}
+    return None
 
 
 def _continuation_is_exceptional(
@@ -1073,6 +1252,12 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
             "obligations_candidate_found": 0,
             "obligations_needs_context": 0,
             "obligations_unresolved": 0,
+            "candidate_grounding_rejections": 0,
+            "canonical_obligations_total": 0,
+            "canonical_required_obligations": 0,
+            "canonical_required_unresolved": 0,
+            "canonical_supporting_unresolved": 0,
+            "obligations_reconciled_by_sibling": 0,
             "discovery_contract_failures": 0,
             "context_requests_total": 0,
             "context_requests_unique": 0,
@@ -1094,7 +1279,9 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
             with telemetry_lock:
                 telemetry[key] += amount
 
-        def analyze(region: DiscoveryRegion) -> tuple[list[Candidate], list[Exception]]:
+        def analyze(
+            region: DiscoveryRegion,
+        ) -> tuple[list[Candidate], list[Exception], list[dict[str, Any]]]:
             segment = region.to_segment()
             segment_candidates: list[Candidate] = []
             errors: list[Exception] = []
@@ -1129,7 +1316,12 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                         path=region.path,
                         start_line=region.start_line,
                     )
-                    return [candidate_from_dict(item) for item in saved["candidates"]], []
+                    saved_coverage = saved.get("coverage_state", {})
+                    return (
+                        [candidate_from_dict(item) for item in saved["candidates"]],
+                        [],
+                        _coverage_observations(saved_coverage),
+                    )
 
             self._emit(
                 "source_region_started",
@@ -1145,6 +1337,7 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                 for task in _tasks_relevant_to_region(region, plan)
             ]
             coverage_state = DiscoveryCoverageState(region.region_id, dict(region.obligation_specs))
+            rejected_candidate_ids: set[str] = set()
             resolved_context: list[dict[str, Any]] = []
             all_resolved_context: list[dict[str, Any]] = []
             maximum = (
@@ -1223,6 +1416,10 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                             allowed_source_windows=_source_windows_from_context(all_resolved_context),
                         )
                         if candidate is None:
+                            candidate_id = str(item.get("candidate_id", ""))
+                            if candidate_id:
+                                rejected_candidate_ids.add(candidate_id)
+                                bump("candidate_grounding_rejections")
                             continue
                         candidate_id = str(item["candidate_id"])
                         candidate.metadata["candidate_id"] = candidate_id
@@ -1246,6 +1443,7 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                     coverage_state.apply(
                         obligation_results,
                         coverage_state.candidate_ids | valid_candidate_ids,
+                        rejected_candidate_ids,
                     )
                     contract_failures = len(coverage_state.contract_issues) - prior_contract_issues
                     if contract_failures:
@@ -1385,11 +1583,13 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                     else "incomplete"
                 ),
             )
-            return segment_candidates, errors
+            return segment_candidates, errors, _coverage_observations(coverage_state.to_dict())
 
         with ThreadPoolExecutor(max_workers=int(runtime["discovery_max_workers"])) as executor:
-            for segment_candidates, errors in executor.map(analyze, regions):
+            all_observations: list[dict[str, Any]] = []
+            for segment_candidates, errors, observations in executor.map(analyze, regions):
                 candidates.extend(segment_candidates)
+                all_observations.extend(observations)
                 failures += len(errors)
                 self.discovery_error_types.extend(type(error).__name__ for error in errors)
                 self.discovery_errors.extend(str(error)[:240] for error in errors)
@@ -1400,9 +1600,13 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
         telemetry["discovery_model_calls_per_unique_region"] = round(
             telemetry["discovery_model_calls"] / max(1, len(regions)), 3
         )
+        telemetry.update(reconcile_obligations(all_observations))
         self.discovery_metrics = dict(region_stats) | dict(telemetry)
         self.discovery_contract_failures = int(telemetry["discovery_contract_failures"])
         self.discovery_unresolved_obligations = int(telemetry["obligations_unresolved"])
+        self.discovery_required_coverage_unresolved = int(
+            telemetry["canonical_required_unresolved"]
+        )
         self._emit("discovery_telemetry", **region_stats, **telemetry)
         return candidates, failures
 

@@ -14,6 +14,7 @@
   "discovery_context_max_characters": 12000,
   "discovery_context_per_request_max_characters": 3000,
   "candidate_supporting_evidence_limit": 20,
+  "candidate_cluster_member_limit": 12,
   "context_expansion_max_rounds": 2,
   "context_expansion_max_requests_per_round": 5,
   "repository_entrypoint_limit": 100,
@@ -95,7 +96,7 @@
     "finding_consolidation": 12000,
     "finding_group_narratives": 12000,
     "vulnerability_discovery": 16000,
-    "security_review": 5000
+    "security_review": 8000
   },
   "consolidation_max_output_tokens": 12000,
   "research_max_output_tokens": 8000,
@@ -146,5 +147,41 @@
     "window": 9,
     "search": 10,
     "knowledge": 11
+  },
+  "model_output_token_limit_by_operation_by_tier": {
+    "security_review": {
+      "standard": 8000,
+      "deep": 12000
+    },
+    "capability_chain": {
+      "standard": 10000,
+      "deep": 12000
+    }
+  },
+  "output_truncation_retry_by_operation": {
+    "security_review": {
+      "max_retries": 1,
+      "retry_output_tokens_by_tier": {
+        "standard": 10000,
+        "deep": 14000
+      }
+    },
+    "capability_chain": {
+      "max_retries": 1,
+      "retry_output_tokens_by_tier": {
+        "standard": 12000,
+        "deep": 14000
+      }
+    }
+  },
+  "reasoning_effort_by_operation_by_tier": {
+    "security_review": {
+      "standard": "medium",
+      "deep": "high"
+    },
+    "capability_chain": {
+      "standard": "medium",
+      "deep": "high"
+    }
   }
 }

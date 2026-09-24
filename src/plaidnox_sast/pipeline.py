@@ -226,6 +226,7 @@ class SastPipeline:
         ai_discovery_errors: list[str] = []
         ai_discovery_unexpected_failures = 0
         ai_discovery_unresolved_obligations = 0
+        ai_required_coverage_unresolved = 0
         ai_discovery_contract_failures = 0
         ai_context_error_type = ""
         ai_context_error = ""
@@ -298,6 +299,9 @@ class SastPipeline:
             ai_discovery_unexpected_failures = int(getattr(deep_hunt_agent, "discovery_unexpected_failures", 0))
             ai_discovery_unresolved_obligations = int(
                 getattr(deep_hunt_agent, "discovery_unresolved_obligations", 0)
+            )
+            ai_required_coverage_unresolved = int(
+                getattr(deep_hunt_agent, "discovery_required_coverage_unresolved", 0)
             )
             ai_discovery_contract_failures = int(
                 getattr(deep_hunt_agent, "discovery_contract_failures", 0)
@@ -543,7 +547,7 @@ class SastPipeline:
             ai_context_failures
             or ai_planning_failures
             or ai_discovery_failures
-            or ai_discovery_unresolved_obligations
+            or ai_required_coverage_unresolved
             or ai_discovery_contract_failures
             or ai_failures
             or ai_variant_failures
@@ -623,6 +627,12 @@ class SastPipeline:
                 "ai_discovery_errors": ai_discovery_errors,
                 "ai_discovery_unexpected_failures": ai_discovery_unexpected_failures,
                 "ai_discovery_unresolved_obligations": ai_discovery_unresolved_obligations,
+                "ai_required_coverage_unresolved": ai_required_coverage_unresolved,
+                **{
+                    f"discovery_{key}": value
+                    for key, value in getattr(deep_hunt_agent, "discovery_metrics", {}).items()
+                    if key.startswith("canonical_") or key in {"obligations_reconciled_by_sibling", "candidate_grounding_rejections"}
+                },
                 "ai_discovery_contract_failures": ai_discovery_contract_failures,
                 "deduplicated_candidates": duplicate_count,
                 "rejected_candidates": rejected_count,

@@ -4,6 +4,7 @@
   "properties": {
     "candidates": {
       "type": "array",
+      "maxItems": 3,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -44,11 +45,11 @@
           },
           "message": {
             "type": "string",
-            "maxLength": 1200
+            "maxLength": 480
           },
           "attack_path": {
             "type": "string",
-            "maxLength": 1200
+            "maxLength": 480
           },
           "evidence_basis": {
             "type": "object",
@@ -56,44 +57,50 @@
             "properties": {
               "origin": {
                 "type": "array",
+                "maxItems": 3,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               },
               "propagation": {
                 "type": "array",
+                "maxItems": 4,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               },
               "expected_boundary": {
                 "type": "array",
+                "maxItems": 3,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               },
               "sensitive_effect": {
                 "type": "array",
+                "maxItems": 3,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               },
               "controls_checked": {
                 "type": "array",
+                "maxItems": 4,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               },
               "missing_evidence": {
                 "type": "array",
+                "maxItems": 3,
                 "items": {
                   "type": "string",
-                  "maxLength": 800
+                  "maxLength": 240
                 }
               }
             },
@@ -113,6 +120,7 @@
           },
           "classification_references": {
             "type": "array",
+            "maxItems": 3,
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -146,7 +154,7 @@
           },
           "business_impact": {
             "type": "string",
-            "maxLength": 1600
+            "maxLength": 480
           }
         },
         "required": [
@@ -171,7 +179,7 @@
     },
     "next_focus": {
       "type": "string",
-      "maxLength": 2000
+      "maxLength": 500
     },
     "coverage": {
       "type": "object",
@@ -179,23 +187,26 @@
       "properties": {
         "obligations_reviewed": {
           "type": "array",
+          "maxItems": 8,
           "items": {
             "type": "string",
-            "maxLength": 800
+            "maxLength": 240
           }
         },
         "branches_reviewed": {
           "type": "array",
+          "maxItems": 8,
           "items": {
             "type": "string",
-            "maxLength": 800
+            "maxLength": 240
           }
         },
         "unresolved_areas": {
           "type": "array",
+          "maxItems": 5,
           "items": {
             "type": "string",
-            "maxLength": 800
+            "maxLength": 240
           }
         }
       },
