@@ -43,9 +43,8 @@ def test_vulnerable_snippet_is_exact_changed_range_and_redacted(tmp_path: Path):
     ]
 
 
-def test_evidence_trace_branches_from_downstream_trust_to_sensitive_effects():
-    candidate = _candidate()
-    evidence = (
+def _branching_evidence() -> tuple[ReviewEvidence, ...]:
+    return (
         ReviewEvidence(
             EvidenceRole.ATTACKER_ORIGIN,
             "deep_hunt",
@@ -88,14 +87,19 @@ def test_evidence_trace_branches_from_downstream_trust_to_sensitive_effects():
         ),
     )
 
+
+def test_evidence_trace_branches_from_downstream_trust_to_sensitive_effects():
     trace = build_evidence_trace(
-        candidate,
-        evidence,
+        _candidate(),
+        _branching_evidence(),
         attack_path="bearer token -> req.user -> protected routes",
         gained_capability="Forge identity claims",
     )
 
     assert trace is not None
+    assert trace.trace_type == "taint_and_trust"
+    assert trace.complete is True
+    assert trace.evidence_gaps == ()
     assert len(trace.entry_nodes) == 1
     assert len(trace.terminal_nodes) == 2
     terminal_ids = set(trace.terminal_nodes)
@@ -105,3 +109,18 @@ def test_evidence_trace_branches_from_downstream_trust_to_sensitive_effects():
         for edge in trace.edges
         if edge.source == downstream.node_id
     } == terminal_ids
+    assert {edge.relation for edge in trace.edges} == {"supports_transition"}
+
+
+def test_evidence_trace_marks_unresolved_evidence_gap_incomplete():
+    trace = build_evidence_trace(
+        _candidate(),
+        _branching_evidence(),
+        attack_path="bearer token -> req.user -> protected routes",
+        gained_capability="Forge identity claims",
+        evidence_gaps=("Runtime-only authorization branch was not observed",),
+    )
+
+    assert trace is not None
+    assert trace.complete is False
+    assert trace.evidence_gaps == ("Runtime-only authorization branch was not observed",)
