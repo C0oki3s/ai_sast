@@ -27,6 +27,7 @@ from .context_store import ApplicationContext
 from .evidence import ReviewEvidence, build_review_evidence
 from .l1_review import L1Candidate
 from .snapshots import materialize_revision
+from .trace import EvidenceTrace, VulnerableSnippet, build_evidence_trace, build_vulnerable_snippet
 
 VerificationState = Literal["verified", "rejected", "unresolved"]
 
@@ -55,6 +56,8 @@ class CandidateVerification:
     context_expansion: CandidateContextExpansion | None = None
     proof_plan: str = ""
     regression_test: str = ""
+    vulnerable_snippet: VulnerableSnippet | None = None
+    evidence_trace: EvidenceTrace | None = None
 
 
 class CandidateVerifier(Protocol):
@@ -166,6 +169,11 @@ class SastDeepHuntVerifier:
                     state = "verified"
                 else:
                     state = "rejected"
+                review_evidence = build_review_evidence(
+                    hypothesis,
+                    expansion,
+                    review.evidence_locations,
+                )
                 results.append(
                     CandidateVerification(
                         candidate_id=hypothesis.candidate_id,
@@ -188,14 +196,17 @@ class SastDeepHuntVerifier:
                         ),
                         evidence_gaps=(*(review.evidence_gaps or ()), *expansion.unresolved_gaps),
                         route=route,
-                        evidence=build_review_evidence(
-                            hypothesis,
-                            expansion,
-                            review.evidence_locations,
-                        ),
+                        evidence=review_evidence,
                         context_expansion=expansion,
                         proof_plan=review.proof_plan,
                         regression_test=review.regression_test,
+                        vulnerable_snippet=build_vulnerable_snippet(root, hypothesis),
+                        evidence_trace=build_evidence_trace(
+                            hypothesis,
+                            review_evidence,
+                            attack_path=review.attack_path,
+                            gained_capability=review.gained_capability,
+                        ),
                     )
                 )
         return tuple(results)

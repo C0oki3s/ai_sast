@@ -1,0 +1,52 @@
+name: Discovery correctness checks
+
+on:
+  pull_request:
+    paths:
+      - "src/plaidnox_sast/**"
+      - "src/plaidnox_scm/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/discovery-fixes.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install package and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest httpx ruff
+      - name: Lint changed modules
+        run: |
+          # This focused workflow validates the new correctness code. The repo's
+          # existing touched modules carry style-only I001/BLE001/SIM905/noqa
+          # debt, so those rules are excluded from this security regression job.
+          ruff check --ignore I001,BLE001,SIM905,RUF100 \
+            src/plaidnox_sast/optimized_ai.py \
+            src/plaidnox_sast/fingerprint.py \
+            src/plaidnox_sast/cli.py \
+            src/plaidnox_scm/production.py \
+            src/plaidnox_scm/verification.py \
+            src/plaidnox_scm/trace.py \
+            tests/test_optimized_discovery.py \
+            tests/test_root_cause_semantics.py \
+            tests/test_scm_trace.py
+      - name: Run focused regression tests
+        run: |
+          pytest -q \
+            tests/test_optimized_discovery.py \
+            tests/test_root_cause_semantics.py \
+            tests/test_scm_trace.py \
+            tests/test_candidate_dedupe.py \
+            tests/test_scm_verification.py

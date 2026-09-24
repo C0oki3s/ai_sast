@@ -9,7 +9,8 @@ import threading
 from pathlib import Path
 
 from .acceptance import evaluate_acceptance_manifest, write_acceptance_result
-from .ai import PlaidNoxDeepHuntAgent, load_env_file
+from .ai import load_env_file
+from .optimized_ai import OptimizedPlaidNoxDeepHuntAgent
 from .asset_bundle import (
     create_asset_bundle,
     load_asset_bundle,
@@ -272,7 +273,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     verify_configured_asset_bundle()
-    deep_hunt_agent = PlaidNoxDeepHuntAgent.from_environment(args.model, args.max_output_tokens)
+    deep_hunt_agent = OptimizedPlaidNoxDeepHuntAgent.from_environment(args.model, args.max_output_tokens)
     deep_hunt_agent.set_event_sink(lambda event: print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True))
     if args.saist and not args.saist_bin:
         raise SystemExit("--saist requires --saist-bin pointing to the upstream datadog-saist binary")

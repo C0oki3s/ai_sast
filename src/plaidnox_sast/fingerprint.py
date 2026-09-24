@@ -66,16 +66,23 @@ def _classification_ids(candidate: Candidate) -> frozenset[str]:
 
 
 def root_cause_key(candidate: Candidate) -> str:
-    """Model-declared identity: where the control lives and which control is broken.
+    """Semantic identity of one broken control at one code root.
 
-    Empty when the model did not name both, so callers fall back to location heuristics.
+    The symbol and security-control name identify the implementation point;
+    broken invariant and gained capability prevent distinct weaknesses in the
+    same control from being collapsed into one finding.
     """
     root = candidate.metadata.get("root_cause") or {}
     symbol = _normalize(str(root.get("symbol", "")))
     control = re.sub(r"[^a-z0-9]+", "-", str(root.get("security_control", "")).lower()).strip("-")
+    invariant = _normalize(str(root.get("broken_invariant", "")))
+    capability = _normalize(str(root.get("capability", "")))
     if not symbol or not control:
         return ""
-    return f"{_normalize(candidate.evidence.path)}|{symbol}|{control}"
+    # Older/non-AI candidates may not carry the richer fields. Keep their
+    # historical symbol+control identity instead of making dedupe disappear.
+    semantic_tail = f"|{invariant}|{capability}" if invariant or capability else ""
+    return f"{_normalize(candidate.evidence.path)}|{symbol}|{control}{semantic_tail}"
 
 
 def absorb(kept: Candidate, duplicate: Candidate) -> None:

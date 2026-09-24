@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from plaidnox_sast.ai import PlaidNoxDeepHuntAgent
 from plaidnox_sast.assets import load_json as load_sast_json
-from plaidnox_sast.routers import CandidateRouter
 from plaidnox_sast.llm import (
     LiteLLMConfigurationError,
     LiteLLMResponsesClient,
     LiteLLMSettings,
 )
+from plaidnox_sast.optimized_ai import OptimizedPlaidNoxDeepHuntAgent
+from plaidnox_sast.routers import CandidateRouter
 
 from .application_context import SastApplicationContextBuilder
 from .l1_review import LiteLLMChangedFileReviewer
@@ -36,7 +36,7 @@ def dependencies_from_environment() -> ReviewDependencies:
     except ImportError as exc:
         raise LiteLLMConfigurationError("Install the AI extra with: pip install -e '.[ai]'") from exc
     client = LiteLLMResponsesClient(settings, litellm.responses)
-    agent = PlaidNoxDeepHuntAgent(client, model=model)
+    agent = OptimizedPlaidNoxDeepHuntAgent(client, model=model)
     return ReviewDependencies(
         context_builder=SastApplicationContextBuilder(agent),
         l1_reviewer=LiteLLMChangedFileReviewer(client),
