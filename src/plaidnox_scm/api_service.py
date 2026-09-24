@@ -26,8 +26,10 @@ from .api_models import (
     TriageStatus,
 )
 from .assets import load_json
+from .baseline import FindingBaselineClassification
 from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
+from .policy import evaluate_merge_policy
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
 from .source_broker import SourceBroker
@@ -77,6 +79,14 @@ class _LeaseHeartbeat:
         while not self._stop.wait(self._heartbeat_seconds):
             with attempts.unit_of_work(self._session_factory, self._tenant_id) as repository:
                 repository.renew(self._review_id, self._lease_owner, self._lease_seconds)
+
+_POLICY_ACTIONS = {
+    "PASS": PolicyAction.ALLOW,
+    "WARN": PolicyAction.WARN,
+    "BLOCK": PolicyAction.BLOCK,
+    "REQUIRE_SECURITY_APPROVAL": PolicyAction.REQUIRE_SECURITY_APPROVAL,
+    "INCOMPLETE": PolicyAction.INCOMPLETE,
+}
 
 _COUNTER_FIELDS = (
     "candidates_generated",
@@ -181,6 +191,8 @@ class ReviewService:
                 counters=_counters_dict(result.counters),
                 findings=[finding.model_dump(mode="json") for finding in response.findings],
             )
+        if completed:
+            self._record_fix_validations(tenant_id, review_id, result)
         if not completed:
             # Another worker's reclaim already won the lease -- e.g. this one
             # stalled past its lease and a duplicate delivery took over. That
@@ -282,6 +294,7 @@ class ReviewService:
 
         with triage.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
             outcome = repository.apply_command(finding_id, review_id, command, actor=actor, reason=reason)
+        reevaluated = self._reevaluate_policy(attempt)
         return TriageResponse(
             finding_id=finding_id,
             review_id=review_id,
@@ -291,7 +304,46 @@ class ReviewService:
             reason=outcome.triage.reason,
             applied=outcome.applied,
             updated_at=outcome.triage.updated_at,
+            review_action=reevaluated[0] if reevaluated else None,
+            review_summary=reevaluated[1] if reevaluated else None,
         )
+
+    def _reevaluate_policy(self, attempt: attempts.ReviewAttempt) -> tuple[PolicyAction, str] | None:
+        """Recomputes a completed review's merge action against current triage states.
+
+        Only the persisted verified findings can carry a non-PASS decision
+        (baseline-only and unverified classifications always PASS), so the
+        policy over `attempt.findings` reproduces the original decision
+        exactly, now with triage applied. An INCOMPLETE review is left alone:
+        triage never substitutes for missing coverage.
+        """
+
+        if attempt.state != "completed" or attempt.action in (None, PolicyAction.INCOMPLETE.value):
+            return None
+        classifications = tuple(_classification_from_finding(item) for item in attempt.findings)
+        with triage.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
+            states = repository.get_states(item.finding_fingerprint for item in classifications)
+        policy = evaluate_merge_policy(classifications, coverage_complete=True, triage_states=states)
+        action = _POLICY_ACTIONS[policy.decision]
+        counters = {**(attempt.counters or {}), "blocking": policy.blocking_count, "in_triage": policy.in_triage_count}
+        summary = _summary_text(policy.decision, len(attempt.findings), policy.blocking_count, policy.in_triage_count)
+        with attempts.unit_of_work(self.session_factory, attempt.tenant_id) as repository:
+            repository.update_policy(attempt.review_id, action=action.value, summary=summary, counters=counters)
+        return action, summary
+
+    def _record_fix_validations(self, tenant_id: str, review_id: str, result: ReviewResult) -> None:
+        """A later review's independent classification is the only fix validation.
+
+        `RESOLVED` proves the root cause is gone at this revision; a finding
+        re-verified while `fix_pending` proves the claimed fix did not land.
+        """
+
+        with triage.unit_of_work(self.session_factory, tenant_id) as repository:
+            for item in result.baseline_classifications:
+                if item.relationship == "RESOLVED":
+                    repository.record_fix_validation(item.finding_fingerprint, review_id, resolved=True)
+                elif item.verification_state == "verified":
+                    repository.record_fix_validation(item.finding_fingerprint, review_id, resolved=False)
 
     def get_triage(self, review_id: str, finding_id: str) -> TriageStatus | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
@@ -394,13 +446,7 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
             )
         )
 
-    action = {
-        "PASS": PolicyAction.ALLOW,
-        "WARN": PolicyAction.WARN,
-        "BLOCK": PolicyAction.BLOCK,
-        "REQUIRE_SECURITY_APPROVAL": PolicyAction.REQUIRE_SECURITY_APPROVAL,
-        "INCOMPLETE": PolicyAction.INCOMPLETE,
-    }[result.policy.decision]
+    action = _POLICY_ACTIONS[result.policy.decision]
     incomplete_reason = None
     if action is PolicyAction.INCOMPLETE:
         reasons = (*result.coverage_gaps, *result.policy.reasons)
@@ -409,7 +455,9 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
         review_id=_review_id(request),
         head_sha=request.head_sha,
         action=action,
-        summary=_summary(result, len(findings)),
+        summary=_summary_text(
+            result.policy.decision, len(findings), result.counters.blocking, result.counters.in_triage
+        ),
         findings=findings,
         incomplete_reason=incomplete_reason,
         counters=_counters_dict(result.counters),
@@ -450,13 +498,30 @@ def _review_id(request: ReviewRequest) -> str:
     return f"review_{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
 
 
-def _summary(result: ReviewResult, finding_count: int) -> str:
-    decision = result.policy.decision
-    counts = result.counters
+def _classification_from_finding(finding: dict[str, object]) -> FindingBaselineClassification:
+    return FindingBaselineClassification(
+        relationship=str(finding["baseline_relationship"]).upper(),  # type: ignore[arg-type]
+        root_cause_fingerprint=str(finding["root_cause_fingerprint"]),
+        finding_fingerprint=str(finding["finding_id"]),
+        candidate_id=None,
+        verification_state="verified",
+        baseline_state=None,
+        root_cause_path=str(finding["root_cause_path"]),
+        root_cause_symbol=str(finding["root_cause_symbol"]),
+        vulnerability_class=str(finding.get("category") or ""),
+        title=str(finding["title"]),
+        severity=str(finding["severity"]),
+        confidence=float(finding["confidence"]),  # type: ignore[arg-type]
+        root_cause_changed_in_review=bool(finding["root_cause_changed_in_pr"]),
+        reason="Rebuilt from the persisted verified finding for triage re-evaluation.",
+    )
+
+
+def _summary_text(decision: str, finding_count: int, blocking: int, in_triage: int) -> str:
     if decision == "INCOMPLETE":
         return "Security review could not be completed with full confidence in the available context."
     if not finding_count:
         return "No security findings found."
-    if counts.blocking or counts.in_triage:
-        return f"{finding_count} verified finding(s): {counts.blocking} blocking, {counts.in_triage} requiring triage."
+    if blocking or in_triage:
+        return f"{finding_count} verified finding(s): {blocking} blocking, {in_triage} requiring triage."
     return f"{finding_count} verified finding(s) reported; none require merge action."

@@ -15,8 +15,10 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert "adversarial verification gates" in system.lower()
     assert '"candidate": "example"' in user
     assert load_json("schemas/deep_hunt_review.json")["required"][0] == "supported"
-    assert "analysis_depth" in load_json("routing/jev.json")["questions"]
-    assert "knowledge_action" in load_json("routing/knowledge_retrieval.json")["questions"]
+    models = load_json("runtime/models.json")
+    assert len(models["agent_models"]) > 3
+    assert all(item["cost"] != "high" for item in models["agent_models"])
+    assert "claude-opus-5" not in {item["name"] for item in models["agent_models"]}
     assert load_json("schemas/hunt_plan.json")["properties"]["tasks"]["minItems"] == 1
     assert "maxItems" not in load_json("schemas/vulnerability_discovery.json")["properties"]["candidates"]
     assert "Every production area" in render_prompt("operations/hunt_plan/system.md")
@@ -28,10 +30,9 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert load_json("runtime/litellm.json")["cache_managed_by"] == "litellm_gateway"
     assert load_json("runtime/code_intelligence.json")["maximum_dynamic_queries_per_task"] > 0
     assert load_json("runtime/models.json")["agent_default_model"]
-    assert load_json("runtime/jev.json")["request_timeout_seconds"] > 0
     assert load_json("runtime/production_controls.json")["model_budget"]["maximum_calls_per_scan"] > 0
     assert load_json("schemas/search_query_plan.json")["properties"]["queries"]["minItems"] == 1
-    assert "Rust-compatible ripgrep" in render_prompt("operations/search_query_plan/system.md")
+    assert "literal ripgrep search terms" in render_prompt("operations/search_query_plan/system.md")
     assert "perplexity_sonar" in load_json("research/providers.json")["providers"]
     assert "gate_results" in load_json("schemas/deep_hunt_review.json")["required"]
     assert "coverage" in load_json("schemas/vulnerability_discovery.json")["required"]
@@ -42,10 +43,13 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert load_json("prompts/manifest.json")["version"]
 
 
-def test_perplexity_sonar_is_routed_through_litellm():
+def test_perplexity_sonar_uses_the_direct_native_provider_boundary():
     provider = load_json("research/providers.json")["providers"]["perplexity_sonar"]
 
-    assert provider["litellm_model_prefix"] == "perplexity/perplexity/"
+    assert provider["api_key_environment"] == "IFRIT_PERPLEXITY_API_KEY"
+    assert provider["default_api_base"] == "https://api.perplexity.ai"
+    assert "litellm_model_prefix" not in provider
+    assert provider["provenance"] == "perplexity-sonar-direct"
     assert provider["default_model"] == "sonar"
 
 

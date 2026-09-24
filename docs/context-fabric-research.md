@@ -31,12 +31,10 @@ provider-neutral.
   raw prompts, and raw model responses are not stored.
 - Security memories are versioned and scoped. They influence triage but do not
   auto-close findings.
-- JEV chooses stable PlaidNox tiers, not provider/model identifiers.
+- Model tiers are stable PlaidNox names mapped to models in `runtime/models.json`, never hard-coded provider identifiers.
 - PlaidNox Deep Hunt is mandatory for every reportable finding.
 - Perplexity research is accepted only when its source URL is present in the
   Agent API search-result output; research alone cannot confirm a finding.
 - Every generative call uses versioned Jinja templates through LiteLLM. LiteLLM
   owns prompt caching, and the scanner records provider cache telemetry without
   storing prompt responses or security verdicts locally.
-- JEV routing remains a separate typed-decision request and has no application
-  prompt cache.

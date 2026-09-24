@@ -162,7 +162,7 @@ def test_postgresql_knowledge_adapter_is_content_addressed_reusable_and_idempote
         "title": "Review trust boundary",
         "objective": "Establish which metadata is authoritative.",
     }
-    decision = KnowledgeDecision("use_database", "framework", 0.94, "jev-test", "stored guidance applies")
+    decision = KnowledgeDecision("use_database", "framework", 0.94, "test-model", "stored guidance applies")
     store.record_usage(repository, revision, task["task_id"], "proxy behavior", decision, [entry])
     store.record_usage(repository, revision, task["task_id"], "proxy behavior", decision, [entry])
     plan_id = store.save_plan(repository, revision, "Review observed boundaries.", [task])
@@ -259,7 +259,7 @@ def test_postgres_knowledge_store_round_trips_claims():
 def test_postgres_knowledge_store_record_usage_creates_task_row_before_plan_is_saved():
     factory = _session_factory()
     store = PostgresKnowledgeStore(factory, "tenant-a")
-    decision = KnowledgeDecision("reuse_stored", "task", 0.9, "jev-model", "already covered")
+    decision = KnowledgeDecision("reuse_stored", "task", 0.9, "test-model", "already covered")
 
     store.record_usage("owner/repo", "revision-1", "task-key-1", "jwt verification", decision, [])
 

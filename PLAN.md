@@ -22,7 +22,7 @@ current scanner runtime.
 
 These rules are mandatory for every PlaidNox Code Scanning change.
 
-1. **No inline model assets.** Markdown prompt templates, JSON response schemas, JEV questions,
+1. **No inline model assets.** Markdown prompt templates, JSON response schemas,
    model-tier mappings, classification criteria, and remediation instructions
    live in versioned assets under `src/plaidnox_sast/assets/`.
 2. **PostgreSQL is the production database.** Runtime persistence uses
@@ -53,14 +53,15 @@ These rules are mandatory for every PlaidNox Code Scanning change.
 9. **Memory is evidence, not authority.** Threat statements, security memories,
    earlier verdicts, and web research are scoped, versioned, sourced, auditable,
    and reversible. None can silently confirm or close a finding.
-10. **JEV controls knowledge retrieval.** For every hunt question, JEV chooses
-    exact stored reuse, broader database retrieval, or current web research.
-    Its prompts, confidence thresholds, and fallbacks remain versioned assets.
-11. **All generative model calls use LiteLLM.** Stable Markdown templates rendered with Jinja
-    instructions and schemas form the cacheable prefix. Dynamic task and source
-    context comes last. Prompt caching is owned by LiteLLM, cache metrics are
-    recorded, and security verdicts are never reused merely because the prompt
-    was cached.
+10. **Knowledge retrieval is deterministic.** For every hunt question the coordinator tries
+    exact stored reuse, then broader database retrieval, then current web research.
+11. **Scan reasoning uses LiteLLM; web research uses Perplexity directly.** Stable Markdown
+    templates rendered with Jinja instructions and schemas form the cacheable
+    prefix for FAST/STANDARD/DEEP scan calls. Dynamic task and source context
+    comes last. LiteLLM owns prompt caching and cache telemetry for scan
+    reasoning. Current web research uses the native Perplexity Sonar API with a
+    separately scoped credential, and only cited, schema-validated knowledge is
+    persisted. Security verdicts are never reused merely because a prompt was cached.
 12. **Safe static operation.** Code Scanning does not install dependencies,
     execute repository scripts, run builds, or import target code. Any later
     execution-based validation must use an isolated product/runtime boundary.
@@ -85,7 +86,7 @@ immutable source snapshot + codebase/revision + business/security context
   -> create or incrementally update Context Fabric
   -> LLM reconnaissance and architecture model
   -> LLM hunt-task plan with complete source/path ownership
-  -> JEV knowledge action per task
+  -> knowledge action per task (stored -> broadened -> web)
        -> reuse exact knowledge | retrieve broader knowledge | research current web
   -> Context Compiler selects minimum complete evidence slice
   -> broad AI-native candidate discovery
@@ -162,7 +163,7 @@ Status: foundation implemented; production hardening remains.
 - Readable tree and compact Tree-sitter Security IR.
 - External prompts, schemas, routing, runtime settings, and migrations.
 - AI-generated hunt plan and broad open-taxonomy discovery.
-- JEV knowledge decisions, sourced Perplexity research, and durable RAG.
+- Knowledge routing, sourced Perplexity research, and durable RAG.
 - Mandatory PlaidNox Deep Hunt and recursive variant sweeps.
 - JSON, SARIF, Markdown, and repository-context outputs.
 
@@ -254,6 +255,12 @@ Implemented in this phase:
 - failure-injection unit coverage for budgets, malformed configuration,
   provider-boundary accounting, lease recovery, retries, and scan
   finalization.
+- a snapshot-scoped local checkpoint journal that writes redacted LLM context,
+  response schema, routing/execution metadata, and each successful structured
+  response at the model-call boundary. Completed calls replay without provider
+  cost; an interrupted or failed call remains pending and is retried after a
+  restart. Discovery segments, candidate verdicts, and recursive sweeps retain
+  their higher-level checkpoints as well.
 
 Still required for the release exit: run the pinned NSTCTF and reviewed
 multi-language acceptance set repeatedly through LiteLLM, record reviewer

@@ -1,0 +1,10 @@
+{
+  "columns": [
+    "status",
+    "context_payload",
+    "context_hash",
+    "execution_payload",
+    "last_error_type",
+    "updated_at"
+  ]
+}

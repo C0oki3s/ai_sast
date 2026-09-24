@@ -285,7 +285,7 @@ def test_context_and_knowledge_adapters_run_against_deployable_postgresql_schema
         )
     )
     task = {"task_id": "object-access", "title": "Object access", "objective": "Verify ownership."}
-    decision = KnowledgeDecision("use_database", "repository", 0.9, "jev-test", "stored evidence applies")
+    decision = KnowledgeDecision("use_database", "repository", 0.9, "test-model", "stored evidence applies")
     knowledge_store.record_usage(
         repository_name,
         "revision-a",

@@ -31,8 +31,9 @@ PLAIDNOX_ASSET_BUNDLE_SIGNING_KEY=<secret-manager value>
 
 `*_FILE` variants are supported for protected values in the deployment
 example. Keep the LiteLLM gateway and PostgreSQL on a private network. Permit
-the worker to reach only those services and telemetry collectors. Provider and
-Perplexity egress belongs to LiteLLM, not to the scanner worker.
+the worker to reach only those services, telemetry collectors, and the
+Perplexity API. General model-provider egress belongs to LiteLLM; direct
+Perplexity egress is restricted to knowledge-routed security research (used only when stored knowledge is exhausted).
 
 ## Migrations and signed assets
 
@@ -114,3 +115,24 @@ migrations, verify migration checksums, reclaim an expired job lease, and
 compare artifact hashes. Record recovery time and recovery point results as
 release evidence. Do not test restore procedures against the production
 database.
+
+## Resuming an interrupted local scan
+
+`scan-local` creates `scan-checkpoint.sqlite` in the output directory unless
+`--no-checkpoint` is supplied. Use the same command, source snapshot, revision,
+output directory, and checkpoint path after a provider-credit failure, process
+crash, or operator interruption.
+
+The journal records every model operation as pending before the request. It
+stores the redacted rendered prompts, response schema, selected execution
+route, and failure type. A schema-valid response is then marked complete and
+stored. On restart, completed calls and completed discovery/review/sweep units
+are replayed without provider requests; the first pending operation is retried.
+Changing the codebase, revision, source-tree content, project security/business
+context, source policy, or prompt-manifest version discards stale units.
+
+The SQLite database and its sidecars are created with owner-only permissions
+because they can contain proprietary source context. Treat the output directory
+as a sensitive scan artifact. Report metrics expose counts and a redacted
+resume cursor (`checkpoint_resume_stage`, `checkpoint_resume_operation`, and
+`checkpoint_resume_error_type`), never the stored prompt text.

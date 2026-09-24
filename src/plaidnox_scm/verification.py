@@ -9,7 +9,7 @@ from typing import Literal, Protocol
 
 from plaidnox_sast.ai import AIResponseError, PlaidNoxDeepHuntAgent
 from plaidnox_sast.graph import build_structural_graph, source_file_is_admitted
-from plaidnox_sast.jev import JevRouter
+from plaidnox_sast.routers import CandidateRouter
 from plaidnox_sast.models import (
     Candidate,
     Depth,
@@ -75,12 +75,12 @@ class SastDeepHuntVerifier:
     def __init__(
         self,
         agent: PlaidNoxDeepHuntAgent,
-        router: JevRouter | None = None,
+        router: CandidateRouter | None = None,
         validator: FindingValidator | None = None,
         context_broker: ContextBroker | None = None,
     ) -> None:
         self._agent = agent
-        self._router = router or JevRouter()
+        self._router = router or CandidateRouter()
         self._validator = validator or FindingValidator()
         self._context_broker = context_broker or SCMContextBroker()
 

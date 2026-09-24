@@ -28,7 +28,7 @@ its end-to-end exit condition.
   rg-query generator and `_candidate_from_ai_item` parser as `sweep_variants`.
   Pivot hypotheses are never asserted directly — `pipeline.py`'s round loop
   feeds them back into `work_queue` as ordinary `Candidate`s, so each one
-  passes through the full independent JEV-routing + Deep Hunt review pipeline
+  passes through the full independent tier-routing + Deep Hunt review pipeline
   before it can become a finding, and the loop terminates via the pre-existing
   `seen_candidates` fingerprint-dedup set (no new round cap needed). The
   `capability_chain` prompt explicitly forbids asserting a pivot that depends
@@ -46,7 +46,7 @@ its end-to-end exit condition.
   asserting a capability-bearing finding spawns a pivot that is itself
   independently re-verified into a second, distinct finding, and that the
   loop ends once the pivot's own review names no further capability).
-- JEV knowledge action, Perplexity research with source validation, durable
+- Local knowledge routing (stored -> broadened search -> web), Perplexity research with source validation, durable
   knowledge reuse, and prompt-cache telemetry.
 - Optional DataDog SAIST AI candidate adapter.
 - JSON, SARIF 2.1.0, Markdown, and repository-context reports.
@@ -191,9 +191,9 @@ its end-to-end exit condition.
   down from the original proposal. `severity` and `vulnerability_class`
   stay in `vulnerability_discovery.json`/`variant_sweep.json`/
   `capability_chain.json` because they are load-bearing before Deep Hunt
-  ever runs: `JevRouter.classify` (`jev.py`) reads `candidate.severity` for
-  tier escalation and feeds `candidate.vulnerability_class` into the JEV
-  routing payload, so removing either would require a JEV routing redesign
+  ever runs: `CandidateRouter.classify` (`routers.py`) reads `candidate.severity` for
+  tier escalation and feeds `candidate.vulnerability_class` into the
+  routing rules, so removing either would require a routing redesign
   first. `remediation` had no such dependency — Deep Hunt review always
   overwrites `finding.remediation` for a supported candidate
   (`pipeline.py`'s `verify()`), and a rejected candidate's discovery-stage
@@ -255,7 +255,7 @@ The exit condition is met by
 `tests/test_context_fabric.py::test_unrelated_change_reuses_linked_finding_context`,
 `tests/test_ai.py::test_ai_builds_context_then_discovers_evidenced_candidates`,
 `tests/test_ai.py::test_ai_can_request_a_bounded_call_flow_only_when_needed`,
-and the source-policy cases in `tests/test_graph_jev.py` and `tests/test_ai.py`.
+and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
 
 ### 2b. Optional precision adapters — deferred follow-on
 
@@ -359,12 +359,12 @@ knowledge whenever production persistence is configured.
   `INCOMPLETE` the same way it does on `BLOCK`.
 - Actual LiteLLM model selection for FAST/STANDARD/DEEP tiers — implemented for
   the PlaidNox Deep Hunt review call. `runtime/models.json` carries a new
-  `agent_model_by_tier` map; `JevRouter.classify()`'s `RouteDecision.model_tier`
+  `agent_model_by_tier` map; `CandidateRouter.classify()`'s `RouteDecision.model_tier`
   is threaded from `pipeline.py`'s `verify()` into `PlaidNoxDeepHuntAgent.hunt()`
   / `.review()`, which resolve the tier to a concrete model per call
   (`_model_for_tier`) instead of a single fixed `self.model`. Recon, planning,
   discovery, variant sweeping, and consolidation remain on the default model —
-  JEV routing is candidate-scoped and does not naturally apply to those
+  Tier routing is candidate-scoped and does not naturally apply to those
   scan-level stages.
 - Full secret redaction gateway before every provider boundary — implemented.
   `redaction.py` is the single shared `redact`/`redact_payload` implementation;
@@ -376,8 +376,7 @@ knowledge whenever production persistence is configured.
   module.
 - Typed stage errors and incomplete-scan behavior for required AI failures —
   implemented. `errors.py` introduces a shared `AIStageError(RuntimeError)`
-  root; `AIConfigurationError`/`AIResponseError` (`ai.py`), `JevError`
-  (`jev.py`), and `SAISTError` (`saist.py`) all inherit from it. The broad
+  root; `AIConfigurationError`/`AIResponseError` (`ai.py`) and `SAISTError` (`saist.py`) all inherit from it. The broad
   `except Exception` catches in `pipeline.py` and `ai.py` are deliberately kept
   (narrowing them to only the typed hierarchy was evaluated and rejected: a
   real LiteLLM/SDK call can raise exception types outside this hierarchy, and
@@ -444,269 +443,15 @@ knowledge whenever production persistence is configured.
   range against the patched copy, so a patch that shifts line numbers without
   fixing the vulnerability can be misjudged; tracking hunk offsets was left
   out of this first scope.
-- JEV decision-plane hardening (3 concrete defects fixed plus scope-driven
-  retrieval, `context_profile` decomposition, capability-chain frontier
-  prioritization, and retry routing, scoped to changes with no design
-  ambiguity; the remaining JEV-as-decision-plane redesign — structured
-  knowledge cards and scan-budget allocation — is scoped separately and not
-  yet built). This completes all 4 of the "jobs" JEV was scoped to as a
-  decision plane (model routing, context routing, knowledge routing,
-  frontier routing):
-  - `JevClient.decide_questions` (`jev.py`) now routes `state` through
-    `redact_payload` before sending it to the remote JEV endpoint. JEV is a
-    generative-provider boundary like any other and `redaction.py`'s own
-    contract says every such payload must pass through it first; this
-    boundary had silently never done so. Covered by
-    `tests/test_graph_jev.py::test_jev_client_redacts_secrets_from_state_before_sending`.
-  - `JevKnowledgeRouter.classify` (`knowledge.py`) sent
-    `repository_context.get("repository")` to JEV, but
-    `AIRepositoryContext.to_dict()` has no `repository` key (it's
-    `codebase`) — the field was always `null`, silently starving the
-    `knowledge_scope` decision of the one fact it most needs. Fixed to read
-    `codebase`. Covered by
-    `tests/test_knowledge.py::test_jev_knowledge_router_sends_the_codebase_identifier`.
-  - `KnowledgeCoordinator.resolve_many` (`knowledge.py`) batched every
-    pending `research_web` query in a hunt task into a single research call,
-    then attached the same combined `entries` list to every one of those
-    queries — a query about JWT audience verification could receive research
-    results that actually answered a different, unrelated query in the same
-    task, contaminating the evidence a later Deep Hunt round reasons from.
-    Fixed by calling `research_provider.research` once per distinct pending
-    query, so a query's results are only ever the results for that query.
-    This trades the prior single-call-per-task cost optimization for
-    correctness; reintroducing batched research with per-query attribution
-    (e.g. a `query_id`-tagged response schema) is a valid future enhancement
-    but out of scope here. Covered by
-    `tests/test_knowledge.py::test_fresh_research_queries_are_resolved_independently_per_hunt_task`
-    and
-    `tests/test_knowledge.py::test_resolve_many_does_not_attribute_one_querys_research_to_another`.
-  - `knowledge_scope` (JEV's `repository`/`business_domain`/`framework`/
-    `vulnerability_class`/`advisory` classification, `knowledge.py`) was
-    decided but then ignored: both `KnowledgeCoordinator.resolve` and
-    `resolve_many` ran the same fixed `task.title + task.objective +
-    vulnerability_themes` search terms against `KnowledgeStore.search`
-    regardless of which scope JEV chose, so a `repository`-scoped and an
-    `advisory`-scoped decision retrieved identically. Added a
-    `_retrieval_terms(scope, query, task, repository_context)` helper that
-    maps each scope to the fields that actually carry that kind of fact
-    (`repository` → `repository_context["codebase"]`/`architecture`;
-    `framework` → `architecture`/`entry_points` text, there being no
-    dedicated framework/version field in `repository_context.json`;
-    `business_domain` → `business_invariants`; `vulnerability_class` →
-    `vulnerability_themes`; `advisory` → `vulnerability_themes` +
-    `external_services`), falling back to the raw query when nothing scope-
-    relevant is known. Wired into both `resolve` and `resolve_many`'s
-    `retrieve_database` branches, replacing the previous scope-blind terms.
-    Covered by `tests/test_knowledge.py::test_retrieval_terms_uses_repository_scoped_task_facts`,
-    `test_retrieval_terms_uses_framework_scoped_repository_facts`,
-    `test_retrieval_terms_uses_business_domain_scoped_facts`,
-    `test_retrieval_terms_uses_vulnerability_class_scoped_facts`,
-    `test_retrieval_terms_uses_advisory_scoped_facts`,
-    `test_retrieval_terms_falls_back_to_the_query_when_nothing_is_known`,
-    and the integration test
-    `test_resolve_retrieves_with_scope_shaped_terms`.
-  - `context_profile` (`routing/jev.json`) was a single mutually exclusive
-    choice (local/cross_file/stateful/external_knowledge/mixed), but more
-    than one axis is routinely relevant at once, and the value was never
-    actually consumed anywhere downstream — only echoed into
-    `finding.metadata["context_profile"]` for reporting. Replaced with 5
-    independent NOUL (no/unlikely/likely/yes) signals —
-    `needs_cross_file`, `needs_state_reconstruction`,
-    `needs_external_semantics`, `needs_environment_context`,
-    `needs_deep_falsification` — plus a 1-5 `analysis_complexity` score.
-    `JevAnswer`'s existing `{choice, confidence}` wire contract is reused
-    unchanged (no new JEV question type was invented; this is the only
-    contract this codebase has ever proven against the real endpoint).
-    `RouteDecision.profile` is gone; the 6 new fields live on
-    `RouteDecision` directly, are threaded into `finding.metadata` as
-    `jev_needs_*`/`jev_analysis_complexity`, and are surfaced in SARIF as
-    `jevNeeds*`/`jevAnalysisComplexity` properties
-    (`jev.py`, `models.py`, `validation.py`, `reporters.py`).
-    `JevRouter._local_classify`'s fallback sets all 5 signals to `likely`
-    and complexity to 4 for CRITICAL/HIGH severity, `unlikely`/2 otherwise
-    — preserving today's severity-based behavior when JEV is absent.
-    These signals are now wired into two real behaviors rather than left
-    as unused diagnostics:
-    - `AIAgent.hunt`'s context-expansion budget
-      (`_context_expansion_max_requests` in `ai.py`) grows by
-      `context_expansion_signal_bonus_requests` (2) per breadth signal
-      (`needs_cross_file`/`needs_state_reconstruction`/
-      `needs_external_semantics`/`needs_environment_context`) reporting
-      `likely`/`yes`, capped at `context_expansion_max_requests_per_round_ceiling`
-      (13, both new `runtime/agent.json` keys). This only ever grows the
-      budget above the prior static base of 5, never below it.
-    - `_structured_response`'s reasoning effort can be escalated above the
-      operation's static `reasoning_effort_by_operation` default (never
-      below it — `_stronger_effort` in `ai.py`) via
-      `_hunt_effort_override`, which escalates to `high` when
-      `analysis_complexity >= 4` or `needs_deep_falsification` is
-      `likely`/`yes`. Note: `security_review`/`metadata_exposure_review`
-      are already statically configured at `high`, so this override is
-      currently inert for `hunt()`'s own call site — lowering that static
-      baseline so the escalation has a production effect is a deliberate
-      cost/rigor trade-off left for the user to decide, not bundled into
-      this change.
-    Covered by `tests/test_graph_jev.py::test_jev_escalates_ssrf_to_deep`,
-    `test_jev_uses_high_confidence_remote_route`,
-    `test_jev_falls_back_when_confidence_is_low`, and (in `test_ai.py`)
-    `test_stronger_effort_escalates_above_the_configured_default`,
-    `test_stronger_effort_never_downgrades_the_configured_default`,
-    `test_hunt_effort_override_is_none_without_a_route`,
-    `test_hunt_effort_override_escalates_for_a_high_complexity_route`,
-    `test_hunt_effort_override_escalates_for_a_falsification_flagged_route`,
-    `test_hunt_effort_override_is_none_for_a_low_complexity_uncontested_route`,
-    `test_structured_response_escalates_reasoning_effort_when_jev_route_demands_it`,
-    `test_context_expansion_max_requests_defaults_without_a_route`,
-    `test_context_expansion_max_requests_grows_with_breadth_signals_and_is_capped`,
-    `test_hunt_caps_context_expansion_requests_per_round_by_default`, and
-    `test_hunt_expands_more_context_per_round_when_jev_route_flags_broad_evidence_need`.
-  - Capability-chain frontier prioritization: `chain_capability_pivots`
-    (`ai.py`) treated every verified finding with a non-empty
-    `gained_capability` uniformly — no ranking and no budget cap — so a
-    finding set with many capable roots could spend unbounded AI search
-    budget chasing pivots from all of them at once. Added
-    `routing/capability_chain_frontier.json` (a single `pivot_priority`
-    choice question: `low`/`standard`/`high`), `FRONTIER_PRIORITY_WEIGHT`,
-    `FrontierDecision`, and `JevFrontierRouter` (`jev.py`) — mirroring
-    `JevRouter`'s "always-works" pattern (optional client, deterministic
-    `_local_prioritize` severity-based fallback: CRITICAL/HIGH → `high`,
-    else `standard`) rather than `JevKnowledgeRouter`'s externally-gated
-    pattern, since budget-capping must apply deterministically whether or
-    not JEV is configured. `PlaidNoxDeepHuntAgent` gained a
-    `frontier_router` attribute (defaulting to a local-only
-    `JevFrontierRouter()`) and a `configure_capability_frontier` setter,
-    wired in `cli.py` alongside the existing `configure_knowledge` call.
-    `chain_capability_pivots` now ranks capable findings by
-    `FRONTIER_PRIORITY_WEIGHT[JevFrontierRouter.prioritize(...).priority]`
-    (stable sort, so equal-priority findings keep their original order) and,
-    when the capable list exceeds the new `capability_chain_max_frontier`
-    (5, `runtime/agent.json`), keeps only the top-N ranked findings in the
-    `capability_payload` sent to every search segment — this only ever
-    narrows which findings are chased, it never changes verification: every
-    finding that already passed Deep Hunt stays a reported finding
-    regardless of frontier ranking. Covered by
-    `tests/test_graph_jev.py::test_frontier_priority_weight_orders_low_below_standard_below_high`,
-    `test_frontier_router_locally_prioritizes_high_severity_capabilities_as_high`,
-    `test_frontier_router_locally_prioritizes_other_severities_as_standard`,
-    `test_frontier_router_uses_high_confidence_remote_route`,
-    `test_frontier_router_falls_back_when_confidence_is_low`, and (in
-    `test_ai.py`)
-    `test_capability_chain_caps_and_prioritizes_findings_when_over_budget`.
-  - Retry routing: `hunt`'s context-expansion round loop (`ai.py`) exhausts
-    its budget after `context_expansion_max_rounds` (2) rounds and, if a
-    genuine evidence gap remains (`review.context_requests` still
-    non-empty), previously just returned whatever `review` it had —
-    Deep Hunt had already expanded context twice with no further decision
-    point, exactly the scenario the original JEV proposal calls out for a
-    retry decision. Added `routing/retry_route.json` (a single `next_action`
-    choice question: `retry_same_model`/`escalate_model`/`expand_context`/
-    `mark_unresolved`), `RetryDecision`, and `JevRetryRouter` (`jev.py`) —
-    same "always-works" pattern as `JevRouter`/`JevFrontierRouter` (optional
-    client, deterministic `_local_decide` fallback: escalate the model tier
-    if the candidate was never routed to DEEP, else expand context if a
-    request is still pending, else mark unresolved). `hunt`'s round-loop
-    body was extracted into `_run_hunt_round` (used unchanged by both the
-    normal loop and the new retry path, so nothing about the existing
-    request shape changed) and a new `_apply_retry_route` consults
-    `self.retry_router` — a new `retry_router` attribute (defaulting to a
-    local-only `JevRetryRouter()`) with a `configure_retry_route` setter,
-    wired in `cli.py` alongside the frontier router — exactly once after
-    the round loop ends with a pending gap, bounded to at most one
-    additional `_run_hunt_round` call regardless of the chosen action, so
-    retry routing can never grow unbounded. `escalate_model` forces
-    `ModelTier.DEEP` and `"high"` reasoning effort for that one round;
-    `expand_context` (also covering the proposal's `external_research`,
-    since which specific context a pending request resolves to is already
-    deterministic per-kind dispatch in `_resolve_context_request`, not a
-    JEV decision) resolves the pending `context_requests` before the extra
-    round; `retry_same_model`/`mark_unresolved` change nothing about
-    routing, with `mark_unresolved` skipping the extra round entirely. The
-    state sent to JEV (`_retry_facts`) is investigation-progress facts only
-    — `model_tier`, `rounds_used`, `context_requests_pending`,
-    `resolved_requests`, `unresolved_gates` (from `gate_results`), and
-    `evidence_gaps`/`confidence_history` — never source code. Covered by
-    `tests/test_graph_jev.py::test_retry_router_locally_escalates_a_candidate_never_routed_to_deep`,
-    `test_retry_router_locally_expands_context_for_a_deep_candidate_with_a_pending_request`,
-    `test_retry_router_locally_marks_unresolved_when_deep_and_nothing_pending`,
-    `test_retry_router_uses_high_confidence_remote_route`,
-    `test_retry_router_falls_back_when_confidence_is_low`, and (in
-    `test_ai.py`)
-    `test_ai_review_stops_requesting_context_at_the_configured_round_limit`
-    (updated to assert the bounded extra round and the escalated model),
-    `test_ai_review_retry_route_does_not_add_a_second_extra_round`,
-    `test_ai_review_retry_route_skips_the_extra_round_when_jev_marks_unresolved`.
-  - Structured knowledge claim cards: `JevKnowledgeRouter.classify` sent
-    JEV only stored-knowledge *metadata* (`knowledge_id`, `topic`,
-    `ecosystem`, `framework`, `source_url`, `source_updated_at`,
-    `confidence`) — never what a stored entry actually says — so JEV could
-    not genuinely judge `USE_DATABASE` vs `RETRIEVE_DATABASE` vs
-    `RESEARCH_WEB` sufficiency from a title and a source URL alone. Added a
-    `claims: list[str]` field to `KnowledgeEntry` (short, plain factual
-    statements the entry asserts, not the full `content` body) and threaded
-    it through every layer that produces or stores knowledge: `normalised()`
-    strips/truncates each claim to `knowledge_claim_characters` (240,
-    `runtime/agent.json`) and caps the list to `knowledge_max_claims` (6);
-    `JevKnowledgeRouter.classify`'s `stored_knowledge` payload now includes
-    `"claims": item.claims` per entry; `LiteLLMKnowledgeProvider.research`'s
-    LLM schema (`schemas/knowledge_research.json`) requires a `claims` array
-    (1-6 items, 240 chars each) per returned entry, with the research prompt
-    (`prompts/operations/knowledge_research/system.md`) instructing the
-    model to extract them; both storage backends persist and round-trip
-    claims — SQLite (`sql/knowledge/upsert.sql`, `search.sql`,
-    `migrations/0003_security_knowledge.sql`, JSON-encoded as a `TEXT`
-    column) and PostgreSQL (`migrations/postgresql/0001_code_scanning_core.sql`
-    adds `claims JSONB NOT NULL DEFAULT '[]'::jsonb`,
-    `persistence/models.py`'s `SecurityKnowledgeRecord` adds a `JSON`-typed
-    `claims` column, `persistence/repositories.py`'s `KnowledgeInput`/
-    `_knowledge_value` and `persistence/adapters.py`'s
-    `PostgresKnowledgeStore` carry it through unchanged). `claims` is
-    deliberately excluded from `content_hash` (claims summarize `content`,
-    they are not new identity), so re-upserting identical topic/content/
-    source with different claims still dedupes to the same row. Covered by
-    `tests/test_knowledge.py::test_knowledge_entry_normalised_strips_and_caps_claims`,
-    `test_knowledge_store_round_trips_claims`,
-    `test_jev_knowledge_router_sends_stored_claims_not_just_metadata`,
-    `test_perplexity_sonar_research_keeps_only_returned_citations` (extended
-    to assert `claims`), and
-    `tests/test_persistence_adapters.py::test_postgres_knowledge_store_round_trips_claims`.
-  - Scan-budget allocation: `JevRouter.classify` (`pipeline.py`) already
-    routes each candidate to FAST/STANDARD/DEEP independently based on its
-    own severity/signals, but nothing bounded how many candidates could land
-    on the most expensive DEEP tier in a single scan — a candidate set with
-    unusually many CRITICAL/HIGH findings (or a JEV instance that is simply
-    generous with DEEP) could still reach "200 x strongest model x high
-    reasoning," the exact cost blowup the original JEV proposal calls out.
-    Added a scan-wide `deep_hunt_budget_max` cap (60, `runtime/agent.json`):
-    each round now classifies every queued candidate up front (`round_routes`,
-    replacing per-candidate classification inside the worker closure) before
-    dispatching to the `ThreadPoolExecutor`, so the cap can be enforced
-    deterministically and sequentially rather than racing a shared counter
-    across worker threads. If the round's DEEP-tier candidates exceed the
-    scan's remaining budget, they are ranked by the existing
-    `priority_score(severity, confidence, depth)` helper (already used for
-    final finding ordering, reused rather than inventing a second scoring
-    scheme) and the lowest-priority overflow is demoted to STANDARD tier
-    (`dataclasses.replace` on the `RouteDecision`, appending "; demoted by
-    scan deep-hunt budget" to `reason` so `jev_used` tracking — which checks
-    `reason.startswith("JEV ")` — stays correct for JEV-originated routes).
-    This is deliberately *not* a new JEV question: JEV already made the
-    narrow per-candidate depth decision, so capping the aggregate spend is
-    pure deterministic composition over already-decided routes, matching the
-    "narrow decisions, deterministic code composes the results" principle
-    the proposal itself opens with — the same shape already used by
-    `JevFrontierRouter`'s top-N capability-frontier cap. The budget is
-    scan-wide (not per-round): `deep_budget_used` accumulates across the
-    discovery/variant-sweep/capability-chain rounds of a single
-    `scan_snapshot` call, since new candidates keep entering `work_queue`
-    across rounds and the cost concern is the whole scan, not one round of
-    it. Demotion never removes a candidate from disposition — every
-    candidate still gets a Deep Hunt verdict, just at a cheaper tier, so this
-    only ever narrows *which* candidates get the strongest model, exactly
-    like the frontier cap only narrows which pivots get chased first. New
-    `jev_deep_budget_demotions` metric on `ScanResult`. Covered by
-    `tests/test_pipeline.py::test_pipeline_demotes_the_lowest_priority_excess_deep_routes_to_respect_the_scan_budget`
-    and
-    `test_pipeline_does_not_demote_deep_routes_within_the_configured_budget`.
+- Routing is deterministic and config-driven. `routers.py` holds `CandidateRouter`
+  (severity -> depth/model tier), `FrontierRouter` (pivot priority), `RetryRouter`
+  (escalate model / expand context / mark unresolved) and, in `ai_sast`,
+  `ModelExecutionRouter` (per-operation override, else `agent_fallback_model_by_tier`).
+  Knowledge routing is inline in `KnowledgeCoordinator` (stored hit -> broadened local
+  search -> web research). Every generative call goes through LiteLLM with models chosen
+  from `runtime/models.json`; there is no remote decision service. The scan-wide deep
+  budget demotes the lowest-priority excess DEEP routes (`deep_budget_demotions` metric).
+  Covered by `tests/test_routing.py`, `tests/test_knowledge.py` and `tests/test_pipeline.py`.
 
 Exit condition: every accepted or rejected candidate has a complete audit trail,
 and incomplete coverage can never produce a passing scan — met for the
@@ -729,7 +474,11 @@ change this exit condition.
 Implemented artifacts: `acceptance.py` plus its external JSON Schema and
 example manifest; the `evaluate-acceptance` CLI; checksum-verified migration
 runner; immutable snapshot queue and worker; hardened Docker image/example;
-and the acceptance and operations runbooks. Automated tests exercise the
+the scan-local checkpoint journal; and the acceptance and operations runbooks.
+The checkpoint persists redacted LLM input context, schema, execution route,
+pending failure state, and successful structured output before moving to the
+next operation. A rerun therefore resumes at the first unfinished model call
+and replays prior completed calls without spending model tokens. Automated tests exercise the
 evaluator, migration ordering/checksums, interruption-safe leases, retry
 limits, scan finalization, model budgets, and failure paths without starting a
 source scan.

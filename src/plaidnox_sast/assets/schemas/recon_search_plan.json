@@ -11,7 +11,16 @@
         "additionalProperties": false,
         "properties": {
           "query_id": {"type": "string", "minLength": 1, "maxLength": 120},
-          "pattern": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "search_terms": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            }
+          },
           "include_globs": {
             "type": "array",
             "items": {"type": "string", "minLength": 1, "maxLength": 300}
@@ -23,7 +32,7 @@
             "items": {"type": "string", "minLength": 1, "maxLength": 500}
           }
         },
-        "required": ["query_id", "pattern", "include_globs", "objective", "coverage_targets"]
+        "required": ["query_id", "search_terms", "include_globs", "objective", "coverage_targets"]
       }
     },
     "coverage_notes": {"type": "string", "minLength": 1, "maxLength": 5000}

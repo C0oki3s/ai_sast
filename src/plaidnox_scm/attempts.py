@@ -265,6 +265,27 @@ class ReviewAttemptRepository:
         self._session.flush()
         return result.rowcount == 1
 
+    def update_policy(
+        self,
+        review_id: str,
+        *,
+        action: str,
+        summary: str,
+        counters: dict[str, Any] | None,
+    ) -> bool:
+        """Re-publishes a completed review's policy after triage; never touches running rows."""
+
+        result = self._session.execute(
+            update(ReviewAttemptRecord)
+            .where(
+                ReviewAttemptRecord.review_id == review_id,
+                ReviewAttemptRecord.state == "completed",
+            )
+            .values(action=action, summary=summary, counters=counters)
+        )
+        self._session.flush()
+        return result.rowcount == 1
+
     def fail(
         self,
         review_id: str,

@@ -98,7 +98,7 @@ class Finding:
 
 @dataclass(slots=True)
 class RouteDecision:
-    """JEV's routing verdict: how deep, and along which independent evidence axes.
+    """The deterministic routing verdict: how deep, and along which independent evidence axes.
 
     ``needs_*`` fields are NOUL choices (no/unlikely/likely/yes) rather than one
     mutually exclusive profile, since more than one axis is routinely relevant

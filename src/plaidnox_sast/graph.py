@@ -252,12 +252,42 @@ class RipgrepDiscovery:
         include_globs: Iterable[str] = (),
         exclude_globs: Iterable[str] = (),
     ) -> list[SearchHit]:
+        """Execute a regex query for trusted internal callers and compatibility."""
+
+        return self._search(query_id, [pattern], include_globs, exclude_globs, fixed_strings=False)
+
+    def search_literals(
+        self,
+        query_id: str,
+        terms: Iterable[str],
+        include_globs: Iterable[str] = (),
+        exclude_globs: Iterable[str] = (),
+    ) -> list[SearchHit]:
+        """Execute AI-created search intent as fixed strings, never as regex code."""
+
+        return self._search(query_id, list(terms), include_globs, exclude_globs, fixed_strings=True)
+
+    def _search(
+        self,
+        query_id: str,
+        patterns: list[str],
+        include_globs: Iterable[str],
+        exclude_globs: Iterable[str],
+        *,
+        fixed_strings: bool,
+    ) -> list[SearchHit]:
         runtime = load_json("runtime/code_intelligence.json")
-        if not pattern or len(pattern) > int(runtime["maximum_pattern_characters"]):
+        maximum_terms = int(runtime["maximum_literal_terms_per_query"])
+        if not patterns or len(patterns) > maximum_terms or any(
+            not pattern
+            or len(pattern) > int(runtime["maximum_pattern_characters"])
+            or any(character in pattern for character in ("\r", "\n", "\0"))
+            for pattern in patterns
+        ):
             raise RipgrepQueryError(
                 query_id,
-                pattern,
-                "pattern is empty or exceeds the configured limit",
+                "\0".join(patterns),
+                "query terms are empty or exceed the configured limits",
             )
         command = [
             "rg",
@@ -268,6 +298,8 @@ class RipgrepDiscovery:
             "--max-filesize",
             str(self.max_file_bytes),
         ]
+        if fixed_strings:
+            command.append("--fixed-strings")
         languages = load_json("code_intelligence/languages.json")
         for extension in languages["source_extensions"]:
             command.extend(("--type-add", f"plaidnox:*{extension}"))
@@ -278,7 +310,9 @@ class RipgrepDiscovery:
             command.extend(("--glob", str(value)))
         for value in dict.fromkeys((*self.exclude, *(str(item) for item in exclude_globs))):
             command.extend(("--glob", f"!{value}"))
-        command.extend(("--", pattern, "."))
+        for pattern in patterns:
+            command.extend(("--regexp", pattern))
+        command.extend(("--", "."))
         try:
             result = subprocess.run(
                 command,
@@ -291,13 +325,18 @@ class RipgrepDiscovery:
         except subprocess.TimeoutExpired as exc:
             raise RipgrepQueryError(
                 query_id,
-                pattern,
+                "\0".join(patterns),
                 "query exceeded the configured execution timeout",
             ) from exc
         if result.returncode not in {0, 1}:
             diagnostic = " ".join((result.stderr or "ripgrep returned no diagnostic").split())
             maximum = int(runtime["maximum_rg_error_characters"])
-            raise RipgrepQueryError(query_id, pattern, diagnostic[:maximum], result.returncode)
+            raise RipgrepQueryError(
+                query_id,
+                "\0".join(patterns),
+                diagnostic[:maximum],
+                result.returncode,
+            )
         hits: list[SearchHit] = []
         limit = int(runtime["maximum_hits_per_query"])
         for line in result.stdout.splitlines():

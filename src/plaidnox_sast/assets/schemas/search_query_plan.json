@@ -18,7 +18,16 @@
             "maxItems": 100,
             "items": {"type": "string", "minLength": 1, "maxLength": 120}
           },
-          "pattern": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "search_terms": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            }
+          },
           "include_globs": {
             "type": "array",
             "maxItems": 100,
@@ -54,7 +63,7 @@
         "required": [
           "query_id",
           "task_ids",
-          "pattern",
+          "search_terms",
           "include_globs",
           "objective",
           "direction",

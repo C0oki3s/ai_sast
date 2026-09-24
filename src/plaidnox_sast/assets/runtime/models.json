@@ -1,11 +1,114 @@
 {
-  "agent_default_model": "kimi-k2.7-code",
-  "agent_model_by_tier": {
-    "fast": "glm-5.3-flash",
-    "standard": "kimi-k2.7-code",
-    "deep": "kimi-k3"
+  "agent_default_model": "gpt-5.4-mini",
+  "agent_default_max_output_tokens": 10000,
+  "agent_fallback_model_by_tier": {
+    "fast": "gpt-5.4-mini",
+    "standard": "gpt-5.4-mini",
+    "deep": "gpt-5.4"
   },
-  "jev_default_model": "jev-latest",
+  "agent_model_override_by_operation": {
+    "repository_context": "gpt-5.4-mini"
+  },
+  "agent_models": [
+    {
+      "name": "claude-haiku-4.5",
+      "tier": "fast",
+      "latency": "low",
+      "cost": "low",
+      "guidance": "Fast bounded extraction, planning, and classification."
+    },
+    {
+      "name": "claude-sonnet-4-6",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "Balanced code analysis and cross-file synthesis."
+    },
+    {
+      "name": "claude-sonnet-5",
+      "tier": "deep",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "High-depth code reasoning and adversarial verification."
+    },
+    {
+      "name": "deepseek-v3.2",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "low",
+      "guidance": "Cost-aware general code reasoning and synthesis."
+    },
+    {
+      "name": "glm-4.6",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "low",
+      "guidance": "Cost-aware general analysis."
+    },
+    {
+      "name": "glm-5.3",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "low",
+      "guidance": "Balanced code analysis and planning."
+    },
+    {
+      "name": "glm-5.3-flash",
+      "tier": "fast",
+      "latency": "low",
+      "cost": "low",
+      "guidance": "Lowest-latency search planning, extraction, and bounded classification."
+    },
+    {
+      "name": "kimi-k2-thinking",
+      "tier": "deep",
+      "latency": "high",
+      "cost": "standard",
+      "guidance": "Long-form reasoning and multi-step attack-path analysis."
+    },
+    {
+      "name": "kimi-k2.7-code",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "Primary code-centric multi-file analysis and hunt planning."
+    },
+    {
+      "name": "kimi-k3",
+      "tier": "deep",
+      "latency": "high",
+      "cost": "standard",
+      "guidance": "Deep code-security investigation and difficult cross-file reasoning."
+    },
+    {
+      "name": "llama-4-maverick",
+      "tier": "fast",
+      "latency": "low",
+      "cost": "low",
+      "guidance": "Fast general extraction and low-risk planning."
+    },
+    {
+      "name": "qwen3-235b",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "low",
+      "guidance": "Broad code reasoning and multilingual repository analysis."
+    },
+    {
+      "name": "gpt-5.4-mini",
+      "tier": "standard",
+      "latency": "low",
+      "cost": "low",
+      "guidance": "Low-cost general code analysis, planning and extraction with reasoning."
+    },
+    {
+      "name": "gpt-5.4",
+      "tier": "deep",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "Deeper code-security reasoning and adversarial verification at moderate cost."
+    }
+  ],
   "saist_detection_model": "glm-5.3-flash",
   "saist_validation_model": "kimi-k2.7-code",
   "saist_request_timeout_seconds": 60,

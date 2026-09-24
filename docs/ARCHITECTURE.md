@@ -22,8 +22,8 @@ flowchart LR
     CTX --> PLAN[AI hunt-task plan]
     PLAN --> DISC[AI candidate discovery]
     SAIST[Optional DataDog SAIST candidate adapter] --> DISC
-    DISC --> JEV[JEV profile and model tier]
-    JEV --> VERIFY[PlaidNox Deep Hunt falsification]
+    DISC --> ROUTE[Model tier routing]
+    ROUTE --> VERIFY[PlaidNox Deep Hunt falsification]
     VERIFY --> FIND[Verified findings + dependencies]
     FIND --> SWEEP[Recursive root-cause variant sweep]
     SWEEP --> CONSOLIDATE[AI evidence consolidation]
@@ -68,8 +68,8 @@ Verified root causes trigger variant sweeps until no new evidence is found. A
 strict-schema model pass may consolidate only equivalent findings, and every
 input fingerprint must remain represented exactly once.
 
-JEV records a provider-neutral task class and FAST/STANDARD/DEEP model tier and
-chooses the knowledge action. It never decides to bypass Deep Hunt.
+Routing records a provider-neutral task class and FAST/STANDARD/DEEP model tier and
+the knowledge action is chosen deterministically. It never decides to bypass Deep Hunt.
 
 ## Persistence
 

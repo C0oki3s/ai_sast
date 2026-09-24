@@ -1,4 +1,4 @@
-from plaidnox_sast.jev import JevRouter
+from plaidnox_sast.routers import CandidateRouter
 from plaidnox_sast.models import Candidate, Evidence, Severity
 from plaidnox_sast.validation import FindingValidator
 
@@ -31,7 +31,7 @@ def test_candidate_intake_does_not_make_a_deterministic_vulnerability_verdict(sa
         ),
         metadata={"category": "authentication"},
     )
-    route = JevRouter().classify(candidate)
+    route = CandidateRouter().classify(candidate)
     finding = FindingValidator().validate("org/repo", sample_repo, candidate, route)
     assert finding is not None
     assert finding.state.value == "discovered"
@@ -68,7 +68,7 @@ def test_candidate_intake_preserves_model_confidence_until_deep_hunt(sample_repo
         ),
         metadata={"category": "authentication"},
     )
-    route = JevRouter().classify(candidate)
+    route = CandidateRouter().classify(candidate)
     finding = FindingValidator().validate("org/repo", sample_repo, candidate, route)
     assert finding is not None
     assert finding.confidence == 0.7

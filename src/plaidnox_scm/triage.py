@@ -8,17 +8,18 @@ module takes an already-parsed command and an already-authorized actor
 identity, and only owns the deterministic state transition and its
 append-only audit trail.
 
-`!fixed` intentionally never reaches `resolved` here: per the design doc,
+`!fixed` intentionally never reaches `resolved`: per the design doc,
 "`RESOLVED` cannot be set only because somebody writes `!fixed`; it
-requires fix validation against a new revision" -- that revalidation is
-`baseline.py`'s own `RESOLVED` relationship, computed the next time a
-review actually reverifies the finding is gone. `!fixed` only records
-`fix_pending`, a developer's claim pending that independent check.
+requires fix validation against a new revision". `!fixed` only records
+`fix_pending`. `record_fix_validation` is the only path to `resolved`, and
+it is driven by a later review whose baseline classification independently
+proved the finding gone (`RESOLVED`) -- or reopens a `fix_pending` finding
+that the later review verified again.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +43,14 @@ COMMAND_FP: Final = "fp"
 COMMAND_ACCEPTED_RISK: Final = "accepted_risk"
 COMMAND_FIXED: Final = "fixed"
 COMMANDS: Final = (COMMAND_VALID, COMMAND_FP, COMMAND_ACCEPTED_RISK, COMMAND_FIXED)
+
+# Scanner-originated transitions; never accepted from the triage HTTP contract.
+SYSTEM_ACTOR: Final = "plaidnox"
+EVENT_FIX_VALIDATED: Final = "fix_validated"
+EVENT_FIX_REJECTED: Final = "fix_rejected"
+# A human `false_positive` verdict is not overridden by a later rejection.
+_RESOLVABLE_STATES: Final = frozenset({OPEN, CONFIRMED, ACCEPTED_RISK, FIX_PENDING, FIX_VALIDATING})
+_REOPENABLE_STATES: Final = frozenset({FIX_PENDING, FIX_VALIDATING})
 
 _REASON_REQUIRED: Final = frozenset({COMMAND_FP, COMMAND_ACCEPTED_RISK})
 
@@ -118,6 +127,33 @@ class FindingTriageRepository:
         record = self._session.get(FindingTriageRecord, (self._tenant_id, finding_id))
         return _to_value(record) if record is not None else None
 
+    def get_states(self, finding_ids: Iterable[str]) -> dict[str, str]:
+        ids = sorted(set(finding_ids))
+        if not ids:
+            return {}
+        rows = self._session.execute(
+            select(FindingTriageRecord.finding_id, FindingTriageRecord.state).where(
+                FindingTriageRecord.tenant_id == self._tenant_id,
+                FindingTriageRecord.finding_id.in_(ids),
+            )
+        ).all()
+        return {finding_id: state for finding_id, state in rows}
+
+    def record_fix_validation(self, finding_id: str, review_id: str, *, resolved: bool) -> TriageOutcome | None:
+        """Apply a later review's independent verdict; returns None when nothing changes."""
+
+        record = self._session.get(FindingTriageRecord, (self._tenant_id, finding_id))
+        current_state = record.state if record is not None else OPEN
+        if resolved:
+            if current_state not in _RESOLVABLE_STATES:
+                return None
+            new_state, event = RESOLVED, EVENT_FIX_VALIDATED
+        else:
+            if current_state not in _REOPENABLE_STATES:
+                return None
+            new_state, event = OPEN, EVENT_FIX_REJECTED
+        return self._transition(record, finding_id, review_id, event, current_state, new_state, SYSTEM_ACTOR, None)
+
     def list_events(self, finding_id: str) -> tuple[TriageEvent, ...]:
         rows = self._session.scalars(
             select(FindingTriageEventRecord)
@@ -157,8 +193,21 @@ class FindingTriageRepository:
             raise TriageConflictError(
                 f"cannot apply {command!r} to finding {finding_id} in state {current_state!r}"
             )
-        new_state = table[current_state]
+        return self._transition(
+            record, finding_id, review_id, command, current_state, table[current_state], actor, reason
+        )
 
+    def _transition(
+        self,
+        record: FindingTriageRecord | None,
+        finding_id: str,
+        review_id: str,
+        command: str,
+        current_state: str,
+        new_state: str,
+        actor: str,
+        reason: str | None,
+    ) -> TriageOutcome:
         if record is None:
             record = FindingTriageRecord(tenant_id=self._tenant_id, finding_id=finding_id, state=new_state)
             self._session.add(record)

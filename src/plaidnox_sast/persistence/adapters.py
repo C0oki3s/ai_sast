@@ -1,7 +1,7 @@
 """PostgreSQL-backed twins of `context_fabric.ContextFabricStore` and
 `knowledge.KnowledgeStore`, matching their public method signatures exactly.
 
-`ai.py` and `knowledge.KnowledgeCoordinator`/`JevKnowledgeRouter` depend on
+`ai.py` and `knowledge.KnowledgeCoordinator` depend on
 these stores only through duck-typed method calls, so these adapters are
 drop-in replacements: `cli.py` decides which backend to construct, and
 nothing else in the codebase needs to change.
@@ -321,7 +321,7 @@ class PostgresKnowledgeStore:
     """PostgreSQL-backed twin of `knowledge.KnowledgeStore`.
 
     Drop-in for `KnowledgeCoordinator(store, router, research_provider)`;
-    `KnowledgeCoordinator`/`JevKnowledgeRouter` are backend-agnostic and are
+    `KnowledgeCoordinator` are backend-agnostic and are
     reused unmodified.
     """
 

@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.models import Depth, ModelTier, RouteDecision
+from plaidnox_scm import triage
 from plaidnox_scm.cli import main as scm_main
 from plaidnox_scm.context_store import ApplicationContext, unit_of_work
 from plaidnox_scm.l1_review import (
@@ -250,6 +251,67 @@ def test_jwt_verification_removal_runs_l1_and_independent_verification(tmp_path:
     assert result.policy.decision == "BLOCK"
     assert builder.calls == reviewer.calls == verifier.calls == 1
 
+
+
+def test_false_positive_triage_is_honoured_by_the_next_review(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "middleware").mkdir()
+    (repo / "middleware" / "ValidateToken.js").write_text(
+        "const claims = verifier.verify(token);\nmodule.exports = claims;\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "middleware" / "ValidateToken.js").write_text(
+        "const claims = jwt.decode(token);\nmodule.exports = claims;\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "regression")
+    head = _git(repo, "rev-parse", "HEAD")
+    hypothesis = L1Candidate(
+        candidate_id="jwt-regression",
+        changed_path="middleware/ValidateToken.js",
+        changed_symbol="ValidateToken",
+        changed_lines=ChangedLines(1, 1),
+        behavior_before="The token signature was verified.",
+        behavior_after="Claims are decoded without authenticity verification.",
+        security_role="Authentication middleware for protected routes.",
+        suspected_broken_invariant="Only authentic tokens establish identity.",
+        provisional_attacker_capability="Supply forged identity claims.",
+        context_facts_used=("Protected routes trust this middleware.",),
+        context_gaps=(),
+        requested_expansion=(),
+    )
+    factory = _factory()
+
+    def run():
+        return review_pull_request(
+            repo,
+            base,
+            head,
+            "codebase-1",
+            "tenant-a",
+            factory,
+            context_builder=_ContextBuilder(),
+            l1_reviewer=_L1Reviewer(hypothesis),
+            candidate_verifier=_Verifier(),
+        )
+
+    first = run()
+    assert first.policy.decision == "BLOCK"
+    finding_id = first.baseline_classifications[0].finding_fingerprint
+    with triage.unit_of_work(factory, "tenant-a") as repository:
+        repository.apply_command(finding_id, "review-1", "fp", actor="reviewer", reason="not reachable")
+
+    second = run()
+
+    assert second.baseline_classifications[0].finding_fingerprint == finding_id
+    assert second.policy.decision == "PASS"
+    assert second.policy.triaged_count == 1
+    assert second.counters.blocking == 0
+    assert second.counters.in_triage == 0
+    assert second.counters.verified == 1
 
 def test_zero_verified_is_incomplete_when_l1_coverage_is_unresolved(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

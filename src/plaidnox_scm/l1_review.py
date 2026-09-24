@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from plaidnox_sast.assets import load_json as load_sast_json
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
-from plaidnox_sast.llm import response_text
+from plaidnox_sast.llm import response_json
 from plaidnox_sast.redaction import redact_payload
 
 from .assets import load_json
@@ -218,7 +218,7 @@ def _parse_response(
     changed_file: ChangedFile,
 ) -> tuple[list[L1Candidate], bool, list[str]]:
     try:
-        payload = json.loads(response_text(response))
+        payload = response_json(response)
         raw_candidates = list(payload["candidates"])
         coverage_complete = bool(payload["coverage_complete"])
         coverage_gaps = [str(item) for item in payload["coverage_gaps"]]

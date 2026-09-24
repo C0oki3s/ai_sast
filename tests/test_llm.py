@@ -64,6 +64,25 @@ def test_gateway_client_injects_litellm_proxy_transport_settings():
     assert requests[0]["custom_llm_provider"] == "litellm_proxy"
 
 
+def test_gateway_client_preserves_tighter_operation_transport_policy():
+    requests = []
+
+    client = LiteLLMResponsesClient(
+        LiteLLMSettings("http://localhost:4000", "gateway-key", 600, 3, True),
+        lambda **kwargs: requests.append(kwargs) or SimpleNamespace(output_text="result"),
+    )
+
+    client.responses.create(
+        model="fast-model",
+        input="evidence",
+        timeout=60,
+        max_retries=0,
+    )
+
+    assert requests[0]["timeout"] == 60
+    assert requests[0]["max_retries"] == 0
+
+
 def test_response_text_is_normalized_from_litellm_message_output():
     raw = SimpleNamespace(
         output=[
@@ -111,6 +130,14 @@ def test_structured_answers_tolerate_markdown_and_prose_wrappers(text: str) -> N
 def test_truncated_structured_answer_still_fails() -> None:
     with pytest.raises(json.JSONDecodeError):
         parse_json_text('```json\n{"architecture": "a", "applications": [')
+
+
+def test_litellm_database_truncation_marker_is_never_accepted_as_model_data() -> None:
+    with pytest.raises(json.JSONDecodeError, match="storage-truncation marker"):
+        parse_json_text(
+            '{"strategy":"prefix (litellm_truncated skipped 11916 chars. '
+            'Set MAX_STRING_LENGTH_PROMPT_IN_DB) suffix"}'
+        )
 
 
 def test_response_json_reads_the_normalized_response_text() -> None:

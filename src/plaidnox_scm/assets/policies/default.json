@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-23.1",
+  "version": "2026-09-23.2",
   "blocking_relationships": [
     "INTRODUCED",
     "REGRESSED",
@@ -20,6 +20,8 @@
   "low_confidence_verified_decision": "REQUIRE_SECURITY_APPROVAL",
   "unknown_severity_decision": "REQUIRE_SECURITY_APPROVAL",
   "incomplete_decision": "INCOMPLETE",
+  "false_positive_triage_decision": "PASS",
+  "accepted_risk_triage_decision": "PASS",
   "decision_precedence": [
     "BLOCK",
     "INCOMPLETE",

@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from plaidnox_sast.assets import load_json
 from plaidnox_sast.ai import (
     AIRepositoryContext,
     AIResponseError,
@@ -18,7 +19,6 @@ from plaidnox_sast.ai import (
     load_env_file,
 )
 from plaidnox_sast.graph import build_structural_graph
-from plaidnox_sast.jev import JevClient, JevRetryRouter
 from plaidnox_sast.models import (
     Candidate,
     Evidence,
@@ -86,20 +86,20 @@ class FakeResponse:
         self.output_text = json.dumps(payload or review_payload())
 
 
-def test_recon_skips_invalid_model_pattern_and_keeps_other_query_evidence(sample_repo) -> None:
+def test_recon_executes_model_search_intent_as_literals_without_regex_parse_errors(sample_repo) -> None:
     errors = []
     queries = [
         {
             "query_id": "invalid-lookbehind",
             "objective": "Locate evaluator calls.",
-            "pattern": r"(?<!\.)eval\(",
+            "search_terms": [r"(?<!\.)eval\("],
             "include_globs": ["*.js"],
             "coverage_targets": ["runtime-evaluation"],
         },
         {
             "query_id": "request-input",
             "objective": "Locate request inputs.",
-            "pattern": r"req\.body",
+            "search_terms": ["req.body"],
             "include_globs": ["*.js"],
             "coverage_targets": ["input-surface"],
         },
@@ -113,15 +113,13 @@ def test_recon_skips_invalid_model_pattern_and_keeps_other_query_evidence(sample
         error_sink=errors.append,
     )
 
-    assert len(errors) == 1
-    assert errors[0].query_id == "invalid-lookbehind"
-    assert evidence[0]["query_failed"] is True
-    assert evidence[0]["failure"]["pattern_hash"] == errors[0].pattern_hash
+    assert errors == []
+    assert evidence[0]["query_failed"] is False
     assert evidence[1]["query_failed"] is False
     assert any(hit.query_id == "request-input" for hit in hits)
 
 
-def test_search_plan_skips_invalid_pattern_and_falls_back_to_task_focus(sample_repo) -> None:
+def test_search_plan_treats_regex_metacharacters_as_literals_and_falls_back_to_focus(sample_repo) -> None:
     plan = HuntPlan(
         "plan-test",
         "Review the focused source.",
@@ -146,7 +144,7 @@ def test_search_plan_skips_invalid_pattern_and_falls_back_to_task_focus(sample_r
         [
             {
                 "query_id": "invalid-lookbehind",
-                "pattern": r"(?<!\.)eval\(",
+                "search_terms": [r"(?<!\.)eval\("],
                 "include_globs": ["*.js"],
                 "task_ids": ["task-1"],
             }
@@ -158,7 +156,7 @@ def test_search_plan_skips_invalid_pattern_and_falls_back_to_task_focus(sample_r
         error_sink=errors.append,
     )
 
-    assert len(errors) == 1
+    assert errors == []
     assert segments
     assert {item["path"] for item in segments} == {"app.js"}
     assert all(item["task_ids"] == ["task-1"] for item in segments)
@@ -275,8 +273,8 @@ app.post("/reports", async (req, res) => {
 
     assert review.supported is True
     request = client.responses.kwargs
-    assert request["model"] == "test-model"
-    assert "prompt_cache_key" not in request
+    assert request["model"] == load_json("runtime/models.json")["agent_fallback_model_by_tier"]["standard"]
+    assert request["prompt_cache_key"] == "plaidnox-sast:security_review"
     assert request["text"]["format"]["strict"] is True
     supplied = request["input"][1]["content"]
     assert "untrusted evidence" in request["input"][0]["content"]
@@ -285,7 +283,7 @@ app.post("/reports", async (req, res) => {
     assert "<redacted-mongodb-uri>" in supplied
 
 
-def test_ai_review_routes_to_the_model_configured_for_the_jev_model_tier(sample_repo):
+def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo):
     (sample_repo / "app.js").write_text(
         "const express = require('express');\n"
         "const app = express();\n"
@@ -304,7 +302,7 @@ def test_ai_review_routes_to_the_model_configured_for_the_jev_model_tier(sample_
     assert client.responses.kwargs["model"] == agent.model_by_tier["fast"]
 
     agent.review(sample_repo, deep_candidate(), finding())
-    assert client.responses.kwargs["model"] == "test-model"
+    assert client.responses.kwargs["model"] == agent.model_by_tier["standard"]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
@@ -416,10 +414,10 @@ def test_ai_review_stops_requesting_context_at_the_configured_round_limit(sample
 
     assert review.supported is False
     # 3 normal rounds (max_rounds=2) plus 1 bounded retry-routed round once the
-    # evidence gap is still open, since JevRetryRouter's local fallback escalates
-    # the model tier when the candidate has never been routed to DEEP.
+    # evidence gap is still open, since RetryRouter escalates the model tier
+    # when the candidate has never been routed to DEEP.
     assert len(client.responses.requests) == 4
-    assert client.responses.requests[3]["model"] == "kimi-k3"
+    assert client.responses.requests[3]["model"] == load_json("runtime/models.json")["agent_fallback_model_by_tier"]["deep"]
 
 
 def test_ai_review_retry_route_does_not_add_a_second_extra_round(sample_repo):
@@ -445,46 +443,6 @@ def test_ai_review_retry_route_does_not_add_a_second_extra_round(sample_repo):
     # Already DEEP, so the local retry fallback expands context for exactly one
     # more round instead of escalating further.
     assert len(client.responses.requests) == 4
-
-
-class FakeHTTPResponse:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def read(self):
-        return json.dumps(self.payload).encode()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-def test_ai_review_retry_route_skips_the_extra_round_when_jev_marks_unresolved(sample_repo, monkeypatch):
-    (sample_repo / "app.js").write_text("const express = require('express');\n")
-    always_requesting = review_payload(
-        supported=False,
-        rejection_reason="Evidence gap: still need more context.",
-        evidence_gaps=["Still need more context."],
-        evidence_locations=[],
-        context_requests=[
-            {"kind": "window", "path": "app.js", "symbol": "", "start_line": 1, "end_line": 1}
-        ],
-    )
-    client = QueueClient([always_requesting, always_requesting, always_requesting])
-    response = {
-        "model": "jev-test",
-        "answers": {"next_action": {"choice": "mark_unresolved", "confidence": 0.9}},
-    }
-    monkeypatch.setattr("plaidnox_sast.jev.urlopen", lambda request, timeout: FakeHTTPResponse(response))
-    agent = PlaidNoxDeepHuntAgent(client)
-    agent.configure_retry_route(JevRetryRouter(JevClient("test-key", endpoint="https://example.test")))
-
-    review = agent.review(sample_repo, deep_candidate(), finding())
-
-    assert review.supported is False
-    assert len(client.responses.requests) == 3
 
 
 def test_metadata_review_rejects_an_on_demand_context_request(sample_repo):
@@ -681,7 +639,7 @@ app.get("/users/:id", async (req, res) => {
                 "queries": [
                     {
                         "query_id": "express-entrypoints",
-                        "pattern": "app\\.(get|post)|req\\.(params|body)",
+                        "search_terms": ["app.get(", "app.post(", "req.params", "req.body"],
                         "include_globs": ["*.js"],
                         "objective": "Locate repository-specific Express entry points and input reads.",
                         "coverage_targets": ["application entry points", "request inputs"],
@@ -708,7 +666,7 @@ app.get("/users/:id", async (req, res) => {
                     {
                         "query_id": "user-lookup",
                         "task_ids": ["task-user-lookup"],
-                        "pattern": "findById|req\\.params",
+                        "search_terms": ["findById", "req.params"],
                         "include_globs": ["*.js"],
                         "objective": "Locate attacker-controlled identifiers and object lookup operations.",
                     }
@@ -781,7 +739,8 @@ app.get("/users/:id", async (req, res) => {
     assert "security_ir" not in compact_context
     assert "source_inventory" not in compact_context
     assert "source_tree" not in compact_context
-    assert compact_context["focus_path"] == "app.js"
+    assert "focus_path" not in compact_context
+    assert discovery_payload["source_segment"]["path"] == "app.js"
     discovery_audit = agent.model_input_audit()[3]
     assert discovery_audit["operation"] == "vulnerability_discovery"
     assert discovery_audit["repository_wide_context"] is False
@@ -817,7 +776,7 @@ def test_ai_attaches_context_fabric_before_reconnaissance(sample_repo, tmp_path)
                 "queries": [
                     {
                         "query_id": "fixture-entrypoints",
-                        "pattern": "app\\.",
+                        "search_terms": ["app."],
                         "include_globs": ["*.js"],
                         "objective": "Locate application registration points.",
                         "coverage_targets": ["fixture application"],
@@ -865,7 +824,7 @@ def test_ai_uses_persisted_context_and_only_changed_scope_on_next_revision(tmp_p
                 "queries": [
                     {
                         "query_id": "observed-functions",
-                        "pattern": "function",
+                        "search_terms": ["function"],
                         "include_globs": ["*.js"],
                         "objective": "Locate observed function definitions.",
                         "coverage_targets": ["changed scope"],
@@ -883,7 +842,7 @@ def test_ai_uses_persisted_context_and_only_changed_scope_on_next_revision(tmp_p
                     {
                         "query_id": "changed-functions",
                         "task_ids": ["task-changed"],
-                        "pattern": "function",
+                        "search_terms": ["function"],
                         "include_globs": ["*.js"],
                         "objective": "Inspect functions in the affected scope.",
                     }
@@ -965,7 +924,7 @@ def test_ai_reuses_exact_persisted_repository_context_without_model_calls(tmp_pa
                 "queries": [
                     {
                         "query_id": "observed-functions",
-                        "pattern": "def ",
+                        "search_terms": ["def "],
                         "include_globs": ["*.py"],
                         "objective": "Locate observed functions.",
                         "coverage_targets": ["service"],
@@ -1002,7 +961,7 @@ def test_ai_creates_open_ended_hunt_tasks_before_discovery(sample_repo):
                 "queries": [
                     {
                         "query_id": "identity-entrypoints",
-                        "pattern": "app\\.|req\\.",
+                        "search_terms": ["app.", "req."],
                         "include_globs": ["*.js"],
                         "objective": "Locate identity entry points and inputs.",
                         "coverage_targets": ["identity application"],
@@ -1140,7 +1099,7 @@ def test_variant_sweep_uses_compact_verified_context(sample_repo):
                     {
                         "query_id": "route-variants",
                         "task_ids": ["task-test"],
-                        "pattern": "app\\.(get|post)|req\\.",
+                        "search_terms": ["app.get(", "app.post(", "req."],
                         "include_globs": ["*.js"],
                         "objective": "Find alternate request paths and input use.",
                     }
@@ -1249,7 +1208,7 @@ def test_capability_chain_searches_from_the_gained_capability(sample_repo):
                     {
                         "query_id": "renderer-pivots",
                         "task_ids": ["task-test"],
-                        "pattern": "renderer|fetch\\(",
+                        "search_terms": ["renderer", "fetch("],
                         "include_globs": ["*.js"],
                         "objective": "Find where the renderer's network reach is consumed elsewhere.",
                     }
@@ -1290,7 +1249,7 @@ def test_capability_chain_caps_and_prioritizes_findings_when_over_budget(sample_
                     {
                         "query_id": "renderer-pivots",
                         "task_ids": ["task-test"],
-                        "pattern": "renderer|fetch\\(",
+                        "search_terms": ["renderer", "fetch("],
                         "include_globs": ["*.js"],
                         "objective": "Find where the renderer's network reach is consumed elsewhere.",
                     }
@@ -1372,6 +1331,30 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
     assert client.responses.kwargs["reasoning"]["effort"] == expected
 
 
+def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_repo):
+    from plaidnox_sast.assets import load_json
+
+    events = []
+    client = FakeClient(review_payload())
+    agent = PlaidNoxDeepHuntAgent(client, event_sink=events.append)
+
+    agent._structured_response(
+        "plaidnox_recon_search_plan",
+        load_json("schemas/recon_search_plan.json"),
+        "recon_search_plan",
+        {"source_tree": ["app.js"], "security_ir": []},
+    )
+
+    policy = load_json("runtime/agent.json")["model_request_policy_by_operation"]["recon_search_plan"]
+    assert client.responses.kwargs["timeout"] == policy["timeout_seconds"]
+    assert client.responses.kwargs["max_retries"] == policy["max_retries"]
+    started = next(item for item in events if item["event"] == "model_request_started")
+    completed = next(item for item in events if item["event"] == "model_request_completed")
+    assert started["operation"] == "recon_search_plan"
+    assert started["timeout_seconds"] == policy["timeout_seconds"]
+    assert completed["duration_milliseconds"] >= 0
+
+
 def test_structured_response_falls_back_to_low_effort_for_an_unlisted_operation(sample_repo, monkeypatch):
     import plaidnox_sast.ai as ai_module
     from plaidnox_sast.assets import load_json as real_load_json
@@ -1437,7 +1420,7 @@ def test_hunt_effort_override_is_none_for_a_low_complexity_uncontested_route():
     assert _hunt_effort_override(route) is None
 
 
-def test_structured_response_escalates_reasoning_effort_when_jev_route_demands_it(sample_repo, monkeypatch):
+def test_structured_response_escalates_reasoning_effort_when_route_demands_it(sample_repo, monkeypatch):
     import plaidnox_sast.ai as ai_module
     from plaidnox_sast.assets import load_json as real_load_json
     from plaidnox_sast.models import Depth, ModelTier, RouteDecision
@@ -1523,7 +1506,7 @@ def test_hunt_caps_context_expansion_requests_per_round_by_default(sample_repo):
     assert len(second_request_payload["context_expansions"]) == 5
 
 
-def test_hunt_expands_more_context_per_round_when_jev_route_flags_broad_evidence_need(sample_repo):
+def test_hunt_expands_more_context_per_round_when_route_flags_broad_evidence_need(sample_repo):
     from plaidnox_sast.models import Depth, ModelTier, RouteDecision
 
     (sample_repo / "app.js").write_text(
@@ -1641,7 +1624,7 @@ def test_create_search_plan_requires_every_coverage_obligation_to_be_referenced(
                     {
                         "query_id": "user-lookup",
                         "task_ids": ["task-user-lookup"],
-                        "pattern": "findById|req\\.params",
+                        "search_terms": ["findById", "req.params"],
                         "include_globs": ["*.js"],
                         "objective": "Locate attacker-controlled identifiers and object lookup operations.",
                         "direction": "forward",
@@ -1668,7 +1651,7 @@ def test_create_search_plan_rejects_an_unknown_coverage_ref():
                     {
                         "query_id": "user-lookup",
                         "task_ids": ["task-user-lookup"],
-                        "pattern": "findById|req\\.params",
+                        "search_terms": ["findById", "req.params"],
                         "include_globs": ["*.js"],
                         "objective": "Locate attacker-controlled identifiers and object lookup operations.",
                         "direction": "forward",
@@ -1695,7 +1678,7 @@ def test_create_search_plan_succeeds_when_every_coverage_obligation_is_reference
                     {
                         "query_id": "user-lookup",
                         "task_ids": ["task-user-lookup"],
-                        "pattern": "findById|req\\.params",
+                        "search_terms": ["findById", "req.params"],
                         "include_globs": ["*.js"],
                         "objective": "Locate attacker-controlled identifiers and object lookup operations.",
                         "direction": "forward",
@@ -1767,7 +1750,7 @@ def test_build_repository_context_reports_sampling_truncation_by_area(sample_rep
                 "queries": [
                     {
                         "query_id": "fixture-entrypoints",
-                        "pattern": "app\\.",
+                        "search_terms": ["app."],
                         "include_globs": ["*.js"],
                         "objective": "Locate application registration points.",
                         "coverage_targets": ["fixture application"],
@@ -2141,7 +2124,7 @@ def _recon_plan_text() -> str:
             "queries": [
                 {
                     "query_id": "express-entrypoints",
-                    "pattern": "app\\.get",
+                    "search_terms": ["app.get"],
                     "include_globs": ["*.js"],
                     "objective": "Locate Express entry points.",
                     "coverage_targets": ["application entry points"],
@@ -2221,3 +2204,91 @@ def test_repository_context_still_fails_typed_after_exhausting_shape_retries(sam
 
     with pytest.raises(AIResponseError, match="repository context did not match"):
         agent.build_repository_context(sample_repo, "org/repo", "abc123", build_structural_graph(sample_repo))
+
+
+def test_payload_puts_per_request_keys_after_stable_prefix() -> None:
+    from plaidnox_sast.prompts import _payload_json
+
+    first = _payload_json({"source_segment": {"path": "a"}, "repository_context": {"x": 1}, "hunt_plan": {}, "continuation_focus": ""})
+    second = _payload_json({"continuation_focus": "", "hunt_plan": {}, "repository_context": {"x": 1}, "source_segment": {"path": "b"}})
+    prefix = first[: first.index('"source_segment"')]
+    assert second.startswith(prefix)
+    assert first.index('"continuation_focus"') > first.index('"source_segment"')
+
+
+def test_discovery_stops_when_a_continuation_only_repeats_known_candidates(sample_repo):
+    item = {
+        "title": "Potential missing ownership check",
+        "vulnerability_class": "missing object ownership enforcement",
+        "classification_references": [
+            {
+                "namespace": "CWE",
+                "identifier": "CWE-639",
+                "name": "Authorization Bypass Through User-Controlled Key",
+                "source_url": "https://cwe.mitre.org/data/definitions/639.html",
+            }
+        ],
+        "business_impact": "An actor may read another actor's object.",
+        "severity": "high",
+        "confidence": 0.82,
+        "category": "authorization",
+        "path": "app.js",
+        "start_line": 4,
+        "end_line": 4,
+        "message": "Object lookup by request identifier without an ownership condition.",
+        "attack_path": "request parameter -> object lookup",
+    }
+    repeating = {"candidates": [item], "coverage_complete": False, "next_focus": "rest of file"}
+    query = {
+        "query_id": "q",
+        "search_terms": ["findById"],
+        "include_globs": ["*.js"],
+        "objective": "Locate lookups.",
+    }
+    agent = PlaidNoxDeepHuntAgent(
+        SchemaClient(
+            {
+                "plaidnox_recon_search_plan": {
+                    "strategy": "s",
+                    "queries": [{**query, "coverage_targets": ["entry points"]}],
+                    "coverage_notes": "n",
+                },
+                "plaidnox_repository_context": {
+                    "architecture": "Express API.",
+                    "applications": [
+                        {
+                            "app_name": "fixture",
+                            "app_root_path": ".",
+                            "architecture": "Express.",
+                            "entry_points": ["app.js"],
+                            "trust_boundaries": ["HTTP request"],
+                            "data_stores": ["User model"],
+                        }
+                    ],
+                },
+                "plaidnox_search_query_plan": {
+                    "strategy": "s",
+                    "queries": [{**query, "task_ids": ["t"]}],
+                    "coverage_notes": "n",
+                },
+                "plaidnox_vulnerability_discovery": repeating,
+            }
+        ),
+        model="test-model",
+    )
+    context = agent.build_repository_context(sample_repo, "org/repo", "abc123", build_structural_graph(sample_repo))
+    plan = HuntPlan(
+        "plan-test",
+        "Review.",
+        [HuntTask("t", "Review", "Trace.", ["app.js"], [], ["authorization"], ["evidence"], [], [])],
+    )
+    client = agent.client
+    before = len(client.responses.requests)
+    candidates, failures = agent.discover_candidates(sample_repo, context, plan)
+    discovery_calls = [
+        r for r in client.responses.requests[before:] if r["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
+    ]
+
+    assert failures == 0
+    assert len(candidates) == 1
+    assert len(discovery_calls) == 2

@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from plaidnox_sast.ai import PlaidNoxDeepHuntAgent
 from plaidnox_sast.assets import load_json as load_sast_json
-from plaidnox_sast.jev import JevClient, JevRouter
+from plaidnox_sast.routers import CandidateRouter
 from plaidnox_sast.llm import (
     LiteLLMConfigurationError,
     LiteLLMResponsesClient,
@@ -38,9 +37,8 @@ def dependencies_from_environment() -> ReviewDependencies:
         raise LiteLLMConfigurationError("Install the AI extra with: pip install -e '.[ai]'") from exc
     client = LiteLLMResponsesClient(settings, litellm.responses)
     agent = PlaidNoxDeepHuntAgent(client, model=model)
-    jev_client = JevClient.from_environment() if os.environ.get("JEV_API_KEY") else None
     return ReviewDependencies(
         context_builder=SastApplicationContextBuilder(agent),
         l1_reviewer=LiteLLMChangedFileReviewer(client),
-        candidate_verifier=SastDeepHuntVerifier(agent, router=JevRouter(jev_client)),
+        candidate_verifier=SastDeepHuntVerifier(agent, router=CandidateRouter()),
     )

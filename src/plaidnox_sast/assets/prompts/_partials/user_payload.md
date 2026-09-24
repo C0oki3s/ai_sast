@@ -1,1 +1,1 @@
-{{ payload | json(indent=2) }}
+{{ payload | payload_json(indent=2) }}

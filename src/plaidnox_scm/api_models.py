@@ -150,6 +150,10 @@ class TriageResponse(BaseModel):
     reason: str | None = None
     applied: bool
     updated_at: datetime
+    # The owning review's merge action re-evaluated with this triage applied;
+    # absent when the review has not completed or ended INCOMPLETE.
+    review_action: PolicyAction | None = None
+    review_summary: str | None = None
 
 
 class TriageStatus(BaseModel):

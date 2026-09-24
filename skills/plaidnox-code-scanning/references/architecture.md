@@ -8,8 +8,8 @@ immutable source snapshot
   -> Context Fabric base/overlay update
   -> AI repository context
   -> AI hunt plan
-  -> JEV knowledge decision
-  -> durable knowledge or Perplexity Sonar research through LiteLLM
+  -> knowledge routing
+  -> durable knowledge or direct Perplexity Sonar research
   -> AI-planned ripgrep discovery
   -> evidence candidates
   -> independent Deep Hunt gates
@@ -23,9 +23,9 @@ immutable source snapshot
 - `rg`: fast AI-directed discovery and navigation.
 - Tree-sitter: compact symbols, calls, imports, routes, and structural context. It does not issue vulnerability verdicts.
 - Context Fabric: durable source identity, relationships, threat context, security memory, finding dependencies, and snapshot overlays.
-- JEV: typed decisions for context profile, depth, knowledge reuse/retrieval/research, and stable model tier.
-- LiteLLM: the only generative model interface and owner of prompt-cache behavior/telemetry.
-- Perplexity Sonar: current web-grounded security research through LiteLLM.
+- Routing: deterministic rules (`routers.py`) for depth, retry and stable model tier; knowledge reuse/retrieval/research is decided inline by `KnowledgeCoordinator`.
+- LiteLLM: the generative interface for scan reasoning and owner of its prompt-cache behavior/telemetry.
+- Perplexity Sonar: direct, separately credentialed web-grounded security research.
 - SAIST: optional broad AI candidate source. PlaidNox owns validation and final findings.
 - Deep Hunt: mandatory attacker-first verification, falsification, evidence, proof reasoning, remediation, and variant discovery.
 

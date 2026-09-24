@@ -3,8 +3,12 @@
   "application_response_cache": false,
   "api_base_environment": "LITELLM_API_BASE",
   "api_key_environment": "LITELLM_API_KEY",
-  "request_timeout_seconds": 1800,
-  "request_max_retries": 3,
+  "request_timeout_seconds": 600,
+  "request_max_retries": 1,
+  "response_rejection_markers": [
+    "(litellm_truncated skipped",
+    "MAX_STRING_LENGTH_PROMPT_IN_DB"
+  ],
   "direct_provider_key_environment_by_model_prefix": {
     "perplexity/": "IFRIT_PERPLEXITY_API_KEY"
   }

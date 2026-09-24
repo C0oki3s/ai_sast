@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
+import json
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,9 +15,10 @@ from .ai import AIConfigurationError, PlaidNoxDeepHuntAgent
 from .assets import load_json
 from .config import load_local_project_config
 from .errors import AIStageError
-from .fingerprint import candidate_fingerprint, deduplicate
+from .checkpoint import ScanCheckpoint, candidate_from_dict, candidate_to_dict, finding_from_dict, unit_key
+from .fingerprint import CandidateIndex, candidate_fingerprint, deduplicate
 from .graph import build_structural_graph
-from .jev import JevClient, JevRouter
+from .routers import CandidateRouter
 from .models import (
     Depth,
     Finding,
@@ -88,16 +92,29 @@ def _finding_dependencies(
     return list(dependencies.values())
 
 
+def _resumable(checkpoint: ScanCheckpoint | None, stage: str, key: str, run):
+    """Replay a completed sweep from the checkpoint; persist it only if it fully succeeded."""
+
+    if checkpoint is not None:
+        saved = checkpoint.get(stage, key)
+        if saved is not None:
+            return [candidate_from_dict(item) for item in saved["candidates"]], 0
+    candidates, failures = run()
+    if checkpoint is not None and failures == 0:
+        checkpoint.put(stage, key, {"candidates": [candidate_to_dict(item) for item in candidates]})
+    return candidates, failures
+
+
 class SastPipeline:
     def __init__(
         self,
         saist_detector: DatadogSAISTDetector | None = None,
-        jev_client: JevClient | None = None,
         session_factory: sessionmaker[Session] | None = None,
         tenant_id: str = "default",
+        checkpoint_path: Path | None = None,
     ) -> None:
+        self.checkpoint_path = checkpoint_path
         self.saist_detector = saist_detector
-        self.jev_client = jev_client
         self.session_factory = session_factory
         self.tenant_id = tenant_id
 
@@ -118,6 +135,31 @@ class SastPipeline:
         graph = build_structural_graph(root, exclude=config.exclude, max_file_bytes=config.max_file_bytes)
         tree_hash = snapshot_tree_hash(graph)
         revision = revision or f"snapshot-{tree_hash}"
+        context_scope = json.dumps(
+            {
+                "business_context": config.business_context,
+                "exclude": sorted(config.exclude),
+                "max_file_bytes": config.max_file_bytes,
+                "security_context": config.security_context,
+                "source_ref": config.source_ref,
+                "version": config.version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        context_scope_hash = hashlib.sha256(context_scope.encode("utf-8")).hexdigest()
+        checkpoint: ScanCheckpoint | None = None
+        if self.checkpoint_path is not None:
+            checkpoint = ScanCheckpoint(
+                self.checkpoint_path,
+                (
+                    f"{codebase}|{revision}|{tree_hash}|{context_scope_hash}|"
+                    f"{load_json('prompts/manifest.json')['version']}"
+                ),
+            )
+            configure_checkpoint = getattr(deep_hunt_agent, "configure_checkpoint", None)
+            if callable(configure_checkpoint):
+                configure_checkpoint(checkpoint)
         configure_source_policy = getattr(deep_hunt_agent, "configure_source_policy", None)
         if callable(configure_source_policy):
             configure_source_policy(config.exclude, config.max_file_bytes)
@@ -197,6 +239,74 @@ class SastPipeline:
             raise AIConfigurationError(
                 "PlaidNox Deep Hunt agent must provide context, planning, discovery, variant sweeping, and consolidation"
             )
+        router = CandidateRouter()
+        validator = FindingValidator()
+        worker_count = int(load_json("runtime/agent.json")["discovery_max_workers"])
+        deep_budget_max = int(load_json("runtime/agent.json")["deep_hunt_budget_max"])
+        deep_budget_reserved = [0]
+        early_reviews: dict[str, Future] = {}
+        early_lock = threading.Lock()
+        early_executor = ThreadPoolExecutor(max_workers=worker_count)
+
+        def verify(candidate_route):
+            candidate, route = candidate_route
+            finding = validator.validate(codebase, root, candidate, route)
+            if finding is None:
+                return candidate, None, 0, 0, 0, 1, "", "", False
+            review_key = candidate_fingerprint(codebase, candidate)
+            saved = checkpoint.get("review", review_key) if checkpoint is not None else None
+            if saved is not None:
+                if saved["outcome"] == "unsupported":
+                    return candidate, None, 1, 0, 0, 1, "", "", False
+                return candidate, finding_from_dict(saved["finding"]), 1, 1, 0, 0, "", "", False
+            try:
+                hunt = getattr(deep_hunt_agent, "hunt", None)
+                if not callable(hunt):
+                    hunt = deep_hunt_agent.review
+                review = hunt(root, candidate, finding, config.security_context, model_tier=route.model_tier, route=route)
+                if not review.supported:
+                    if checkpoint is not None:
+                        checkpoint.put("review", review_key, {"outcome": "unsupported"})
+                    return candidate, None, 1, 0, 0, 1, "", "", False
+                finding.metadata["deep_hunt"] = review.to_dict()
+                finding.title = review.title or finding.title
+                finding.vulnerability_class = review.vulnerability_class or finding.vulnerability_class
+                finding.metadata["classification_references"] = review.classification_references
+                finding.severity = Severity(review.severity) if review.severity else finding.severity
+                finding.message = review.message or finding.message
+                finding.impact = review.business_impact or finding.impact
+                finding.remediation = review.remediation_note or finding.remediation
+                finding.confidence = review.confidence
+                finding.priority_score = priority_score(
+                    finding.severity,
+                    finding.confidence,
+                    str(finding.metadata.get("route_depth", "standard")),
+                )
+                finding.state = FindingState.VALIDATED
+                finding.validator = "plaidnox-deep-hunt"
+                if checkpoint is not None:
+                    checkpoint.put("review", review_key, {"outcome": "supported", "finding": finding.to_dict()})
+                return candidate, finding, 1, 1, 0, 0, "", "", False
+            except Exception as exc:  # noqa: BLE001
+                unexpected = not isinstance(exc, AIStageError)
+                return candidate, None, 0, 0, 1, 1, type(exc).__name__, str(exc)[:240], unexpected
+
+        def review_early(candidate):
+            """Start the Deep Hunt review of a fresh candidate while discovery continues."""
+            fingerprint = candidate_fingerprint(codebase, candidate)
+            with early_lock:
+                if fingerprint in early_reviews:
+                    return
+                route = router.classify(candidate)
+                if route.model_tier == ModelTier.DEEP:
+                    if deep_budget_reserved[0] >= deep_budget_max:
+                        return
+                    deep_budget_reserved[0] += 1
+                early_reviews[fingerprint] = early_executor.submit(verify, (candidate, route))
+
+        if hasattr(deep_hunt_agent, "candidate_sink"):
+            deep_hunt_agent.candidate_sink = review_early
+
         try:
             context = context_builder(root, codebase, revision, graph, config.business_context)
             repository_context = context.to_dict()
@@ -225,8 +335,6 @@ class SastPipeline:
             saist_candidates + ai_discovery_candidates,
         )
 
-        router = JevRouter(self.jev_client)
-        validator = FindingValidator()
         findings = []
         rejected_count = 0
         ai_reviewed = 0
@@ -240,66 +348,41 @@ class SastPipeline:
         ai_capability_chain_failures = 0
         ai_capability_chain_unexpected_failures = 0
         ai_capability_chain_rounds = 0
-        jev_routes = 0
-        jev_deep_budget_demotions = 0
+        deep_budget_demotions = 0
         ai_review_error_types: list[str] = []
         ai_review_errors: list[str] = []
         ai_review_unexpected_failures = 0
         work_queue = list(candidates)
-        seen_candidates = {candidate_fingerprint(codebase, candidate) for candidate in candidates}
-        worker_count = int(load_json("runtime/agent.json")["discovery_max_workers"])
-        deep_budget_max = int(load_json("runtime/agent.json")["deep_hunt_budget_max"])
-        deep_budget_used = 0
-
-        def verify(candidate_route):
-            candidate, route = candidate_route
-            jev_used = route.reason.startswith("JEV ")
-            finding = validator.validate(codebase, root, candidate, route)
-            if finding is None:
-                return candidate, None, 0, 0, 0, jev_used, 1, "", "", False
-            try:
-                hunt = getattr(deep_hunt_agent, "hunt", None)
-                if not callable(hunt):
-                    hunt = deep_hunt_agent.review
-                review = hunt(root, candidate, finding, config.security_context, model_tier=route.model_tier, route=route)
-                if not review.supported:
-                    return candidate, None, 1, 0, 0, jev_used, 1, "", "", False
-                finding.metadata["deep_hunt"] = review.to_dict()
-                finding.title = review.title or finding.title
-                finding.vulnerability_class = review.vulnerability_class or finding.vulnerability_class
-                finding.metadata["classification_references"] = review.classification_references
-                finding.severity = Severity(review.severity) if review.severity else finding.severity
-                finding.message = review.message or finding.message
-                finding.impact = review.business_impact or finding.impact
-                finding.remediation = review.remediation_note or finding.remediation
-                finding.confidence = review.confidence
-                finding.priority_score = priority_score(
-                    finding.severity,
-                    finding.confidence,
-                    str(finding.metadata.get("jev_depth", "standard")),
-                )
-                finding.state = FindingState.VALIDATED
-                finding.validator = "plaidnox-deep-hunt"
-                return candidate, finding, 1, 1, 0, jev_used, 0, "", "", False
-            except Exception as exc:  # noqa: BLE001
-                unexpected = not isinstance(exc, AIStageError)
-                return candidate, None, 0, 0, 1, jev_used, 1, type(exc).__name__, str(exc)[:240], unexpected
+        # Variants and pivots are checked against the same-issue index, so a bug
+        # already reviewed under another name is not hunted again.
+        seen_candidates = CandidateIndex(nearby_lines=0)
+        for candidate in candidates:
+            seen_candidates.admit(candidate)
+        deep_budget_used = deep_budget_reserved[0]
 
         while work_queue:
-            round_routes = [(candidate, router.classify(candidate)) for candidate in work_queue]
+            early_round = []
+            pending_queue = []
+            for candidate in work_queue:
+                early = early_reviews.pop(candidate_fingerprint(codebase, candidate), None)
+                if early is None:
+                    pending_queue.append(candidate)
+                else:
+                    early_round.append(early)
+            round_routes = [(candidate, router.classify(candidate)) for candidate in pending_queue]
             deep_entries = [entry for entry in round_routes if entry[1].model_tier == ModelTier.DEEP]
             remaining_budget = max(0, deep_budget_max - deep_budget_used)
             if len(deep_entries) > remaining_budget:
                 # Ranking is deterministic composition over each candidate's already-decided
-                # route, not a new JEV decision -- every candidate is still dispositioned via
-                # Deep Hunt, only the model tier for the lowest-priority overflow is capped.
+                # route -- every candidate is still dispositioned via Deep Hunt, only the
+                # model tier for the lowest-priority overflow is capped.
                 ranked = sorted(
                     deep_entries,
                     key=lambda entry: priority_score(entry[0].severity, entry[0].confidence, entry[1].depth.value),
                     reverse=True,
                 )
                 demoted_ids = {id(candidate) for candidate, _ in ranked[remaining_budget:]}
-                jev_deep_budget_demotions += len(demoted_ids)
+                deep_budget_demotions += len(demoted_ids)
                 round_routes = [
                     (
                         candidate,
@@ -320,14 +403,13 @@ class SastPipeline:
 
             verified_round = []
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                results = executor.map(verify, round_routes)
+                results = itertools.chain((future.result() for future in early_round), executor.map(verify, round_routes))
                 for (
                     candidate,
                     finding,
                     reviewed,
                     supported,
                     failed,
-                    jev_used,
                     rejected,
                     error_type,
                     error,
@@ -340,7 +422,6 @@ class SastPipeline:
                         ai_review_error_types.append(error_type)
                         ai_review_errors.append(error)
                         ai_review_unexpected_failures += int(unexpected)
-                    jev_routes += int(jev_used)
                     rejected_count += rejected
                     if finding is not None:
                         findings.append(finding)
@@ -349,33 +430,35 @@ class SastPipeline:
             next_round = []
             if context is not None and plan is not None and verified_round:
                 ai_variant_rounds += 1
-                variants, sweep_failures = sweeper(root, context, plan, verified_round)
+                round_key = unit_key(sorted(candidate_fingerprint(codebase, item) for item, _ in verified_round))
+                variants, sweep_failures = _resumable(
+                    checkpoint, "variants", round_key, lambda: sweeper(root, context, plan, verified_round)
+                )
                 ai_variant_failures += sweep_failures
                 ai_variant_unexpected_failures += int(getattr(deep_hunt_agent, "variant_unexpected_failures", 0))
                 for variant in variants:
-                    fingerprint = candidate_fingerprint(codebase, variant)
-                    if fingerprint in seen_candidates:
+                    if not seen_candidates.admit(variant):
                         continue
-                    seen_candidates.add(fingerprint)
                     next_round.append(variant)
                     ai_variant_candidates += 1
 
                 chainer = getattr(deep_hunt_agent, "chain_capability_pivots", None)
                 if callable(chainer):
                     ai_capability_chain_rounds += 1
-                    pivots, chain_failures = chainer(root, context, plan, verified_round)
+                    pivots, chain_failures = _resumable(
+                        checkpoint, "capability_chain", round_key, lambda: chainer(root, context, plan, verified_round)
+                    )
                     ai_capability_chain_failures += chain_failures
                     ai_capability_chain_unexpected_failures += int(
                         getattr(deep_hunt_agent, "capability_chain_unexpected_failures", 0)
                     )
                     for pivot in pivots:
-                        fingerprint = candidate_fingerprint(codebase, pivot)
-                        if fingerprint in seen_candidates:
+                        if not seen_candidates.admit(pivot):
                             continue
-                        seen_candidates.add(fingerprint)
                         next_round.append(pivot)
                         ai_capability_chain_candidates += 1
             work_queue = next_round
+        early_executor.shutdown(wait=True)
         ai_consolidation_failures = 0
         ai_consolidation_error_type = ""
         ai_consolidation_error = ""
@@ -387,7 +470,7 @@ class SastPipeline:
                 finding.priority_score = priority_score(
                     finding.severity,
                     finding.confidence,
-                    str(finding.metadata.get("jev_depth", "standard")),
+                    str(finding.metadata.get("route_depth", "standard")),
                 )
         except Exception as exc:  # noqa: BLE001
             ai_consolidation_failures = 1
@@ -530,9 +613,10 @@ class SastPipeline:
         model_input_metrics = getattr(deep_hunt_agent, "model_input_metrics", dict)()
         model_budget_metrics = getattr(deep_hunt_agent, "model_budget_metrics", dict)()
         model_input_audit = getattr(deep_hunt_agent, "model_input_audit", list)()
+        checkpoint_resume_cursor = checkpoint.resume_cursor() if checkpoint is not None else {}
         if model_input_audit:
             repository_context["model_input_audit"] = model_input_audit
-        return ScanResult(
+        result = ScanResult(
             codebase=codebase,
             revision=revision,
             mode=ScanMode.DEEP,
@@ -590,8 +674,20 @@ class SastPipeline:
                 "ai_patch_unverified": ai_patch_unverified,
                 "ai_patch_proposal_failures": ai_patch_proposal_failures,
                 "ai_patch_unexpected_failures": ai_patch_unexpected_failures,
-                "jev_routes": jev_routes,
-                "jev_deep_budget_demotions": jev_deep_budget_demotions,
+                "deep_budget_demotions": deep_budget_demotions,
+                "checkpoint_enabled": checkpoint is not None,
+                "checkpoint_units_reused": checkpoint.hits if checkpoint is not None else 0,
+                "checkpoint_units_saved": checkpoint.writes if checkpoint is not None else 0,
+                "checkpoint_units_discarded_stale": checkpoint.discarded if checkpoint is not None else 0,
+                "checkpoint_units_pending": (
+                    checkpoint.status_counts().get("pending", 0) if checkpoint is not None else 0
+                ),
+                "checkpoint_units_completed": (
+                    checkpoint.status_counts().get("completed", 0) if checkpoint is not None else 0
+                ),
+                "checkpoint_resume_stage": checkpoint_resume_cursor.get("stage", ""),
+                "checkpoint_resume_operation": checkpoint_resume_cursor.get("operation", ""),
+                "checkpoint_resume_error_type": checkpoint_resume_cursor.get("last_error_type", ""),
                 "persistence_enabled": persistence_enabled,
                 "persistence_indexed": persistence_indexed,
                 "persistence_error_type": persistence_error_type,
@@ -607,3 +703,6 @@ class SastPipeline:
             },
             repository_context=repository_context,
         )
+        if checkpoint is not None:
+            checkpoint.close()
+        return result

@@ -74,10 +74,9 @@ class WorkerPaths:
 
 
 class LocalScanExecutor:
-    def __init__(self, paths: WorkerPaths, *, timeout_seconds: int, jev: bool = True) -> None:
+    def __init__(self, paths: WorkerPaths, *, timeout_seconds: int) -> None:
         self.paths = paths
         self.timeout_seconds = timeout_seconds
-        self.jev = jev
 
     def __call__(self, job: ScanJobValue) -> dict[str, Any]:
         snapshot = self.paths.resolve_snapshot(job.snapshot_uri)
@@ -106,8 +105,6 @@ class LocalScanExecutor:
             "--tenant-id",
             job.tenant_id,
         ]
-        if not self.jev:
-            command.append("--no-jev")
         completed = subprocess.run(  # noqa: S603 - trusted scanner executable and fixed argument vector
             command,
             check=False,

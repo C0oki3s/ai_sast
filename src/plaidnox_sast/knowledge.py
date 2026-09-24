@@ -11,10 +11,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from jsonschema import Draft202012Validator
+
 from .assets import load_json, load_text
-from .cache_telemetry import LiteLLMCacheTelemetry
 from .controls import ModelUsageBudget
-from .jev import JevClient, JevError
+from .llm import parse_json_text
 from .prompts import render_operation
 from .redaction import redact_payload
 
@@ -258,60 +259,13 @@ class KnowledgeStore:
         }
 
 
-class JevKnowledgeRouter:
-    """Uses JEV only for typed knowledge reuse/retrieval/research decisions."""
-
-    def __init__(self, client: JevClient) -> None:
-        self.client = client
-
-    def classify(
-        self,
-        query: str,
-        task: dict[str, Any],
-        repository_context: dict[str, Any],
-        stored: list[KnowledgeEntry],
-    ) -> KnowledgeDecision:
-        policy = load_json("routing/knowledge_retrieval.json")
-        state = {
-            "query": query,
-            "task": task,
-            "repository": {
-                "codebase": repository_context.get("codebase"),
-                "architecture": repository_context.get("architecture"),
-                "applications": repository_context.get("applications"),
-            },
-            "stored_knowledge": [
-                {
-                    "knowledge_id": item.knowledge_id,
-                    "topic": item.topic,
-                    "ecosystem": item.ecosystem,
-                    "framework": item.framework,
-                    "source_url": item.source_url,
-                    "source_updated_at": item.source_updated_at,
-                    "confidence": item.confidence,
-                    # What the entry actually says, not just its metadata — JEV
-                    # cannot judge sufficiency from a title and a source URL alone.
-                    "claims": item.claims,
-                }
-                for item in stored
-            ],
-        }
-        answers = self.client.decide_questions(state, "routing/knowledge_retrieval.json")
-        try:
-            action = answers["knowledge_action"]
-            scope = answers["knowledge_scope"]
-        except KeyError as exc:
-            raise JevError("JEV knowledge response omitted a required decision") from exc
-        confidence = min(action.confidence, scope.confidence)
-        if confidence < float(policy["confidence_threshold"]):
-            return KnowledgeDecision(
-                str(policy["low_confidence_action"]),
-                scope.choice,
-                confidence,
-                action.model,
-                "JEV confidence below the knowledge reuse threshold",
-            )
-        return KnowledgeDecision(action.choice, scope.choice, confidence, action.model, "JEV knowledge decision")
+def _infer_scope(task: dict[str, Any]) -> str:
+    """Pick the retrieval scope most likely to describe this task's local knowledge."""
+    if task.get("vulnerability_themes"):
+        return "vulnerability_class"
+    if task.get("business_invariants"):
+        return "business_domain"
+    return "repository"
 
 
 def _joined(values: Any) -> str:
@@ -372,11 +326,9 @@ class KnowledgeCoordinator:
     def __init__(
         self,
         store: SecurityKnowledgeStore,
-        router: JevKnowledgeRouter,
         research_provider: KnowledgeResearchProvider | None = None,
     ) -> None:
         self.store = store
-        self.router = router
         self.research_provider = research_provider
 
     def resolve(
@@ -388,18 +340,34 @@ class KnowledgeCoordinator:
         repository_context: dict[str, Any],
     ) -> tuple[KnowledgeDecision, list[KnowledgeEntry]]:
         stored = self.store.search(query)
-        decision = self.router.classify(query, task, repository_context, stored)
-        entries = stored
-        if decision.action == "research_web":
-            if self.research_provider is None:
-                raise RuntimeError("JEV requested web research but no knowledge research provider is configured")
-            researched = self.research_provider.research(
-                query,
-                {"task": task, "repository_context": repository_context, "stored_knowledge": [item.to_dict() for item in stored]},
-            )
-            entries = [self.store.upsert(item) for item in researched]
-        elif decision.action == "retrieve_database":
-            entries = self.store.search(_retrieval_terms(decision.scope, query, task, repository_context))
+        if stored:
+            decision = KnowledgeDecision("use_database", "repository", 1.0, "", "stored knowledge available")
+            entries = stored
+        else:
+            scope = _infer_scope(task)
+            retrieved = self.store.search(_retrieval_terms(scope, query, task, repository_context))
+            if retrieved:
+                decision = KnowledgeDecision(
+                    "retrieve_database", scope, 1.0, "", "no exact match; broadened local retrieval"
+                )
+                entries = retrieved
+            else:
+                if self.research_provider is None:
+                    raise RuntimeError(
+                        "local knowledge exhausted but no knowledge research provider is configured"
+                    )
+                decision = KnowledgeDecision(
+                    "research_web", scope, 1.0, "", "no local knowledge found; web research required"
+                )
+                researched = self.research_provider.research(
+                    query,
+                    {
+                        "task": task,
+                        "repository_context": repository_context,
+                        "stored_knowledge": [item.to_dict() for item in stored],
+                    },
+                )
+                entries = [self.store.upsert(item) for item in researched]
         self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, entries)
         return decision, entries
 
@@ -411,7 +379,7 @@ class KnowledgeCoordinator:
         queries: list[str],
         repository_context: dict[str, Any],
     ) -> list[tuple[str, KnowledgeDecision, list[KnowledgeEntry]]]:
-        """Classify each query with JEV, then research each pending query independently.
+        """Classify each query locally, then research each pending query independently.
 
         Each query gets its own research call so a research result is never attributed
         to a query it wasn't actually answering.
@@ -420,18 +388,30 @@ class KnowledgeCoordinator:
         resolved: list[tuple[str, KnowledgeDecision, list[KnowledgeEntry]]] = []
         for query in dict.fromkeys(item.strip() for item in queries if item.strip()):
             stored = self.store.search(query)
-            decision = self.router.classify(query, task, repository_context, stored)
-            if decision.action == "research_web":
-                pending_research.append((query, decision, stored))
+            if stored:
+                decision = KnowledgeDecision("use_database", "repository", 1.0, "", "stored knowledge available")
+                self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, stored)
+                resolved.append((query, decision, stored))
                 continue
-            if decision.action == "retrieve_database":
-                stored = self.store.search(_retrieval_terms(decision.scope, query, task, repository_context))
-            self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, stored)
-            resolved.append((query, decision, stored))
+            scope = _infer_scope(task)
+            retrieved = self.store.search(_retrieval_terms(scope, query, task, repository_context))
+            if retrieved:
+                decision = KnowledgeDecision(
+                    "retrieve_database", scope, 1.0, "", "no exact match; broadened local retrieval"
+                )
+                self.store.record_usage(repository, scan_id, str(task["task_id"]), query, decision, retrieved)
+                resolved.append((query, decision, retrieved))
+                continue
+            decision = KnowledgeDecision(
+                "research_web", scope, 1.0, "", "no local knowledge found; web research required"
+            )
+            pending_research.append((query, decision, retrieved))
 
         if pending_research:
             if self.research_provider is None:
-                raise RuntimeError("JEV requested web research but no knowledge research provider is configured")
+                raise RuntimeError(
+                    "local knowledge exhausted but no knowledge research provider is configured"
+                )
             for query, decision, stored in pending_research:
                 researched = self.research_provider.research(
                     query,
@@ -447,39 +427,47 @@ class KnowledgeCoordinator:
         return resolved
 
 
-class LiteLLMKnowledgeProvider:
-    """Structured, source-validated research routed only through LiteLLM."""
+class PerplexityKnowledgeProvider:
+    """Structured, source-validated research through Perplexity's native API."""
 
     def __init__(
         self,
         client: Any,
         model: str,
-        cache_telemetry: LiteLLMCacheTelemetry,
         model_budget: ModelUsageBudget | None = None,
     ) -> None:
         self.client = client
         self.model = model
-        self.cache_telemetry = cache_telemetry
         self.model_budget = model_budget or ModelUsageBudget()
         self.config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
 
     @classmethod
     def from_environment(
         cls,
-        cache_telemetry: LiteLLMCacheTelemetry,
         model_budget: ModelUsageBudget | None = None,
-    ) -> LiteLLMKnowledgeProvider:
-        from .llm import LiteLLMConfigurationError, LiteLLMResponsesClient
+    ) -> PerplexityKnowledgeProvider:
+        try:
+            from perplexity import Perplexity
+        except ImportError as exc:
+            raise RuntimeError("Install the AI extra with: pip install -e '.[ai]'") from exc
 
         config = load_json("research/providers.json")["providers"]["perplexity_sonar"]
+        api_key_environment = str(config["api_key_environment"])
+        api_key = os.environ.get(api_key_environment, "").strip()
+        if not api_key:
+            raise RuntimeError(f"{api_key_environment} is required for Perplexity Sonar research")
         selected = os.environ.get(str(config["model_environment"]), str(config["default_model"]))
-        prefix = str(config["litellm_model_prefix"])
-        model = selected if selected.startswith("perplexity/") else f"{prefix}{selected}"
-        try:
-            client = LiteLLMResponsesClient.from_environment(model, prefer_direct=True)
-        except LiteLLMConfigurationError as exc:
-            raise RuntimeError(str(exc)) from exc
-        return cls(client, model, cache_telemetry, model_budget)
+        api_base = os.environ.get(
+            str(config["api_base_environment"]),
+            str(config["default_api_base"]),
+        ).strip()
+        client = Perplexity(
+            api_key=api_key,
+            base_url=api_base,
+            timeout=float(config["request_timeout_seconds"]),
+            max_retries=int(config["request_max_retries"]),
+        )
+        return cls(client, selected, model_budget)
 
     def research(self, query: str, context: dict[str, Any]) -> list[KnowledgeEntry]:
         schema = load_json("schemas/knowledge_research.json")
@@ -495,37 +483,38 @@ class LiteLLMKnowledgeProvider:
             maximum_output_tokens,
         )
         try:
-            response = self.client.responses.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
-                instructions=system_prompt,
-                input=user_prompt,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "plaidnox_security_knowledge",
-                        "strict": True,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=maximum_output_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "plaidnox_knowledge_research",
                         "schema": schema,
-                    }
+                    },
                 },
-                max_output_tokens=maximum_output_tokens,
             )
         except BaseException:
             self.model_budget.cancel(reservation)
             raise
         self.model_budget.complete(reservation, response)
-        self.cache_telemetry.record_response(response)
-        if getattr(response, "status", "completed") != "completed":
-            raise RuntimeError("LiteLLM security research did not complete")
-        content = getattr(response, "output_text", None)
-        if not content:
-            raise RuntimeError("LiteLLM security research returned no content")
         try:
-            payload = json.loads(content)
+            payload = parse_json_text(_chat_completion_text(response))
         except json.JSONDecodeError as exc:
-            raise RuntimeError("LiteLLM security research did not return structured JSON") from exc
+            raise RuntimeError("Perplexity security research did not return structured JSON") from exc
+        validation_errors = sorted(
+            Draft202012Validator(schema).iter_errors(payload),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+        if validation_errors:
+            raise RuntimeError("Perplexity security research did not match the required schema")
         sources = _response_sources(response)
         if not sources:
-            raise RuntimeError("LiteLLM security research returned no cited sources")
+            raise RuntimeError("Perplexity security research returned no cited sources")
         entries = []
         for item in payload["entries"]:
             source_url = str(item["source_url"])
@@ -550,18 +539,17 @@ class LiteLLMKnowledgeProvider:
                 )
             )
         if not entries:
-            raise RuntimeError("LiteLLM security research contained no entries backed by returned citations")
+            raise RuntimeError("Perplexity security research contained no entries backed by returned citations")
         return entries
 
 
 def research_provider_from_environment(
-    cache_telemetry: LiteLLMCacheTelemetry,
     model_budget: ModelUsageBudget | None = None,
 ) -> KnowledgeResearchProvider:
     providers = load_json("research/providers.json")
     selected = os.environ.get("IFRIT_RESEARCH_PROVIDER", str(providers["default_provider"]))
     if selected == "perplexity_sonar":
-        return LiteLLMKnowledgeProvider.from_environment(cache_telemetry, model_budget)
+        return PerplexityKnowledgeProvider.from_environment(model_budget)
     raise RuntimeError(f"Unsupported IFRIT research provider: {selected}")
 
 
@@ -593,6 +581,16 @@ def _response_sources(response: Any) -> dict[str, dict[str, Any]]:
                     if url.startswith(("http://", "https://")):
                         sources.setdefault(_normalise_url(url), value)
     return sources
+
+
+def _chat_completion_text(response: Any) -> str:
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError("Perplexity security research returned no answer") from exc
+    if not content:
+        raise RuntimeError("Perplexity security research returned an empty answer")
+    return str(content)
 
 
 def _object_dict(value: Any) -> dict[str, Any]:

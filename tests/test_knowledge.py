@@ -2,31 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 
-from plaidnox_sast.cache_telemetry import LiteLLMCacheTelemetry
-from plaidnox_sast.jev import JevAnswer
+import pytest
+
 from plaidnox_sast.knowledge import (
-    JevKnowledgeRouter,
     KnowledgeCoordinator,
-    KnowledgeDecision,
     KnowledgeEntry,
     KnowledgeStore,
-    LiteLLMKnowledgeProvider,
+    PerplexityKnowledgeProvider,
 )
-
-
-class FakeJevClient:
-    def __init__(self, action: str = "use_database", confidence: float = 0.93, scope: str = "framework"):
-        self.action = action
-        self.confidence = confidence
-        self.scope = scope
-        self.requests = []
-
-    def decide_questions(self, state, routing_asset):
-        self.requests.append((state, routing_asset))
-        return {
-            "knowledge_action": JevAnswer(self.action, self.confidence, "jev-test"),
-            "knowledge_scope": JevAnswer(self.scope, self.confidence, "jev-test"),
-        }
 
 
 class FakeResearchProvider:
@@ -108,7 +91,7 @@ def test_knowledge_store_is_content_addressed_and_searchable(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM security_knowledge").fetchone()[0] == 1
 
 
-def test_jev_routes_between_database_reuse_and_web_research(tmp_path):
+def test_resolve_reuses_stored_knowledge_before_any_web_research(tmp_path):
     store = KnowledgeStore(tmp_path / "context.sqlite")
     stored = store.upsert(
         KnowledgeEntry(
@@ -120,17 +103,19 @@ def test_jev_routes_between_database_reuse_and_web_research(tmp_path):
             confidence=0.95,
         )
     )
-    reuse_jev = FakeJevClient("use_database")
-    coordinator = KnowledgeCoordinator(store, JevKnowledgeRouter(reuse_jev))
+    provider = FakeResearchProvider()
+    coordinator = KnowledgeCoordinator(store, provider)
     decision, entries = coordinator.resolve("owner/repo", "scan-1", _task(), "Express proxy trust", {})
 
     assert decision.action == "use_database"
     assert entries[0].knowledge_id == stored.knowledge_id
-    assert reuse_jev.requests[0][1] == "routing/knowledge_retrieval.json"
+    assert not provider.queries
 
+
+def test_resolve_researches_the_web_when_local_knowledge_is_absent(tmp_path):
+    store = KnowledgeStore(tmp_path / "context.sqlite")
     provider = FakeResearchProvider()
-    research_jev = FakeJevClient("research_web")
-    coordinator = KnowledgeCoordinator(store, JevKnowledgeRouter(research_jev), provider)
+    coordinator = KnowledgeCoordinator(store, provider)
     decision, entries = coordinator.resolve("owner/repo", "scan-2", _task(), "current proxy behavior", {})
 
     assert decision.action == "research_web"
@@ -138,22 +123,19 @@ def test_jev_routes_between_database_reuse_and_web_research(tmp_path):
     assert entries[0].provenance == "web-research"
 
 
-def test_jev_knowledge_router_sends_the_codebase_identifier():
-    client = FakeJevClient("use_database")
-    router = JevKnowledgeRouter(client)
+def test_resolve_fails_typed_when_research_is_needed_but_no_provider_is_configured(tmp_path):
+    coordinator = KnowledgeCoordinator(KnowledgeStore(tmp_path / "context.sqlite"))
 
-    router.classify("proxy trust", _task(), {"codebase": "org/repo", "architecture": "Express API"}, [])
-
-    state, _routing_asset = client.requests[0]
-    assert state["repository"]["codebase"] == "org/repo"
+    with pytest.raises(Exception, match="no knowledge research provider"):
+        coordinator.resolve("owner/repo", "scan-3", _task(), "current proxy behavior", {})
 
 
-def test_low_confidence_jev_decision_uses_external_research_policy():
-    router = JevKnowledgeRouter(FakeJevClient("use_database", confidence=0.4))
-    decision = router.classify("unknown behavior", _task(), {}, [])
+def test_infer_scope_follows_the_populated_task_fields():
+    from plaidnox_sast.knowledge import _infer_scope
 
-    assert isinstance(decision, KnowledgeDecision)
-    assert decision.action == "research_web"
+    assert _infer_scope({"vulnerability_themes": ["ssrf"]}) == "vulnerability_class"
+    assert _infer_scope({"business_invariants": ["tenant isolation"]}) == "business_domain"
+    assert _infer_scope({}) == "repository"
 
 
 def test_retrieval_terms_uses_repository_scoped_task_facts():
@@ -254,19 +236,16 @@ def test_resolve_retrieves_with_scope_shaped_terms(tmp_path):
             confidence=0.9,
         )
     )
-    coordinator = KnowledgeCoordinator(store, JevKnowledgeRouter(FakeJevClient("retrieve_database", scope="framework")))
+    provider = FakeResearchProvider()
+    coordinator = KnowledgeCoordinator(store, provider)
+    task = {**_task(), "vulnerability_themes": ["Passport session fixation"]}
 
-    decision, entries = coordinator.resolve(
-        "owner/repo",
-        "scan-1",
-        _task(),
-        "session handling",
-        {"architecture": "Express", "applications": [{"architecture": "Express with Passport"}]},
-    )
+    decision, entries = coordinator.resolve("owner/repo", "scan-1", task, "zzqx unrelated wording", {})
 
     assert decision.action == "retrieve_database"
-    assert entries
+    assert decision.scope == "vulnerability_class"
     assert entries[0].framework == "passport"
+    assert not provider.queries
 
 
 def test_hunt_plan_and_tasks_are_persisted_separately(tmp_path):
@@ -288,11 +267,7 @@ def test_hunt_plan_and_tasks_are_persisted_separately(tmp_path):
 def test_fresh_research_queries_are_resolved_independently_per_hunt_task(tmp_path):
     store = KnowledgeStore(tmp_path / "context.sqlite")
     provider = FakeResearchProvider()
-    coordinator = KnowledgeCoordinator(
-        store,
-        JevKnowledgeRouter(FakeJevClient("research_web")),
-        provider,
-    )
+    coordinator = KnowledgeCoordinator(store, provider)
     resolved = coordinator.resolve_many(
         "owner/repo",
         "scan-batch",
@@ -313,11 +288,7 @@ def test_fresh_research_queries_are_resolved_independently_per_hunt_task(tmp_pat
 def test_resolve_many_does_not_attribute_one_querys_research_to_another(tmp_path):
     store = KnowledgeStore(tmp_path / "context.sqlite")
     provider = QueryAwareResearchProvider()
-    coordinator = KnowledgeCoordinator(
-        store,
-        JevKnowledgeRouter(FakeJevClient("research_web")),
-        provider,
-    )
+    coordinator = KnowledgeCoordinator(store, provider)
     resolved = coordinator.resolve_many(
         "owner/repo",
         "scan-batch",
@@ -363,7 +334,7 @@ def test_perplexity_sonar_research_keeps_only_returned_citations():
         ]
     }
 
-    class FakeResponses:
+    class FakeCompletions:
         def __init__(self):
             self.request = None
 
@@ -373,40 +344,41 @@ def test_perplexity_sonar_research_keeps_only_returned_citations():
                 "Response",
                 (),
                 {
-                    "status": "completed",
-                    "output_text": json.dumps(payload),
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {"message": type("Message", (), {"content": json.dumps(payload)})()},
+                        )()
+                    ],
                     "usage": {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 20}},
-                    "output": [
+                    "search_results": [
                         {
-                            "type": "search_results",
-                            "results": [
-                                {
-                                    "title": "Express behind proxies",
-                                    "url": "https://expressjs.com/en/guide/behind-proxies.html",
-                                    "last_updated": "2026-08-01",
-                                }
-                            ],
+                            "title": "Express behind proxies",
+                            "url": "https://expressjs.com/en/guide/behind-proxies.html",
+                            "last_updated": "2026-08-01",
                         }
                     ],
                 },
             )()
 
-    responses = FakeResponses()
-    client = type("Client", (), {"responses": responses})()
-    provider = LiteLLMKnowledgeProvider(
-        client, "perplexity/perplexity/sonar", LiteLLMCacheTelemetry()
-    )
+    completions = FakeCompletions()
+    client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": completions})()},
+    )()
+    provider = PerplexityKnowledgeProvider(client, "sonar")
 
     entries = provider.research("Express trust proxy security", {"architecture": "Express"})
 
     assert len(entries) == 1
-    assert entries[0].provenance == "perplexity-sonar-via-litellm:perplexity/perplexity/sonar"
+    assert entries[0].provenance == "perplexity-sonar-direct:sonar"
     assert entries[0].source_updated_at == "2026-08-01"
     assert entries[0].claims == ["Express trust proxy setting changes derived client IP."]
-    assert responses.request["model"] == "perplexity/perplexity/sonar"
-    assert responses.request["text"]["format"]["type"] == "json_schema"
-    assert "prompt_cache_key" not in responses.request
-    assert "primary sources" in responses.request["instructions"]
+    assert completions.request["model"] == "sonar"
+    assert completions.request["response_format"]["type"] == "json_schema"
+    assert "primary sources" in completions.request["messages"][0]["content"]
 
 
 def test_knowledge_entry_normalised_strips_and_caps_claims():
@@ -441,21 +413,3 @@ def test_knowledge_store_round_trips_claims(tmp_path):
 
     assert saved.claims == ["Only trust explicitly configured reverse proxies."]
     assert store.search("Express")[0].claims == ["Only trust explicitly configured reverse proxies."]
-
-
-def test_jev_knowledge_router_sends_stored_claims_not_just_metadata():
-    client = FakeJevClient("use_database")
-    router = JevKnowledgeRouter(client)
-    stored = [
-        KnowledgeEntry(
-            topic="Express proxy trust",
-            content="Only trust explicitly configured reverse proxies.",
-            source_url="https://expressjs.com/en/guide/behind-proxies.html",
-            claims=["Only trust explicitly configured reverse proxies."],
-        ).normalised()
-    ]
-
-    router.classify("proxy trust", _task(), {}, stored)
-
-    state, _routing_asset = client.requests[0]
-    assert state["stored_knowledge"][0]["claims"] == ["Only trust explicitly configured reverse proxies."]

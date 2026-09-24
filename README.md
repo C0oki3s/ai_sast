@@ -33,10 +33,10 @@ immutable local source snapshot
   -> bounded rg execution and evidence-backed application context
   -> build/reuse Context Fabric snapshot/overlay
   -> LLM-created hunt tasks from architecture, code, business context, and knowledge
-  -> JEV database reuse / retrieval / Perplexity web-research decision
+  -> knowledge database reuse / retrieval / Perplexity web-research fallback
   -> recursive PlaidNox discovery and root-cause variant sweeps
   -> optional DataDog SAIST candidate input
-  -> JEV context/profile classification
+  -> deterministic candidate route classification
   -> PlaidNox Deep Hunt: entry point -> forward trace -> falsification -> evidence
   -> finding dependencies -> deduplication -> policy -> JSON/SARIF/Markdown
 ```
@@ -60,16 +60,15 @@ python3 -m venv .venv
 
 Every operational scan uses the LiteLLM SDK. For the local gateway, configure a
 virtual key and base URL; no model-provider key is passed to the Deep Hunt
-runtime. JEV is enabled by default, so `JEV_API_KEY` is required unless
-`--no-jev` is explicitly selected.
+runtime.
 
 ```dotenv
 LITELLM_API_KEY=<virtual key>
 LITELLM_API_BASE=http://localhost:4000
 ```
 
-Perplexity Sonar web research is also invoked through the LiteLLM SDK. Configure
-its direct provider credential without putting it in code:
+Perplexity Sonar web research uses Perplexity's official SDK and a separately
+scoped direct credential:
 
 ```dotenv
 IFRIT_RESEARCH_PROVIDER=perplexity_sonar
@@ -77,9 +76,9 @@ IFRIT_PERPLEXITY_API_KEY=<secret-manager value>
 IFRIT_RESEARCH_SONAR_MODEL=sonar
 ```
 
-The configured `sonar` name maps to `perplexity/perplexity/sonar`, which selects
-Perplexity's responses/Agent API route in LiteLLM. Provider values are never
-written to reports, context stores, or repository files.
+The configured `sonar` model is sent directly to Perplexity's Sonar Chat
+Completions API. Provider credentials are never written to reports, context
+stores, or repository files.
 
 Use `--saist --saist-bin /path/to/datadog-saist` to add upstream DataDog SAIST
 as a broad AI-native candidate source. It does not replace PlaidNox Deep Hunt.

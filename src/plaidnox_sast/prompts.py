@@ -40,7 +40,27 @@ def _environment() -> Environment:
         sort_keys=True,
         indent=indent,
     )
+    environment.filters["payload_json"] = _payload_json
     return environment
+
+
+def _payload_json(payload: Mapping[str, Any], indent: int | None = 2) -> str:
+    """Serialise a payload with stable keys first and per-request keys last.
+
+    Provider prompt caches match on the longest identical prefix, so the
+    content that repeats across requests (repository context, hunt plan)
+    must precede the content that changes every request (the source segment).
+    """
+    volatile = [
+        str(key) for key in load_json("runtime/agent.json")["prompt_cache_volatile_payload_keys"]
+    ]
+    stable = sorted(key for key in payload if key not in volatile)
+    names = (*stable, *(key for key in volatile if key in payload))
+    # Nested keys stay sorted so equal content always serialises identically.
+    normalised = {
+        key: json.loads(json.dumps(payload[key], ensure_ascii=False, sort_keys=True)) for key in names
+    }
+    return json.dumps(normalised, ensure_ascii=False, sort_keys=False, indent=indent)
 
 
 def render_prompt(template_name: str, **values: Any) -> str:

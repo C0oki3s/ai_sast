@@ -1,4 +1,4 @@
 interface:
   display_name: "PlaidNox Code Scanning"
   short_description: "Build and improve the PlaidNox AI code-scanning engine"
-  default_prompt: "Improve the PlaidNox Code Scanning backend using its LiteLLM, JEV, ripgrep, Tree-sitter, Context Fabric, and Deep Hunt architecture."
+  default_prompt: "Improve the PlaidNox Code Scanning backend using its LiteLLM, ripgrep, Tree-sitter, Context Fabric, and Deep Hunt architecture."

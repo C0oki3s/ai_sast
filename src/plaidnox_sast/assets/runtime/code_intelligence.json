@@ -1,5 +1,6 @@
 {
   "maximum_pattern_characters": 2000,
+  "maximum_literal_terms_per_query": 20,
   "maximum_hits_per_query": 500,
   "rg_timeout_seconds": 30,
   "maximum_rg_error_characters": 800,

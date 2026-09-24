@@ -4,7 +4,7 @@
 
 ## Search-plan result
 
-Translate every investigation task into a bounded discovery and navigation plan. Derive patterns from supplied evidence; do not substitute a baked-in rule list. Include distinct searches for entry points, sensitive effects, definitions/references, guards, missing-input branches, indirect dispatch, and second-order store readers/writers where the task warrants them. Use focus paths to constrain broad searches and include task IDs accurately. When verified roots are present, cover semantic variants across the full production scope.
+Translate every investigation task into a bounded discovery and navigation plan. Derive literal search terms from supplied evidence; do not substitute a baked-in rule list. Include distinct searches for entry points, sensitive effects, definitions/references, guards, missing-input branches, indirect dispatch, and second-order store readers/writers where the task warrants them. Use focus paths to constrain broad searches and include task IDs accurately. When verified roots are present, cover semantic variants across the full production scope.
 
 Each query also declares `direction` (`forward` traces attacker influence outward, `backward` traces a sensitive effect back to its origin, `boundary` probes an identity/authorization/tenant/state inconsistency, `variant` searches for a semantic twin of an already-verified root cause, `inventory` is a bounded reconnaissance sweep) and `purpose` (what role the matched lines play: `entry_point`, `origin`, `effect`, `control`, `caller`, `callee`, `writer`, `reader`, `missing_branch`, `indirect_dispatch`, or `alternate_implementation`).
 

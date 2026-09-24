@@ -22,9 +22,8 @@ from .config import load_local_project_config
 from .context_fabric import ContextFabric, ContextFabricStore
 from .environment import load_mounted_secrets
 from .graph import build_structural_graph
-from .jev import JevClient, JevFrontierRouter, JevRetryRouter
+from .routers import FrontierRouter, ModelExecutionRouter, RetryRouter
 from .knowledge import (
-    JevKnowledgeRouter,
     KnowledgeCoordinator,
     KnowledgeStore,
     research_provider_from_environment,
@@ -57,6 +56,15 @@ def _parser() -> argparse.ArgumentParser:
     local.add_argument("--codebase", required=True, help="stable application codebase identity")
     local.add_argument("--revision", help="immutable source revision; defaults to a content-derived snapshot hash")
     local.add_argument("--output", type=Path, required=True)
+    local.add_argument(
+        "--checkpoint",
+        type=Path,
+        help=(
+            "durable resume store (default: OUTPUT/scan-checkpoint.sqlite); completed work and "
+            "LLM responses are replayed, while the last pending model operation is retried"
+        ),
+    )
+    local.add_argument("--no-checkpoint", action="store_true", help="disable durable checkpointing")
     local.add_argument("--enforce", action="store_true")
     local.add_argument(
         "--propose-patches",
@@ -102,12 +110,6 @@ def _parser() -> argparse.ArgumentParser:
         worker = sub.add_parser(name, help=help_text)
         worker.add_argument("--tenant-id", required=True)
         worker.add_argument("--worker-id")
-        worker.add_argument(
-            "--jev",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help="pass JEV routing through to scans (requires JEV_API_KEY)",
-        )
         worker.add_argument("--env-file", type=Path)
     return parser
 
@@ -133,14 +135,6 @@ def _add_ai_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_engine_arguments(parser: argparse.ArgumentParser) -> None:
-    runtime = load_json("runtime/models.json")
-    parser.add_argument(
-        "--jev",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="use JEV for typed scan and knowledge-routing decisions (enabled by default)",
-    )
-    parser.add_argument("--jev-model", default=str(runtime["jev_default_model"]))
     parser.add_argument("--saist", action="store_true", help="run the upstream DataDog SAIST scanner")
     parser.add_argument("--saist-bin", help="path to the datadog-saist binary")
     parser.add_argument(
@@ -238,10 +232,6 @@ def _run_worker(args: argparse.Namespace, *, continuous: bool) -> int:
     factory = build_session_factory(settings)
     runtime = load_json("runtime/production_controls.json")["worker"]
     worker_id = args.worker_id or os.environ.get(str(runtime["worker_id_environment_variable"]), "")
-    if args.jev and not os.environ.get("JEV_API_KEY"):
-        # Deterministic misconfiguration: refuse before leasing, otherwise every
-        # job burns all of its attempts on the same scanner startup failure.
-        raise SystemExit("JEV_API_KEY is required for worker scans; configure it or pass --no-jev")
     worker = ScanWorker(
         factory,
         args.tenant_id,
@@ -249,7 +239,6 @@ def _run_worker(args: argparse.Namespace, *, continuous: bool) -> int:
         LocalScanExecutor(
             WorkerPaths.from_environment(),
             timeout_seconds=int(runtime["scan_timeout_seconds"]),
-            jev=args.jev,
         ),
         lease_seconds=int(runtime["lease_seconds"]),
         heartbeat_seconds=int(runtime["heartbeat_seconds"]),
@@ -304,34 +293,27 @@ def _run_scan_local(args: argparse.Namespace) -> int:
         else ContextFabricStore(context_database)
     )
     deep_hunt_agent.configure_context_fabric(context_store)
-    jev_client = (
-        JevClient.from_environment(args.jev_model)
-        if args.jev
-        else None
+    deep_hunt_agent.configure_capability_frontier(FrontierRouter())
+    deep_hunt_agent.configure_retry_route(RetryRouter())
+    deep_hunt_agent.configure_model_execution_route(ModelExecutionRouter())
+    knowledge_store = (
+        PostgresKnowledgeStore(persistence_session_factory, args.tenant_id)
+        if persistence_session_factory is not None
+        else KnowledgeStore(context_database)
     )
-    deep_hunt_agent.configure_capability_frontier(JevFrontierRouter(jev_client))
-    deep_hunt_agent.configure_retry_route(JevRetryRouter(jev_client))
-    if jev_client is not None:
-        knowledge_store = (
-            PostgresKnowledgeStore(persistence_session_factory, args.tenant_id)
-            if persistence_session_factory is not None
-            else KnowledgeStore(context_database)
+    deep_hunt_agent.configure_knowledge(
+        KnowledgeCoordinator(
+            knowledge_store,
+            research_provider_from_environment(
+                deep_hunt_agent.model_budget,
+            ),
         )
-        deep_hunt_agent.configure_knowledge(
-            KnowledgeCoordinator(
-                knowledge_store,
-                JevKnowledgeRouter(jev_client),
-                research_provider_from_environment(
-                    deep_hunt_agent.cache_telemetry,
-                    deep_hunt_agent.model_budget,
-                ),
-            )
-        )
+    )
     pipeline = SastPipeline(
         saist_detector=DatadogSAISTDetector(args.saist_bin) if args.saist else None,
-        jev_client=jev_client,
         session_factory=persistence_session_factory,
         tenant_id=args.tenant_id,
+        checkpoint_path=None if args.no_checkpoint else (args.checkpoint or output / "scan-checkpoint.sqlite"),
     )
     telemetry = ScanTelemetry.from_environment()
     with telemetry.scan(args.codebase, args.revision):

@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ai = ["litellm>=1.101,<2.0"]
+ai = ["litellm>=1.101,<2.0", "perplexityai>=0.43,<1.0"]
 observability = ["opentelemetry-api>=1.35,<2.0", "opentelemetry-sdk>=1.35,<2.0"]
 
 [project.scripts]

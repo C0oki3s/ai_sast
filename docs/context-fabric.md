@@ -49,6 +49,6 @@ for a specific question without changing the Context Fabric contract.
 - The recursive loop ends at a fixed point; any search, model, coverage, or
   sweep failure marks the scan incomplete.
 
-JEV chooses durable knowledge reuse, broader retrieval, or sourced Perplexity
-research. Only provider-returned source URLs are persisted. Research and memory
+Knowledge routing picks durable reuse, broader retrieval, or sourced Perplexity
+research, in that order. Only provider-returned source URLs are persisted. Research and memory
 guide the hunt but cannot confirm a finding without code evidence.

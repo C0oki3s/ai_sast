@@ -1,7 +1,0 @@
-{
-  "endpoint_environment_variable": "JEV_ENDPOINT",
-  "default_endpoint": "https://api.typesafe.ai/v1/systemone",
-  "request_timeout_seconds": 15,
-  "maximum_message_characters": 1200,
-  "maximum_path_nodes": 8
-}

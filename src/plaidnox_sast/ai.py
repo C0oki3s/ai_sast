@@ -8,15 +8,18 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from .assets import load_json
 from .cache_telemetry import LiteLLMCacheTelemetry
 from .context_fabric import ContextFabric, PreparedContext
+from .fingerprint import CandidateIndex
 from .controls import ModelUsageBudget
 from .errors import AIStageError
 from .graph import (
@@ -29,12 +32,19 @@ from .graph import (
     source_file_is_admitted,
     source_files,
 )
-from .jev import FRONTIER_PRIORITY_WEIGHT, JevFrontierRouter, JevRetryRouter
+from .checkpoint import ScanCheckpoint, candidate_from_dict, candidate_to_dict, unit_key
+from .routers import (
+    FRONTIER_PRIORITY_WEIGHT,
+    FrontierRouter,
+    ModelExecutionDecision,
+    ModelExecutionRouter,
+    RetryRouter,
+)
 from .knowledge import (
     KnowledgeCoordinator,
     KnowledgeEntry,
     KnowledgeStore,
-    LiteLLMKnowledgeProvider,
+    PerplexityKnowledgeProvider,
 )
 from .llm import (
     LiteLLMConfigurationError,
@@ -237,23 +247,29 @@ class PlaidNoxDeepHuntAgent:
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         cache_telemetry: LiteLLMCacheTelemetry | None = None,
         context_store: ContextFabric | None = None,
-        frontier_router: JevFrontierRouter | None = None,
-        retry_router: JevRetryRouter | None = None,
+        frontier_router: FrontierRouter | None = None,
+        retry_router: RetryRouter | None = None,
+        model_execution_router: ModelExecutionRouter | None = None,
         model_budget: ModelUsageBudget | None = None,
     ) -> None:
         self.client = client
         model_runtime = load_json("runtime/models.json")
         self.model = model or str(model_runtime["agent_default_model"])
         self.model_by_tier: dict[str, str] = {
-            str(tier): str(name) for tier, name in model_runtime.get("agent_model_by_tier", {}).items()
+            str(tier): str(name)
+            for tier, name in model_runtime["agent_fallback_model_by_tier"].items()
         }
         self.max_output_tokens = max_output_tokens
         self.knowledge_coordinator = knowledge_coordinator
         self.event_sink = event_sink
         self.cache_telemetry = cache_telemetry or LiteLLMCacheTelemetry()
         self.context_store = context_store
-        self.frontier_router = frontier_router or JevFrontierRouter()
-        self.retry_router = retry_router or JevRetryRouter()
+        self.frontier_router = frontier_router or FrontierRouter()
+        self.retry_router = retry_router or RetryRouter()
+        self.checkpoint: ScanCheckpoint | None = None
+        # Set by the pipeline to start reviewing candidates while discovery is still running.
+        self.candidate_sink: Callable[[Candidate], None] | None = None
+        self.model_execution_router = model_execution_router or ModelExecutionRouter()
         self.model_budget = model_budget or ModelUsageBudget()
         self.discovery_error_types: list[str] = []
         self.discovery_errors: list[str] = []
@@ -261,6 +277,7 @@ class PlaidNoxDeepHuntAgent:
         self.source_excludes: list[str] = []
         self.max_file_bytes: int | None = None
         self._model_input_audit: list[dict[str, Any]] = []
+        self._model_execution_routes: dict[str, ModelExecutionDecision] = {}
         self.search_query_errors: list[dict[str, Any]] = []
 
     @classmethod
@@ -293,11 +310,18 @@ class PlaidNoxDeepHuntAgent:
     def configure_context_fabric(self, store: ContextFabric) -> None:
         self.context_store = store
 
-    def configure_capability_frontier(self, router: JevFrontierRouter) -> None:
+    def configure_capability_frontier(self, router: FrontierRouter) -> None:
         self.frontier_router = router
 
-    def configure_retry_route(self, router: JevRetryRouter) -> None:
+    def configure_checkpoint(self, checkpoint: ScanCheckpoint | None) -> None:
+        self.checkpoint = checkpoint
+
+    def configure_retry_route(self, router: RetryRouter) -> None:
         self.retry_router = router
+
+    def configure_model_execution_route(self, router: ModelExecutionRouter) -> None:
+        self.model_execution_router = router
+        self._model_execution_routes.clear()
 
     def configure_source_policy(self, exclude: list[str], max_file_bytes: int) -> None:
         self.source_excludes = list(exclude)
@@ -319,7 +343,7 @@ class PlaidNoxDeepHuntAgent:
             self.search_query_errors.append(record)
             gap = (
                 f"{phase} query {error.query_id} could not execute; "
-                f"pattern {error.pattern_hash[:12]} remains an unresolved coverage obligation"
+                f"query terms {error.pattern_hash[:12]} remain an unresolved coverage obligation"
             )
             if context is not None and gap not in context.coverage_gaps:
                 context.coverage_gaps.append(gap)
@@ -337,6 +361,7 @@ class PlaidNoxDeepHuntAgent:
         """Start a new scan-scoped model-input audit."""
 
         self._model_input_audit.clear()
+        self._model_execution_routes.clear()
 
     def reset_search_query_errors(self) -> None:
         """Start a new scan-scoped AI search-query audit."""
@@ -361,8 +386,8 @@ class PlaidNoxDeepHuntAgent:
             ),
         }
 
-    def web_knowledge_provider(self) -> LiteLLMKnowledgeProvider:
-        return LiteLLMKnowledgeProvider.from_environment(self.cache_telemetry, self.model_budget)
+    def web_knowledge_provider(self) -> PerplexityKnowledgeProvider:
+        return PerplexityKnowledgeProvider.from_environment(self.model_budget)
 
     def hunt(
         self,
@@ -519,8 +544,8 @@ class PlaidNoxDeepHuntAgent:
         confidence_history: list[float],
         max_requests: int,
     ) -> DeepHuntResult:
-        """Consult JEV exactly once for a single bounded extra round after the normal
-        context-expansion budget is exhausted and a genuine evidence gap remains."""
+        """Decide, exactly once, whether a single bounded extra round is warranted after the
+        normal context-expansion budget is exhausted and a genuine evidence gap remains."""
         decision = self.retry_router.decide(_retry_facts(review, model_tier, context_expansions, confidence_history))
         self._emit(
             "candidate_retry_routed",
@@ -956,7 +981,6 @@ class PlaidNoxDeepHuntAgent:
             load_json("schemas/recon_search_plan.json"),
             "recon_search_plan",
             manifest,
-            model_tier=ModelTier.FAST,
         )
         try:
             payload = response_json(response)
@@ -1075,9 +1099,19 @@ class PlaidNoxDeepHuntAgent:
         if not segments:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
 
+        # One index for the whole scan: the same bug reported from overlapping
+        # segments or continuations must be hunted once.
+        candidate_index = CandidateIndex()
+
         def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], list[Exception]]:
             segment_candidates: list[Candidate] = []
             errors: list[Exception] = []
+            checkpoint_key = unit_key("discovery", segment)
+            if self.checkpoint is not None:
+                saved = self.checkpoint.get("discovery", checkpoint_key)
+                if saved is not None:
+                    self._emit("checkpoint_reused", stage="discovery", path=segment["path"], start_line=segment["start_line"])
+                    return [candidate_from_dict(item) for item in saved["candidates"]], []
             self._emit("source_segment_started", path=segment["path"], start_line=segment["start_line"])
             related_tasks = _tasks_for_segment(
                 plan,
@@ -1103,11 +1137,21 @@ class PlaidNoxDeepHuntAgent:
                         request,
                     )
                     payload = response_json(response)
+                    new_candidates = 0
                     for item in payload["candidates"]:
                         candidate = _candidate_from_ai_item(root, item, segment)
-                        if candidate is not None:
-                            segment_candidates.append(candidate)
+                        if candidate is None:
+                            continue
+                        if not candidate_index.admit(candidate):
+                            continue
+                        segment_candidates.append(candidate)
+                        new_candidates += 1
                     if bool(payload["coverage_complete"]):
+                        break
+                    if _continuation > 0 and not new_candidates:
+                        # A continuation that only repeats known candidates is not
+                        # widening coverage; stop paying to resend the segment.
+                        self._emit("discovery_continuation_exhausted", path=segment["path"], round=_continuation)
                         break
                     next_focus = str(payload["next_focus"])
                     if not next_focus:
@@ -1115,6 +1159,17 @@ class PlaidNoxDeepHuntAgent:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(exc)
                     break
+            if self.checkpoint is not None and not errors:
+                self.checkpoint.put(
+                    "discovery", checkpoint_key, {"candidates": [candidate_to_dict(item) for item in segment_candidates]}
+                )
+            sink = self.candidate_sink
+            if sink is not None and not errors:
+                for candidate in segment_candidates:
+                    try:
+                        sink(candidate)
+                    except Exception:  # noqa: BLE001 - early triage is an optimisation only
+                        break
             self._emit(
                 "source_segment_completed",
                 path=segment["path"],
@@ -1667,24 +1722,78 @@ class PlaidNoxDeepHuntAgent:
         serialized_payload = json.dumps(safe_payload, sort_keys=True, ensure_ascii=False)
         runtime = load_json("runtime/code_intelligence.json")
         source_keys = {str(item) for item in runtime["audited_source_payload_keys"]}
+        source_context_characters = _payload_characters_for_keys(safe_payload, source_keys)
+        repository_wide_context = _contains_repository_wide_context(safe_payload)
+        agent_runtime = load_json("runtime/agent.json")
+        configured_effort = str(
+            agent_runtime["reasoning_effort_by_operation"].get(prompt_operation, "low")
+        )
+        effort = _stronger_effort(configured_effort, reasoning_effort_override)
+        system_prompt, user_prompt = render_operation(prompt_operation, safe_payload, output_schema=schema)
+        schema_hash = hashlib.sha256(
+            json.dumps(schema, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        checkpoint_key = unit_key(
+            "llm_response",
+            name,
+            prompt_operation,
+            hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            hashlib.sha256(user_prompt.encode("utf-8")).hexdigest(),
+            schema_hash,
+        )
+        if self.checkpoint is not None:
+            saved = self.checkpoint.get_record("llm_response", checkpoint_key)
+            if saved is not None:
+                execution = dict(saved["execution"])
+                structured_payload = saved["payload"]["structured_payload"]
+                self._model_input_audit.append(
+                    {
+                        "operation": prompt_operation,
+                        "model_tier": str(execution.get("model_tier", "checkpoint")),
+                        "model": str(execution.get("model", "checkpoint")),
+                        "payload_hash": hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest(),
+                        "payload_characters": len(serialized_payload),
+                        "source_context_characters": source_context_characters,
+                        "repository_wide_context": repository_wide_context,
+                        "checkpoint_reused": True,
+                    }
+                )
+                self._emit(
+                    "checkpoint_reused",
+                    stage="llm_response",
+                    operation=prompt_operation,
+                )
+                replay = SimpleNamespace(
+                    status="completed",
+                    output_text=json.dumps(structured_payload, ensure_ascii=False),
+                    usage={},
+                )
+                return StructuredResponse(replay, structured_payload)
+        model_execution = self._model_execution_route(
+            prompt_operation,
+            safe_payload,
+            len(serialized_payload),
+            source_context_characters,
+            repository_wide_context,
+            model_tier,
+            effort,
+        )
         self._model_input_audit.append(
             {
                 "operation": prompt_operation,
-                "model_tier": model_tier.value if model_tier is not None else "default",
+                "model_tier": model_execution.model_tier.value,
+                "model": model_execution.model_name,
                 "payload_hash": hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest(),
                 "payload_characters": len(serialized_payload),
-                "source_context_characters": _payload_characters_for_keys(safe_payload, source_keys),
-                "repository_wide_context": _contains_repository_wide_context(safe_payload),
+                "source_context_characters": source_context_characters,
+                "repository_wide_context": repository_wide_context,
+                "checkpoint_reused": False,
             }
         )
-        system_prompt, user_prompt = render_operation(prompt_operation, safe_payload, output_schema=schema)
-        configured_effort = str(
-            load_json("runtime/agent.json")["reasoning_effort_by_operation"].get(prompt_operation, "low")
-        )
-        effort = _stronger_effort(configured_effort, reasoning_effort_override)
+        request_policy = _model_request_policy(agent_runtime, prompt_operation)
         effective_max_output_tokens = max_output_tokens or self.max_output_tokens
         request_kwargs: dict[str, Any] = {
-            "model": self._model_for_tier(model_tier),
+            "model": model_execution.model_name,
             "reasoning": {"effort": effort},
             "input": [
                 {"role": "system", "content": system_prompt},
@@ -1694,14 +1803,41 @@ class PlaidNoxDeepHuntAgent:
                 "verbosity": "low",
                 "format": {"type": "json_schema", "name": name, "strict": True, "schema": schema},
             },
+            "timeout": request_policy["timeout_seconds"],
+            "max_retries": request_policy["max_retries"],
         }
+        if model_execution.model_name.startswith("gpt-"):
+            # Routes requests sharing this stable prefix to the same cache shard.
+            request_kwargs["prompt_cache_key"] = (
+                f"{agent_runtime['prompt_cache_key_prefix']}:{prompt_operation}"
+            )
         if effective_max_output_tokens is not None:
             # Only impose a cap when the caller explicitly wants one -- an
             # unset cap here previously defaulted to a fixed value too low
             # for reasoning models, which spend part of the budget on
             # chain-of-thought before the final structured answer.
             request_kwargs["max_output_tokens"] = effective_max_output_tokens
-        shape_retries = int(load_json("runtime/agent.json")["structured_shape_retries"])
+        if self.checkpoint is not None:
+            self.checkpoint.begin(
+                "llm_response",
+                checkpoint_key,
+                {
+                    "schema_name": name,
+                    "schema": schema,
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                },
+                {
+                    "operation": prompt_operation,
+                    "model": model_execution.model_name,
+                    "model_tier": model_execution.model_tier.value,
+                    "reasoning_effort": effort,
+                    "timeout_seconds": request_policy["timeout_seconds"],
+                    "max_retries": request_policy["max_retries"],
+                    "max_output_tokens": effective_max_output_tokens,
+                },
+            )
+        shape_retries = request_policy["structured_shape_retries"]
         best: Any = None
         for attempt in range(shape_retries + 1):
             reservation = self.model_budget.reserve(
@@ -1709,22 +1845,56 @@ class PlaidNoxDeepHuntAgent:
                 len(system_prompt) + len(user_prompt),
                 effective_max_output_tokens,
             )
+            started_at = time.monotonic()
+            self._emit(
+                "model_request_started",
+                operation=prompt_operation,
+                model=str(request_kwargs["model"]),
+                attempt=attempt + 1,
+                timeout_seconds=request_policy["timeout_seconds"],
+                max_retries=request_policy["max_retries"],
+            )
             try:
                 response = self.client.responses.create(**request_kwargs)
-            except BaseException:
+            except BaseException as exc:
                 self.model_budget.cancel(reservation)
+                if self.checkpoint is not None:
+                    self.checkpoint.fail("llm_response", checkpoint_key, type(exc).__name__)
+                self._emit(
+                    "model_request_failed",
+                    operation=prompt_operation,
+                    model=str(request_kwargs["model"]),
+                    attempt=attempt + 1,
+                    duration_milliseconds=round((time.monotonic() - started_at) * 1000),
+                    error_type=type(exc).__name__,
+                )
                 raise
+            self._emit(
+                "model_request_completed",
+                operation=prompt_operation,
+                model=str(request_kwargs["model"]),
+                attempt=attempt + 1,
+                duration_milliseconds=round((time.monotonic() - started_at) * 1000),
+            )
             self.model_budget.complete(reservation, response)
             self.cache_telemetry.record_response(response)
             if getattr(response, "status", "completed") != "completed":
                 detail = getattr(response, "incomplete_details", None)
                 reason = getattr(detail, "reason", "unknown") if detail else "unknown"
+                if self.checkpoint is not None:
+                    self.checkpoint.fail("llm_response", checkpoint_key, f"incomplete:{reason}")
                 raise AIResponseError(f"AI request was incomplete: {reason}")
             try:
                 payload, matches = parse_structured(response_text(response), schema)
             except json.JSONDecodeError:
                 payload, matches = None, False
             if matches:
+                if self.checkpoint is not None:
+                    self.checkpoint.complete(
+                        "llm_response",
+                        checkpoint_key,
+                        {"structured_payload": payload},
+                    )
                 return StructuredResponse(response, payload)
             if payload is not None:
                 best = payload
@@ -1737,7 +1907,58 @@ class PlaidNoxDeepHuntAgent:
         # Out of retries: hand callers the closest reshaped answer (or the raw
         # one when nothing decoded) so their own schema check raises the
         # stage-specific AIResponseError.
+        if self.checkpoint is not None:
+            self.checkpoint.fail("llm_response", checkpoint_key, "StructuredResponseShapeMismatch")
         return StructuredResponse(response, best) if best is not None else response
+
+    def _model_execution_route(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+        payload_characters: int,
+        source_context_characters: int,
+        repository_wide_context: bool,
+        minimum_tier: ModelTier | None,
+        reasoning_effort: str,
+    ) -> ModelExecutionDecision:
+        cache_key = f"{operation}:{minimum_tier.value if minimum_tier else 'any'}:{reasoning_effort}"
+        cached = self._model_execution_routes.get(cache_key)
+        if cached is not None:
+            return cached
+        decision = self.model_execution_router.classify(
+            {
+                "operation": operation,
+                "minimum_tier": minimum_tier.value if minimum_tier is not None else "",
+                "reasoning_effort": reasoning_effort,
+                "payload_characters": payload_characters,
+                "source_context_characters": source_context_characters,
+                "repository_wide_context": repository_wide_context,
+                "context_fields": sorted(str(key) for key in payload),
+            }
+        )
+        self._model_execution_routes[cache_key] = decision
+        self._emit(
+            "model_execution_route_selected",
+            operation=operation,
+            model=decision.model_name,
+            model_tier=decision.model_tier.value,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+        return decision
+
+
+def _model_request_policy(runtime: Mapping[str, Any], operation: str) -> dict[str, int | float]:
+    """Resolve externally configured transport and response-shape limits."""
+
+    policies = runtime["model_request_policy_by_operation"]
+    default = dict(policies["default"])
+    default.update(policies.get(operation, {}))
+    return {
+        "timeout_seconds": float(default["timeout_seconds"]),
+        "max_retries": int(default["max_retries"]),
+        "structured_shape_retries": int(default["structured_shape_retries"]),
+    }
 
 
 # Kept for artifact and test compatibility with the first MVP. New code uses
@@ -1762,7 +1983,7 @@ _EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def _stronger_effort(configured: str, override: str | None) -> str:
-    """Let JEV escalate reasoning effort above the static per-operation default, never below it."""
+    """Let a route's evidence signals escalate reasoning effort above the static per-operation default, never below it."""
     if override is None or override not in _EFFORT_ORDER:
         return configured
     if configured not in _EFFORT_ORDER:
@@ -1969,11 +2190,11 @@ def _resolve_context_request(
 
     if kind == "search":
         if not pattern:
-            return {"kind": kind, "resolved": False, "reason": "search requests must include a non-empty pattern"}
+            return {"kind": kind, "resolved": False, "reason": "search requests must include a non-empty literal"}
         try:
-            hits = RipgrepDiscovery(root).search(
+            hits = RipgrepDiscovery(root).search_literals(
                 "context_search",
-                pattern,
+                [pattern],
                 include_globs=[path] if path else [],
                 exclude_globs=list(source_excludes or []),
             )
@@ -2408,9 +2629,9 @@ def _execute_recon_search_plan(
 
     for query in queries:
         try:
-            hits = discovery.search(
+            hits = discovery.search_literals(
                 str(query["query_id"]),
-                str(query["pattern"]),
+                [str(item) for item in query["search_terms"]],
                 include_globs=[str(item) for item in query.get("include_globs", [])],
                 exclude_globs=[str(item) for item in (exclude or [])],
             )
@@ -2528,9 +2749,9 @@ def _search_segments(
     for query in queries:
         task_ids = {str(item) for item in query["task_ids"]}
         try:
-            hits = rg.search(
+            hits = rg.search_literals(
                 str(query["query_id"]),
-                str(query["pattern"]),
+                [str(item) for item in query["search_terms"]],
                 include_globs=[str(item) for item in query["include_globs"]],
                 exclude_globs=exclude or [],
             )
@@ -2774,18 +2995,21 @@ def _compact_repository_context_value(
         values = source.get(key, [])
         if not isinstance(values, list):
             continue
-        ordered = sorted(
-            enumerate(values),
-            key=lambda item: (
-                0 if focus_path and focus_path in json.dumps(item[1], ensure_ascii=False) else 1,
-                item[0],
-            ),
-        )
+        # Original order keeps the context byte-identical across segments so
+        # the provider prompt cache can reuse it; focus only re-ranks when
+        # the section is too large to include whole.
+        ordered = list(enumerate(values))
+        if focus_path and len(ordered) > maximum:
+            ordered.sort(
+                key=lambda item: (
+                    0 if focus_path in json.dumps(item[1], ensure_ascii=False) else 1,
+                    item[0],
+                )
+            )
         compact[str(key)] = [
             _without_fields(value, omitted)
             for _index, value in ordered[:maximum]
         ]
-    compact["focus_path"] = focus_path
     return compact
 
 

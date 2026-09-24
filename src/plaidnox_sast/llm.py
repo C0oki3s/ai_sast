@@ -1,4 +1,4 @@
-"""Provider-neutral LiteLLM SDK boundary for every generative model call."""
+"""Provider-neutral LiteLLM SDK boundary for scan-reasoning model calls."""
 
 from __future__ import annotations
 
@@ -91,12 +91,12 @@ class _LiteLLMResponses:
         self.responses_function = responses_function
 
     def create(self, **kwargs: Any) -> LiteLLMResponse:
-        request = {
-            **kwargs,
-            "api_key": self.settings.api_key,
-            "timeout": self.settings.timeout_seconds,
-            "max_retries": self.settings.max_retries,
-        }
+        request = {**kwargs, "api_key": self.settings.api_key}
+        # Callers may apply a tighter operation-specific policy. The client
+        # settings remain the transport fallback rather than silently
+        # overwriting that policy with the global timeout/retry budget.
+        request.setdefault("timeout", self.settings.timeout_seconds)
+        request.setdefault("max_retries", self.settings.max_retries)
         if self.settings.api_base:
             request["api_base"] = self.settings.api_base
         if self.settings.use_gateway:
@@ -191,7 +191,7 @@ def response_json(response: Any) -> Any:
 def parse_json_text(text: str) -> Any:
     stripped = text.strip()
     try:
-        return json.loads(stripped)
+        return _reject_storage_truncation(json.loads(stripped), stripped)
     except json.JSONDecodeError as strict_error:
         candidates = [match.group(1).strip() for match in _JSON_FENCE.finditer(stripped)]
         start = min((index for index in (stripped.find("{"), stripped.find("[")) if index >= 0), default=-1)
@@ -203,8 +203,29 @@ def parse_json_text(text: str) -> Any:
                 value, _ = decoder.raw_decode(candidate)
             except json.JSONDecodeError:
                 continue
-            return value
+            return _reject_storage_truncation(value, stripped)
         raise strict_error
+
+
+def _reject_storage_truncation(value: Any, source: str) -> Any:
+    markers = [
+        str(item).lower()
+        for item in load_json("runtime/litellm.json")["response_rejection_markers"]
+    ]
+
+    def contains(item: Any) -> bool:
+        if isinstance(item, str):
+            lowered = item.lower()
+            return any(marker in lowered for marker in markers)
+        if isinstance(item, dict):
+            return any(contains(key) or contains(child) for key, child in item.items())
+        if isinstance(item, (list, tuple)):
+            return any(contains(child) for child in item)
+        return False
+
+    if contains(value):
+        raise json.JSONDecodeError("LiteLLM response contains a storage-truncation marker", source, 0)
+    return value
 
 
 class StructuredResponse:

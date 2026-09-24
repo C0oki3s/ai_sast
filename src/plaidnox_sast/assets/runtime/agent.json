@@ -3,8 +3,7 @@
   "source_segment_characters": 8000,
   "discovery_max_workers": 4,
   "sweep_max_workers": 2,
-  "discovery_max_continuations": 8,
-  "structured_shape_retries": 1,
+  "discovery_max_continuations": 2,
   "context_expansion_max_rounds": 2,
   "context_expansion_max_requests_per_round": 5,
   "repository_entrypoint_limit": 100,
@@ -38,8 +37,48 @@
     "which",
     "with"
   ],
-  "request_timeout_seconds": 60,
-  "request_max_retries": 3,
+  "model_request_policy_by_operation": {
+    "default": {
+      "timeout_seconds": 800,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    },
+    "recon_search_plan": {
+      "timeout_seconds": 800,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    },
+    "search_query_plan": {
+      "timeout_seconds": 800,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    },
+    "repository_context": {
+      "timeout_seconds": 800,
+      "max_retries": 2,
+      "structured_shape_retries": 1
+    },
+    "hunt_plan": {
+      "timeout_seconds": 800,
+      "max_retries": 2,
+      "structured_shape_retries": 1
+    },
+    "vulnerability_discovery": {
+      "timeout_seconds": 800,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    },
+    "variant_sweep": {
+      "timeout_seconds": 800,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    },
+    "security_review": {
+      "timeout_seconds": 900,
+      "max_retries": 1,
+      "structured_shape_retries": 1
+    }
+  },
   "consolidation_max_output_tokens": 12000,
   "research_max_output_tokens": 8000,
   "capability_chain_max_frontier": 5,
@@ -49,6 +88,8 @@
   "context_request_edge_page_size": 20,
   "knowledge_claim_characters": 240,
   "knowledge_max_claims": 6,
+  "prompt_cache_volatile_payload_keys": ["source_segment", "continuation_focus"],
+  "prompt_cache_key_prefix": "plaidnox-sast",
   "reasoning_effort_by_operation": {
     "recon_search_plan": "low",
     "search_query_plan": "low",

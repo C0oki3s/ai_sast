@@ -22,6 +22,7 @@ from .context_store import ApplicationContext, unit_of_work
 from .diffing import Diff, compute_diff
 from .l1_review import ChangedFileReviewer, L1Candidate, L1ReviewBatch
 from .policy import MergePolicyResult, evaluate_merge_policy
+from . import triage
 from .snapshots import resolve_revision
 from .verification import CandidateVerification, CandidateVerifier
 
@@ -101,7 +102,11 @@ def review_pull_request(
             application_context.security_controls if application_context is not None else (),
             coverage_complete=True,
         )
-        policy = evaluate_merge_policy(baseline_classifications, coverage_complete=True)
+        policy = evaluate_merge_policy(
+            baseline_classifications,
+            coverage_complete=True,
+            triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
+        )
         return ReviewResult(
             outcome="pass_fast_exit",
             relevance=relevance,
@@ -149,6 +154,7 @@ def review_pull_request(
             baseline_classifications,
             coverage_complete=False,
             configuration_complete=False,
+            triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
         )
         gaps = tuple(f"Missing review dependency: {name}" for name in missing)
         return ReviewResult(
@@ -231,6 +237,7 @@ def review_pull_request(
     policy = evaluate_merge_policy(
         baseline_classifications,
         coverage_complete=provisional_coverage_complete,
+        triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
     )
     counters = _counters(batch, verifications, baseline_classifications, policy)
     coverage_gaps = tuple(batch.coverage_gaps) + tuple(
@@ -265,6 +272,17 @@ def review_pull_request(
     )
 
 
+def _triage_states(
+    session_factory: sessionmaker[Session],
+    tenant_id: str,
+    classifications: tuple[FindingBaselineClassification, ...],
+) -> dict[str, str]:
+    if not classifications:
+        return {}
+    with triage.unit_of_work(session_factory, tenant_id) as repository:
+        return repository.get_states(item.finding_fingerprint for item in classifications)
+
+
 def _counters(
     batch: L1ReviewBatch,
     verifications: tuple[CandidateVerification, ...],
@@ -284,10 +302,6 @@ def _counters(
         ),
         existing=sum(item.relationship == "EXISTING" for item in baseline_classifications),
         resolved=sum(item.relationship == "RESOLVED" for item in baseline_classifications),
-        in_triage=sum(
-            item.verification_state == "verified"
-            and item.relationship not in {"EXISTING", "RESOLVED"}
-            for item in baseline_classifications
-        ),
+        in_triage=policy.in_triage_count,
         blocking=policy.blocking_count,
     )

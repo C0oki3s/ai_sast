@@ -2,10 +2,14 @@
   "default_provider": "perplexity_sonar",
   "providers": {
     "perplexity_sonar": {
+      "api_key_environment": "IFRIT_PERPLEXITY_API_KEY",
+      "api_base_environment": "IFRIT_PERPLEXITY_API_BASE",
+      "default_api_base": "https://api.perplexity.ai",
       "model_environment": "IFRIT_RESEARCH_SONAR_MODEL",
       "default_model": "sonar",
-      "litellm_model_prefix": "perplexity/perplexity/",
-      "provenance": "perplexity-sonar-via-litellm"
+      "request_timeout_seconds": 180,
+      "request_max_retries": 1,
+      "provenance": "perplexity-sonar-direct"
     }
   }
 }

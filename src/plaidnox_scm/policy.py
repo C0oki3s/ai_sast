@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,6 +18,13 @@ MergeDecision = Literal[
 ]
 
 
+# Human triage verdicts that the policy may honour, mapped to their policy key.
+TRIAGE_CLOSED_STATES: dict[str, str] = {
+    "false_positive": "false_positive_triage_decision",
+    "accepted_risk": "accepted_risk_triage_decision",
+}
+
+
 class MergePolicyConfigurationError(RuntimeError):
     """Raised when the versioned merge policy cannot produce a safe decision."""
 
@@ -29,6 +37,7 @@ class FindingPolicyDisposition:
     confidence: float
     decision: MergeDecision
     reason: str
+    triage_state: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +52,8 @@ class MergePolicyResult:
     resolved_count: int
     incomplete: bool
     reasons: tuple[str, ...]
+    triaged_count: int = 0
+    in_triage_count: int = 0
 
 
 def evaluate_merge_policy(
@@ -50,7 +61,10 @@ def evaluate_merge_policy(
     *,
     coverage_complete: bool,
     configuration_complete: bool = True,
+    triage_states: Mapping[str, str] | None = None,
 ) -> MergePolicyResult:
+    """`triage_states` maps finding fingerprint -> human triage state; it never widens a block."""
+
     policy = load_json("policies/default.json")
     _validate_policy(policy)
     blocking_relationships = {str(value) for value in policy["blocking_relationships"]}
@@ -59,9 +73,12 @@ def evaluate_merge_policy(
     minimum_confidence = float(policy["minimum_verified_confidence"])
     dispositions: list[FindingPolicyDisposition] = []
 
+    states = triage_states or {}
     for finding in classifications:
+        triage_state = states.get(finding.finding_fingerprint)
         decision, reason = _finding_decision(
             finding,
+            triage_state,
             blocking_relationships,
             blocking_severities,
             warning_severities,
@@ -76,6 +93,7 @@ def evaluate_merge_policy(
                 confidence=finding.confidence,
                 decision=decision,
                 reason=reason,
+                triage_state=triage_state,
             )
         )
 
@@ -88,6 +106,11 @@ def evaluate_merge_policy(
     if not candidate_decisions:
         candidate_decisions.append("PASS")
     decision = _highest_precedence(candidate_decisions, policy)
+    actionable = [
+        (finding, item)
+        for finding, item in zip(classifications, dispositions, strict=True)
+        if finding.verification_state == "verified" and finding.relationship not in {"EXISTING", "RESOLVED"}
+    ]
     return MergePolicyResult(
         decision=decision,
         policy_version=str(policy["version"]),
@@ -99,11 +122,14 @@ def evaluate_merge_policy(
         resolved_count=sum(item.relationship == "RESOLVED" for item in classifications),
         incomplete=incomplete,
         reasons=tuple(dict.fromkeys(reasons)),
+        triaged_count=sum(item.triage_state in TRIAGE_CLOSED_STATES for _, item in actionable),
+        in_triage_count=sum(item.triage_state not in TRIAGE_CLOSED_STATES for _, item in actionable),
     )
 
 
 def _finding_decision(
     finding: FindingBaselineClassification,
+    triage_state: str | None,
     blocking_relationships: set[str],
     blocking_severities: set[str],
     warning_severities: set[str],
@@ -116,6 +142,11 @@ def _finding_decision(
         return _configured_decision(policy, "resolved_relationship_decision"), "Resolved baseline finding is informational."
     if finding.verification_state != "verified":
         return "PASS", "No current independently verified vulnerability requires merge action."
+    if triage_state in TRIAGE_CLOSED_STATES:
+        return (
+            _configured_decision(policy, TRIAGE_CLOSED_STATES[triage_state]),
+            f"Verified finding was triaged as {triage_state} by an authorized reviewer.",
+        )
     if finding.confidence < minimum_confidence:
         return (
             _configured_decision(policy, "low_confidence_verified_decision"),
@@ -165,6 +196,7 @@ def _validate_policy(policy: dict[str, object]) -> None:
         "unknown_severity_decision",
         "incomplete_decision",
         "decision_precedence",
+        *TRIAGE_CLOSED_STATES.values(),
     }
     missing = sorted(required - set(policy))
     if missing:
@@ -185,6 +217,7 @@ def _validate_policy(policy: dict[str, object]) -> None:
         "low_confidence_verified_decision",
         "unknown_severity_decision",
         "incomplete_decision",
+        *TRIAGE_CLOSED_STATES.values(),
     ):
         _configured_decision(policy, key)
 

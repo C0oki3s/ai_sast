@@ -342,11 +342,11 @@ def test_pipeline_demotes_the_lowest_priority_excess_deep_routes_to_respect_the_
         deep_hunt_agent=FakeManyHighSeverityCandidatesAI(),
     )
 
-    tiers_by_title = {finding.title: finding.metadata["jev_model_tier"] for finding in result.findings}
+    tiers_by_title = {finding.title: finding.metadata["route_model_tier"] for finding in result.findings}
     assert tiers_by_title["Missing object ownership check 0"] == "deep"
     assert tiers_by_title["Missing object ownership check 1"] == "standard"
     assert tiers_by_title["Missing object ownership check 2"] == "standard"
-    assert result.metrics["jev_deep_budget_demotions"] == 2
+    assert result.metrics["deep_budget_demotions"] == 2
     # Demotion never blocks disposition: every candidate still gets a Deep Hunt verdict.
     assert len(result.findings) == 3
 
@@ -358,8 +358,8 @@ def test_pipeline_does_not_demote_deep_routes_within_the_configured_budget(sampl
         deep_hunt_agent=FakeManyHighSeverityCandidatesAI(),
     )
 
-    assert result.metrics["jev_deep_budget_demotions"] == 0
-    assert all(finding.metadata["jev_model_tier"] == "deep" for finding in result.findings)
+    assert result.metrics["deep_budget_demotions"] == 0
+    assert all(finding.metadata["route_model_tier"] == "deep" for finding in result.findings)
 
 
 def test_pipeline_keeps_ai_repository_context_and_discovered_candidates(sample_repo):
@@ -671,3 +671,38 @@ def test_pipeline_records_model_usage_for_the_tenant_cost_quota(sample_repo):
         ("deep", 12, 3),
     ]
     assert all(event.tenant_id == "tenant-a" for event in events)
+
+
+class FakeStreamingDiscoveryAI(FakeContextualAI):
+    """Emits candidates through the sink, then keeps 'discovering' until review has started."""
+
+    candidate_sink = None
+
+    def __init__(self):
+        import threading
+
+        self.review_started = threading.Event()
+        self.reviewed_before_discovery_ended = False
+        self.reviews = 0
+
+    def review(self, root, candidate, finding, security_context, model_tier=None, route=None):
+        self.reviews += 1
+        self.review_started.set()
+        return super().review(root, candidate, finding, security_context, model_tier, route)
+
+    def discover_candidates(self, root, context, plan=None):
+        candidates, failures = super().discover_candidates(root, context, plan)
+        for candidate in candidates:
+            self.candidate_sink(candidate)
+        self.reviewed_before_discovery_ended = self.review_started.wait(timeout=10)
+        return candidates, failures
+
+
+def test_pipeline_reviews_candidates_while_discovery_is_still_running(sample_repo):
+    agent = FakeStreamingDiscoveryAI()
+    result = SastPipeline().scan_snapshot(sample_repo, "plaidnox/test-fixture", deep_hunt_agent=agent)
+
+    assert agent.reviewed_before_discovery_ended is True
+    assert agent.reviews == 1  # the early review is reused, not repeated, by the round loop
+    assert len(result.findings) == 1
+    assert all(finding.state.value == "validated" for finding in result.findings)

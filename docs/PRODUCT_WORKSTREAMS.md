@@ -121,9 +121,8 @@ The default flow is:
    ...) rather than the whole repository — each subtree keeps its own
    security model, coverage, revision, and risk state.
 
-Review depth is itself routed, not fixed, reusing the JEV decision plane
-already built for Code Scanning (see `IMPLEMENTATION_PLAN.md`'s JEV
-decision-plane hardening section). The full L0-L3 routing contract,
+Review depth is itself routed, not fixed, using the deterministic routers
+already built for Code Scanning (see `IMPLEMENTATION_PLAN.md`'s routing bullet). The full L0-L3 routing contract,
 superseding any earlier sketch of it, is specified in "PR/MR Contextual
 Review Plan v2" -> "Review levels" below.
 
@@ -140,7 +139,7 @@ evaluator against finding JSON) — no LLM decides pass/fail at merge time.
 
 This subsection is the authoritative design for how PR/MR review is
 implemented — it supersedes any conflicting detail elsewhere in this
-section on pipeline shape, context layers, JEV questions, review levels, or
+section on pipeline shape, context layers, routing questions, review levels, or
 finding counters. The separate "Initial release scope: ~10 organizations"
 section below it remains the deployment/infrastructure and release
 checklist and is unaffected by this design change.
@@ -370,10 +369,10 @@ SENSITIVE_EFFECT
 The primary affected file remains the changed file. Unchanged
 files/routes can appear as contextual evidence.
 
-#### Revised JEV role
+#### Routing role
 
-Run JEV only after deterministic relevance classification. Recommended
-questions:
+Run routing only after deterministic relevance classification. Recommended
+questions (answered by config-driven deterministic rules, not a remote service):
 
 ```text
 analysis_depth: FAST | STANDARD | DEEP
@@ -385,7 +384,7 @@ needs_external_semantics: YES | NO
 needs_environment_context: YES | NO
 ```
 
-JEV must not decide vulnerability validity, severity, CWE, merge outcome,
+Routing must not decide vulnerability validity, severity, CWE, merge outcome,
 or whether missing evidence may be ignored.
 
 #### Review levels
@@ -442,7 +441,7 @@ Inspect changed/new sensitive files locally and reuse fingerprints for
 unchanged sensitive material. If changed code newly consumes an unchanged
 credential/config item, treat that relationship as affected.
 
-Raw secret values must never enter model/JEV payloads, findings, logs,
+Raw secret values must never enter model payloads, findings, logs,
 Redis, S3, or reports.
 
 #### Caching strategy
@@ -1061,6 +1060,82 @@ wave must implement that decision); the real `RESOLVED` transition via fix
 validation against a new revision (a distinct, larger remediation-agent
 feature); and `!reopen`/`!snooze`/`!assign`, which the doc itself labels
 "optional later."
+
+#### Implementation status (Wave 13)
+
+Wave 13 closes the two triage gaps Wave 12 left open: the policy engine now
+honours human triage verdicts, and fix validation against a new revision
+drives the `resolved` transition.
+
+- **Triage-aware merge policy.** `evaluate_merge_policy()` takes an
+  optional `triage_states` mapping (finding fingerprint -> triage state).
+  A verified finding triaged `false_positive` or `accepted_risk` resolves
+  to the new policy keys `false_positive_triage_decision` /
+  `accepted_risk_triage_decision` (both `PASS` in `default.json`, now
+  version `2026-09-23.2`), so the choice stays config-driven, not
+  hard-coded. Triage is consulted only after the `EXISTING`/`RESOLVED` and
+  verification checks, and never overrides `INCOMPLETE`: a human verdict
+  does not substitute for missing coverage. `MergePolicyResult` gains
+  `triaged_count` and `in_triage_count` (verified, actionable findings with
+  and without a closing verdict). `ReviewCounters.in_triage` now comes from
+  `in_triage_count`, so findings a reviewer has already closed no longer
+  show as "requiring triage".
+- **Reviews read triage state.** All three `evaluate_merge_policy()` calls
+  in `review.py` (fast exit, configuration required, full review) load the
+  current triage states for their classifications. A later push to the
+  same PR therefore no longer re-blocks on a finding already marked `!fp`.
+- **Triage re-evaluates the completed review immediately.**
+  `POST .../triage` recomputes the owning review's policy over its
+  persisted verified findings with the updated states and writes the new
+  `action`/`summary`/`counters` back through
+  `ReviewAttemptRepository.update_policy()`. That method only updates
+  `completed` rows, so a running attempt's lease is never touched.
+  `TriageResponse` gains optional `review_action`/`review_summary` fields
+  so the bot can refresh the HEAD-bound check without a second call.
+  Baseline-only and unverified classifications always `PASS`, so
+  recomputing over `attempt.findings` reproduces the original decision
+  exactly, now with triage applied. A review that ended `incomplete` is
+  left untouched.
+- **Fix validation.** After a review completes, `ReviewService` applies
+  `FindingTriageRepository.record_fix_validation()` for each
+  classification. `RESOLVED` moves `open`/`confirmed`/`accepted_risk`/
+  `fix_pending`/`fix_validating` to `resolved` (event `fix_validated`). A
+  finding verified again while `fix_pending`/`fix_validating` returns to
+  `open` (event `fix_rejected`). Both transitions are recorded as actor
+  `plaidnox`, are never accepted through the triage HTTP contract, and
+  never override a human `false_positive` verdict. These are still the
+  only path to `resolved`; `!fixed` continues to stop at `fix_pending`.
+- **Known limitation: finding identity for new findings.** Triage is keyed
+  on `finding_fingerprint`. For baseline-matched findings this equals the
+  persisted baseline fingerprint and is stable. For a brand-new
+  (`INTRODUCED`) finding it is derived from the root-cause fingerprint plus
+  the verifier's gained capability, so a verifier that phrases the
+  capability differently on a later run produces a new id, and the earlier
+  triage verdict will not carry over. Promoting the finding to baseline on
+  merge (Wave 10) fixes the id from then on.
+- **No migration.** Every change uses the existing tables and columns.
+- **Tests.** `tests/test_scm_triage_policy.py` covers:
+  - `fp`/`accepted_risk` -> `PASS`, while `open`/`confirmed`/`fix_pending`
+    still block
+  - triage never overriding `INCOMPLETE`
+  - `EXISTING` debt not counted
+  - immediate re-evaluation of a completed blocking review, including
+    persisted status
+  - `incomplete` reviews left untouched
+  - `fix_validated`/`fix_rejected` transitions and their audit events
+  - `false_positive` surviving validation
+
+  `tests/test_scm_review.py` adds an end-to-end run in which a `!fp`
+  between two reviews of the same PR turns `BLOCK` into `PASS`.
+
+Deliberately not attempted here:
+
+- item (12) performance and privacy load tests
+- `!reopen`/`!snooze`/`!assign`
+- the AI remediation agent (`fix_validating` is honoured as a state but
+  nothing in this repo sets it yet)
+- bot-side check re-publication on triage, which belongs to
+  `PlaidNox/plaidnox-github-bot`
 
 ### PR/MR Finding Delivery, Triage, and Remediation Plan
 
@@ -1685,7 +1760,7 @@ GitHub App -> Webhook API -> SQS -> ECS Worker Service (3-10 workers)
 
 Each ECS worker runs the same local pipeline Code Scanning already has: git
 clone/worktree, ripgrep, Tree-sitter, Sensitive Evidence IR, Context Fabric,
-JEV, LiteLLM. GitHub-only for the first release, but kept behind the same
+LiteLLM. GitHub-only for the first release, but kept behind the same
 `SCMProvider` abstraction (`get_diff`/`get_file`/`get_repository`/
 `publish_check`) this section already scopes, so GitLab becomes another
 adapter rather than a rewrite.
@@ -1734,7 +1809,7 @@ Code Scanning):
   authenticated provider-neutral scanner API. GitHub webhook models, signature
   verification, Checks publication, inline comments, and stale-HEAD protection
   are owned by `PlaidNox/plaidnox-github-bot` and are not duplicated here.
-- P1: JEV PR-routing refinements; GitLab adapter; capability-chain expansion
+- P1: PR-routing refinements; GitLab adapter; capability-chain expansion
   in the PR context; manual full white-box trigger.
 - P2: larger-scale scheduler (the 100-org/1,000-org scale path above).
 
