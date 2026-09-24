@@ -266,13 +266,16 @@ taint/dataflow are optional precision layers. The current call-flow expansion is
 structural navigation, not taint proof; unresolved required flows remain explicit
 evidence gaps or incomplete coverage.
 
-### Scale architecture — accepted, implementation not yet started
+### Scale architecture — accepted, first contract slice implemented
 
 The existing run path is still region-first. Implement the workset transition in
 small, measurable stages before replacing it:
 
-1. Add stable `SecurityWorkset`, `SecuritySlice`, and `SecuritySummary` schemas;
-   preserve exact region/slice source provenance and explicit unresolved edges.
+1. **Implemented foundation:** stable `SecurityWorkset`, `SecuritySlice`, and
+   `SecuritySummary` contracts; region adapter; exact source provenance;
+   unresolved-edge state; redaction; and configured lossless batching. Tests are
+   in `tests/test_worksets.py`. Discovery/Deep Hunt orchestration remains on the
+   region path.
 2. Build route/job/trust-boundary/effect worksets from the existing Security IR.
    Keep per-surface obligations local; model call counts should follow unique
    worksets and unresolved semantics, not files/LOC.
