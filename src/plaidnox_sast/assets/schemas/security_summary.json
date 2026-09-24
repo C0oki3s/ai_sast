@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaidNox SecuritySummary",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "symbol_id": {"type": "string", "minLength": 1},
+    "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "facts": {"type": "array", "items": {"type": "object"}},
+    "dependency_symbol_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "unresolved_relationship_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "complete": {"type": "boolean"}
+  },
+  "required": ["symbol_id", "content_hash", "facts", "dependency_symbol_ids", "unresolved_relationship_ids", "complete"]
+}

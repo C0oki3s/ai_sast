@@ -221,6 +221,46 @@ evidence remains required before production release.
 
 ## 2. ripgrep + Tree-sitter Code Intelligence
 
+### Accepted next architecture: SecurityWorksets and SecuritySlices
+
+The current runtime still analyzes region-owned obligations. The next architecture
+is index-first: index the entire admitted repository locally, then form canonical
+security worksets from routes/jobs, trust boundaries, state transitions, and
+external effects. `DiscoveryRegion` remains source-window transport only.
+
+A workset is the coverage and review identity. Its bounded `SecuritySlice` may
+contain source and IR evidence from several files, exact source provenance,
+relevant controls/effects, and explicit unresolved relationships. Per-symbol
+`SecuritySummary` facts are content-versioned and composable. Large repository
+size should raise index cost and possible workset count, but must not create one
+model call per file or arbitrary source region.
+
+The rollout is staged. **Stage 1 is implemented** in `plaidnox_sast.worksets`:
+versioned workset/slice/summary dataclasses, JSON Schemas, an adapter from
+current region payloads, explicit unresolved-edge and completeness fields,
+source/fact redaction, and lossless configured batching. Tests are in
+`tests/test_worksets.py`. This is a contract foundation only; discovery and
+Deep Hunt orchestration still run through the region path.
+
+Next: (2) build worksets from currently indexed Tree-sitter facts; (3) persist summaries
+and dependency fanout for incremental invalidation; (4) evaluate SCIP and Joern
+adapters against the language/security regression corpus; (5) evaluate external
+candidate producers such as OpenGrep behind a normalized candidate interface.
+No indexer, CPG engine, or deterministic scanner is a final verdict authority.
+All reportable candidates still require independent PlaidNox Deep Hunt
+verification and evidence validation. Third-party rule content is not imported.
+
+Execution health and coverage are distinct report concepts. A failed mandatory
+stage is unsuccessful execution. Parser/language gaps and unresolved graph edges
+are explicit coverage limitations; they do not claim the corresponding paths are
+safe.
+
+Scale acceptance uses synthetic, deterministic fixtures around 2k, 20k, and
+100k LOC with a fake model gateway. Record index time, surfaces/worksets/slices,
+prompt bytes, graph fanout, cache reuse, memory, and model-call counts. Gate on
+correct known-vulnerability recall and contract validity before optimizing
+parallelism or adding optional external tools.
+
 ### 2a. Generic incremental core — implemented
 
 - AI-created `rg` queries are the primary discovery and navigation path. The

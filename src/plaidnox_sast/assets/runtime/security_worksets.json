@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "maximum_slices_per_batch": 8,
+  "maximum_batch_characters": 24000,
+  "identity_fields": ["surface_type", "surface_id"],
+  "content_version_field": "evidence_hash",
+  "oversize_policy": "fail_with_explicit_evidence_split"
+}

@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaidNox SecurityWorkset",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "workset_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "surface_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "surface_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "slices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/security_slice"
+      }
+    },
+    "obligation_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "unresolved_edge_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "workset_id",
+    "surface_type",
+    "surface_id",
+    "evidence_hash",
+    "slices",
+    "obligation_ids",
+    "unresolved_edge_ids",
+    "complete",
+    "metadata"
+  ],
+  "$defs": {
+    "security_slice": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "PlaidNox SecuritySlice",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "slice_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "start_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "excerpt": {
+                "type": "string"
+              },
+              "symbol_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "start_line",
+              "end_line",
+              "content_hash",
+              "excerpt",
+              "symbol_id"
+            ]
+          }
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "unresolved_edge_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "omitted_fact_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "slice_id",
+        "locations",
+        "facts",
+        "unresolved_edge_ids",
+        "omitted_fact_ids",
+        "complete"
+      ]
+    }
+  }
+}

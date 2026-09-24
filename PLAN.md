@@ -109,10 +109,56 @@ immutable source snapshot + codebase/revision + business/security context
   -> policy decision and JSON/SARIF/Markdown report
 ```
 
+The analysis model is index-first and workset-based. A deterministic index covers
+the admitted repository, while AI receives only bounded security slices; repository
+LOC must not directly determine model calls. `DiscoveryRegion` is an evidence
+retrieval structure, not the identity of security coverage. `SecurityWorkset`
+becomes the canonical review unit and is rooted in a security surface such as a
+route, job, identity boundary, state mutation, or external effect. One workset may
+reference source slices from several files, and slices retain exact immutable
+source provenance.
+
+The planned pipeline is:
+
+```text
+immutable snapshot
+  -> complete admitted-file inventory + Tree-sitter Security IR
+  -> persistent facts: symbols, references, calls, routes, effects, controls
+  -> compositional SecuritySummary per stable symbol/content version
+  -> canonical SecurityWorksets over entrypoints, trust boundaries, and effects
+  -> bounded SecuritySlice (forward/backward evidence + unresolved edges)
+  -> deterministic candidate producers and AI-inferred analysis specifications
+  -> context-specific LLM reasoning only for unresolved semantic questions
+  -> root-equivalence clustering before independent PlaidNox Deep Hunt
+  -> verified findings + explicit execution health and coverage status
+```
+
+Security IR, external analyzers, and AI-inferred source/sink specifications may
+produce candidate paths; none can confirm or reject a vulnerability. Every
+reportable candidate still requires independent attacker-path review,
+falsification, grounding, and evidence validation by PlaidNox Deep Hunt.
+
+External code-indexer and analyzer integrations are evaluation candidates, not
+runtime dependencies yet. SCIP is a potential symbol/reference import format;
+Joern is a potential CPG adapter; OpenGrep is a potential candidate adapter.
+Each must pass language coverage, precision/recall, incremental cost, operational
+isolation, output normalization, and license review before adoption. No external
+rule corpus or implementation is copied into PlaidNox as part of this plan.
+
 DataDog SAIST can supply broad AI-native candidates through an adapter. It does
 not own the PlaidNox verdict and it does not replace the custom Deep Hunt agent.
 Tree-sitter Security IR and targeted semantic/dataflow adapters provide code
 relationships and context; they do not decide that a vulnerability exists.
+
+### Scale and coverage semantics
+
+Index coverage, security coverage, and execution health are separate dimensions.
+`SUCCESSFUL` / `UNSUCCESSFUL` describe whether required scanner stages executed
+correctly. Coverage reports whether admitted files and required security surfaces
+were indexed and analyzed, including unsupported-language and unresolved-edge
+limitations. A parser's known inability to resolve a relationship is reported as
+a coverage limitation; a crashed required parser/model stage or corrupt index is
+an execution failure. A low finding count never implies successful coverage.
 
 ## Durable Context Fabric
 
@@ -194,6 +240,22 @@ Status: generic incremental core implemented; precision adapters deferred.
   repository context. Content-free model-call audits prove that they do not
   resend the broad source inventory, source tree, or repository-wide IR.
 - AI reviews can request bounded call-flow expansion only when needed.
+- **Contract foundation implemented:** `worksets.py` defines versioned
+  `SecurityWorkset`, `SecuritySlice`, and per-symbol `SecuritySummary` models;
+  `security_worksets_from_regions` adapts existing region evidence into
+  surface-owned slices. External JSON schemas and `runtime/security_worksets.json`
+  define the data contract and batch budgets. The live discovery/verifier
+  orchestration still uses regions and is not switched over yet.
+- Keep `DiscoveryRegion` only as a source-window transport type in the target
+  architecture; do not let region count define coverage identity.
+- Build worksets from indexed entrypoints, trust boundaries, state effects, and
+  external effects. Keep obligations scoped to canonical surfaces; do not repeat
+  repository-wide questions per region.
+- **Contract batching implemented:** slice batches obey external count/serialized
+  character budgets, preserve every slice, report remaining-slice counts, and
+  fail explicitly when an individual slice cannot fit. Unresolved graph edges
+  stay visible and make the slice/workset incomplete; required evidence is never
+  silently truncated.
 
 Exit met: mutation tests prove that changed callees revalidate callers and
 linked findings, unrelated changes omit those findings and code slices, and
@@ -203,6 +265,47 @@ Deferred Phase 2b: compiler/LSP semantic adapters and true language-specific
 taint/dataflow are optional precision layers. The current call-flow expansion is
 structural navigation, not taint proof; unresolved required flows remain explicit
 evidence gaps or incomplete coverage.
+
+### Scale architecture — accepted, implementation not yet started
+
+The existing run path is still region-first. Implement the workset transition in
+small, measurable stages before replacing it:
+
+1. Add stable `SecurityWorkset`, `SecuritySlice`, and `SecuritySummary` schemas;
+   preserve exact region/slice source provenance and explicit unresolved edges.
+2. Build route/job/trust-boundary/effect worksets from the existing Security IR.
+   Keep per-surface obligations local; model call counts should follow unique
+   worksets and unresolved semantics, not files/LOC.
+3. Add compositional symbol summaries and content-addressed persistence, then
+   dependency-fanout invalidation and immutable overlays.
+4. Benchmark SCIP and Joern as optional index adapters; benchmark OpenGrep as an
+   optional candidate adapter. Do not adopt any as a mandatory runtime dependency
+   until language coverage, precision/recall, incremental behavior, operations,
+   output, and licensing pass review.
+5. Add deterministic fake-gateway benchmarks at about 2k, 20k, and 100k LOC.
+   Record index duration, workset/slice counts, prompt bytes, fanout, cache reuse,
+   memory, and simulated model-call counts. Real target scans remain explicitly
+   requested acceptance tests, not routine tests.
+6. Report execution health separately from coverage limitations. Preserve
+   fail-closed behavior for failed required stages and Deep Hunt gates; unsupported
+   syntax or unresolved static edges should be surfaced as coverage data.
+
+Do not enable parallel model workers to hide workset/obligation fan-out. Establish
+recall, contract-validity, and cost baselines before adding concurrency.
+
+Primary research references:
+- [Wiz Atlas architecture](https://www.wiz.io/blog/atlas-ai-vulnerability-researcher)
+  (vendor-described CPG attack-surface mapping, scoped stages, adversarial review).
+- [LLMxCPG paper](https://www.usenix.org/conference/usenixsecurity25/presentation/lekssays)
+  and [implementation](https://github.com/qcri/llmxcpg) (CPG query/slice then LLM).
+- [IRIS at ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/582d4e27fa24168f3af1f4582655034b-Abstract-Conference.html)
+  (LLM-inferred taint specifications plus static and contextual analysis).
+- [Infer compositional analysis](https://engineering.fb.com/2017/09/06/android/finding-inter-procedural-bugs-at-scale-with-infer-static-analyzer/)
+  and [Glean](https://engineering.fb.com/2024/12/19/developer-tools/glean-open-source-code-indexing/)
+  (procedure summaries, persistent facts, incremental indexing).
+- [Joern CPG](https://docs.joern.io/code-property-graph/) and
+  [SCIP indexers](https://sourcegraph.com/docs/code-navigation/writing-an-indexer)
+  (candidate structural/symbol adapters to evaluate, not yet selected dependencies).
 
 ### Phase 3 — PostgreSQL ORM persistence
 
