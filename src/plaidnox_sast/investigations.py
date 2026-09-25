@@ -37,6 +37,7 @@ class Investigation:
     state: str = "planned"
     checkpoint_ref: str | None = None
     revision: int = 1
+    graph_snapshot_id: str = ""
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class Investigation:
             "stable_key": self.stable_key,
             "codebase_id": self.codebase_id,
             "snapshot_id": self.snapshot_id,
+            **({"graph_snapshot_id": self.graph_snapshot_id} if self.graph_snapshot_id else {}),
             "target_ref": self.target_ref,
             "reason": self.reason,
             "security_questions": list(self.security_questions),
@@ -71,6 +73,8 @@ def investigation_evidence_hash(investigation: Investigation) -> str:
         "coverage_notes": investigation.coverage_notes,
         "prior_evidence_refs": investigation.prior_evidence_refs,
     }
+    if investigation.graph_snapshot_id:
+        value["graph_snapshot_id"] = investigation.graph_snapshot_id
     canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -88,6 +92,7 @@ def build_investigation(
     context_dependencies: tuple[dict[str, Any], ...],
     coverage_notes: tuple[str, ...] = (),
     prior_evidence_refs: tuple[str, ...] = (),
+    graph_snapshot_id: str = "",
 ) -> Investigation:
     """Create a content-addressed investigation version from grounded evidence."""
     draft = Investigation(
@@ -105,10 +110,31 @@ def build_investigation(
         coverage_notes=coverage_notes,
         prior_evidence_refs=prior_evidence_refs,
         evidence_hash="0" * 64,
+        graph_snapshot_id=graph_snapshot_id,
     )
     evidence_hash = investigation_evidence_hash(draft)
     identifier = hashlib.sha256(
         f"{codebase_id}\0{stable_key}\0{evidence_hash}".encode("utf-8")
+    ).hexdigest()[:32]
+    result = replace(draft, investigation_id=identifier, evidence_hash=evidence_hash)
+    validate_investigation(result)
+    return result
+
+
+def bind_storage_snapshot(investigation: Investigation, snapshot_id: str) -> Investigation:
+    """Bind graph evidence to its durable Code Scanning snapshot identity.
+
+    Graphify's content/extractor identity remains in ``graph_snapshot_id`` and
+    graph references. ORM foreign keys use the Code Scanning snapshot ID.
+    """
+    if not snapshot_id:
+        raise InvestigationContractError("storage snapshot ID must not be empty")
+    if investigation.snapshot_id == snapshot_id:
+        return investigation
+    draft = replace(investigation, snapshot_id=snapshot_id, evidence_hash="0" * 64)
+    evidence_hash = investigation_evidence_hash(draft)
+    identifier = hashlib.sha256(
+        f"{draft.codebase_id}\0{draft.stable_key}\0{evidence_hash}".encode("utf-8")
     ).hexdigest()[:32]
     result = replace(draft, investigation_id=identifier, evidence_hash=evidence_hash)
     validate_investigation(result)

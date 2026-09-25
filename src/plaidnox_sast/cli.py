@@ -65,6 +65,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     local.add_argument("--no-checkpoint", action="store_true", help="disable durable checkpointing")
+    local.add_argument(
+        "--graphify-shadow-planning",
+        action="store_true",
+        help=(
+            "opt in to Graphify extraction and AI investigation planning for migration telemetry; "
+            "the established discovery and finding pipeline remains authoritative"
+        ),
+    )
     local.add_argument("--enforce", action="store_true")
     local.add_argument(
         "--propose-patches",
@@ -326,6 +334,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
             revision=args.revision,
             deep_hunt_agent=deep_hunt_agent,
             propose_patches=args.propose_patches,
+            graphify_shadow_planning=args.graphify_shadow_planning,
         )
         telemetry.record_result(result)
     _record_context_base(context_store, result, args.path)

@@ -30,6 +30,9 @@ from .fingerprint import (
 )
 from .graph import build_structural_graph
 from .graph import source_file_is_admitted
+from .graph_context import GraphContextBroker
+from .graph_surface_planning import GraphSurfacePlanningCoordinator, InvestigationOrmStore
+from .graphify_adapter import extract_structural_graph
 from .routers import CandidateRouter
 from .models import (
     Depth,
@@ -305,6 +308,7 @@ class SastPipeline:
         revision: str | None = None,
         deep_hunt_agent: PlaidNoxDeepHuntAgent | None = None,
         propose_patches: bool = False,
+        graphify_shadow_planning: bool = False,
     ) -> ScanResult:
         """Run the complete deep-hunt workflow against an immutable source snapshot."""
 
@@ -354,7 +358,8 @@ class SastPipeline:
         if callable(reset_search_query_errors):
             reset_search_query_errors()
 
-        codebase_id = ""
+        codebase_id = _stable_id("codebase", self.tenant_id, codebase)
+        snapshot_id = _stable_id("snapshot", self.tenant_id, codebase, revision)
         persistence_enabled = self.session_factory is not None
         persistence_indexed = False
         persistence_error_type = ""
@@ -363,8 +368,6 @@ class SastPipeline:
         symbols_by_path: dict[str, list] = {}
         if self.session_factory is not None:
             try:
-                codebase_id = _stable_id("codebase", self.tenant_id, codebase)
-                snapshot_id = _stable_id("snapshot", self.tenant_id, codebase, revision)
                 # A scan_id identifies one execution, while snapshot_id identifies
                 # the immutable source revision. Repeated runs therefore retain
                 # separate findings, health, and cost records.
@@ -435,6 +438,16 @@ class SastPipeline:
         ai_context_error_type = ""
         ai_context_error = ""
         ai_context_unexpected_failures = 0
+        graphify_shadow_status = "disabled"
+        graphify_shadow_error_type = ""
+        graphify_shadow_error = ""
+        graphify_snapshot_id = ""
+        graphify_node_count = 0
+        graphify_edge_count = 0
+        graphify_surface_count = 0
+        graphify_investigation_count = 0
+        graphify_mapping_gaps = 0
+        graphify_planning_gaps = 0
         context_builder = getattr(deep_hunt_agent, "build_repository_context", None)
         planner = getattr(deep_hunt_agent, "plan_tasks", None)
         discovery = getattr(deep_hunt_agent, "discover_candidates", None)
@@ -526,6 +539,82 @@ class SastPipeline:
         try:
             context = context_builder(root, codebase, revision, graph, config.business_context)
             repository_context = context.to_dict()
+            if graphify_shadow_planning:
+                graphify_shadow_status = "running"
+                try:
+                    graph_cache = (
+                        self.checkpoint_path.parent / "graphify-cache"
+                        if self.checkpoint_path is not None
+                        else None
+                    )
+                    graph_snapshot = extract_structural_graph(
+                        root,
+                        exclude=config.exclude,
+                        max_file_bytes=config.max_file_bytes,
+                        cache_root=graph_cache,
+                    )
+                    broker = GraphContextBroker(root, graph_snapshot)
+                    graphify_snapshot_id = graph_snapshot.snapshot_id
+                    graphify_node_count = len(graph_snapshot.nodes)
+                    graphify_edge_count = len(graph_snapshot.edges)
+                    graph_persistence = (
+                        InvestigationOrmStore(self.session_factory, self.tenant_id)
+                        if self.session_factory is not None and persistence_indexed
+                        else None
+                    )
+
+                    def plan_graph_group(**arguments):
+                        graph_planner = getattr(deep_hunt_agent, "plan_graph_investigation", None)
+                        if not callable(graph_planner):
+                            raise AIConfigurationError(
+                                "Deep Hunt agent does not provide Graphify investigation planning"
+                            )
+                        arguments.pop("codebase_id", None)
+                        return graph_planner(
+                            context,
+                            codebase_id=codebase_id,
+                            graph_snapshot=graph_snapshot,
+                            context_broker=broker,
+                            **arguments,
+                        )
+
+                    graph_result = GraphSurfacePlanningCoordinator(
+                        plan_graph_group,
+                        persistence=graph_persistence,
+                    ).plan(
+                        codebase_id=codebase_id,
+                        scan_id=scan_id if graph_persistence is not None else None,
+                        repository_context=repository_context,
+                        graph_snapshot=graph_snapshot,
+                        storage_snapshot_id=snapshot_id,
+                    )
+                    graphify_surface_count = len(graph_result.inventory.targets)
+                    graphify_investigation_count = len(graph_result.investigations)
+                    graphify_mapping_gaps = graph_result.mapping_gap_count
+                    graphify_planning_gaps = len(graph_result.planning_gaps)
+                    repository_context["graphify_shadow_planning"] = {
+                        "status": "complete",
+                        "graph_snapshot_id": graphify_snapshot_id,
+                        "node_count": graphify_node_count,
+                        "edge_count": graphify_edge_count,
+                        "surface_count": graphify_surface_count,
+                        "investigation_count": graphify_investigation_count,
+                        "mapping_gap_count": graphify_mapping_gaps,
+                        "planning_gap_count": graphify_planning_gaps,
+                        "investigation_ids": [
+                            item.investigation_id for item in graph_result.investigations
+                        ],
+                    }
+                    graphify_shadow_status = "complete"
+                except Exception as exc:  # noqa: BLE001
+                    graphify_shadow_status = "failed"
+                    graphify_shadow_error_type = type(exc).__name__
+                    graphify_shadow_error = redact_sensitive_values(str(exc))[:240]
+                    repository_context["graphify_shadow_planning"] = {
+                        "status": "failed",
+                        "error_type": graphify_shadow_error_type,
+                        "error": graphify_shadow_error,
+                    }
             plan = planner(context, config.security_context)
             repository_context["hunt_plan"] = plan.to_dict()
             ai_discovery_candidates, ai_discovery_failures = discovery(root, context, plan)
@@ -799,6 +888,16 @@ class SastPipeline:
                 "ai_context_error_type": ai_context_error_type,
                 "ai_context_error": ai_context_error,
                 "ai_context_unexpected_failures": ai_context_unexpected_failures,
+                "graphify_shadow_status": graphify_shadow_status,
+                "graphify_shadow_error_type": graphify_shadow_error_type,
+                "graphify_shadow_error": graphify_shadow_error,
+                "graphify_snapshot_id": graphify_snapshot_id,
+                "graphify_nodes": graphify_node_count,
+                "graphify_edges": graphify_edge_count,
+                "graphify_surfaces": graphify_surface_count,
+                "graphify_investigations": graphify_investigation_count,
+                "graphify_mapping_gaps": graphify_mapping_gaps,
+                "graphify_planning_gaps": graphify_planning_gaps,
                 "ai_planning_failures": ai_planning_failures,
                 "ai_discovery_failures": ai_discovery_failures,
                 "ai_discovery_error_types": ai_discovery_error_types,

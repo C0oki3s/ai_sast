@@ -335,6 +335,7 @@ class GraphInvestigationPlanner:
             source_windows=source_windows,
             context_dependencies=tuple(dependencies),
             coverage_notes=tuple(dict.fromkeys(coverage_notes)),
+            graph_snapshot_id=snapshot.snapshot_id,
         )
 
 

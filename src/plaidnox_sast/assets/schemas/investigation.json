@@ -9,6 +9,7 @@
     "stable_key": {"type": "string", "minLength": 1, "maxLength": 512},
     "codebase_id": {"type": "string", "minLength": 1, "maxLength": 64},
     "snapshot_id": {"type": "string", "minLength": 1, "maxLength": 64},
+    "graph_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 64},
     "target_ref": {"type": "object", "minProperties": 1},
     "reason": {"type": "string", "minLength": 1},
     "security_questions": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},

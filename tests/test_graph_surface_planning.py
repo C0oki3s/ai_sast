@@ -219,6 +219,66 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     )
 
 
+def test_coordinator_binds_graph_evidence_to_durable_scan_snapshot(tmp_path: Path):
+    snapshot = _snapshot(tmp_path, connected=True)
+    durable_snapshot_id = "snapshot-db-identity"
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-a", "example/account", "Account")
+        repository.add_snapshot(
+            durable_snapshot_id,
+            "codebase-a",
+            "revision-a",
+            "tree-hash-a",
+            "context-v1",
+        )
+        repository.start_scan(
+            "scan-a", "codebase-a", durable_snapshot_id, "deep", "workflow-v1"
+        )
+
+    broker = GraphContextBroker(tmp_path, snapshot)
+    planner = GraphInvestigationPlanner(
+        lambda _payload: {
+            "reason": "Review the account identity selection.",
+            "security_questions": ["Can a caller select another principal's account?"],
+            "supporting_node_ids": [],
+            "supporting_edge_keys": [],
+            "coverage_notes": [],
+        }
+    )
+    result = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot,
+            broker=broker,
+            repository_context={},
+            **arguments,
+        ),
+        persistence=InvestigationOrmStore(factory, "tenant-a"),
+    ).plan(
+        codebase_id="codebase-a",
+        scan_id="scan-a",
+        repository_context=_context(snapshot),
+        graph_snapshot=snapshot,
+        storage_snapshot_id=durable_snapshot_id,
+    )
+
+    assert len(result.investigations) == 1
+    investigation = result.investigations[0]
+    assert investigation.snapshot_id == durable_snapshot_id
+    assert investigation.graph_snapshot_id == snapshot.snapshot_id
+    assert investigation.graph_snapshot_id != investigation.snapshot_id
+    with unit_of_work(factory, "tenant-a") as repository:
+        saved = repository.list_investigations("scan-a")
+        surface_plan = repository.get_surface_planning("scan-a")
+    assert saved[0].snapshot_id == durable_snapshot_id
+    assert saved[0].investigation_data["graph_snapshot_id"] == snapshot.snapshot_id
+    assert surface_plan is not None
+    assert surface_plan.snapshot_id == durable_snapshot_id
+    assert surface_plan.planning_data["snapshot_id"] == snapshot.snapshot_id
+
+
 def test_coordinator_plans_100k_loc_repository_in_bounded_graph_groups(
     tmp_path: Path,
 ):

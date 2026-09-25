@@ -17,7 +17,7 @@ from .graph_targets import (
     map_repository_surfaces_to_graph,
 )
 from .graphify_adapter import CodeGraphSnapshot
-from .investigations import Investigation, validate_investigation
+from .investigations import Investigation, bind_storage_snapshot, validate_investigation
 from .persistence.repositories import (
     InvestigationValue,
     PersistenceConflictError,
@@ -115,6 +115,7 @@ class GraphSurfacePlanningCoordinator:
         scan_id: str | None = None,
         repository_context: Mapping[str, Any],
         graph_snapshot: CodeGraphSnapshot,
+        storage_snapshot_id: str | None = None,
     ) -> GraphSurfacePlanningResult:
         inventory = map_repository_surfaces_to_graph(repository_context, graph_snapshot)
         grouping = group_connected_graph_targets(inventory, graph_snapshot)
@@ -122,6 +123,7 @@ class GraphSurfacePlanningCoordinator:
         gaps: list[GraphSurfacePlanningGap] = []
         reused_groups = 0
         persisted_groups = 0
+        durable_snapshot_id = storage_snapshot_id or graph_snapshot.snapshot_id
         existing_by_stable_key: dict[str, InvestigationValue] = {}
         if self.persistence is not None:
             if not scan_id:
@@ -129,7 +131,7 @@ class GraphSurfacePlanningCoordinator:
                     "scan_id is required when investigation persistence is configured"
                 )
             for existing in self.persistence.list_for_scan(scan_id):
-                if existing.snapshot_id != graph_snapshot.snapshot_id:
+                if existing.snapshot_id != durable_snapshot_id:
                     continue
                 if existing.stable_key in existing_by_stable_key:
                     raise PersistenceConflictError(
@@ -138,7 +140,7 @@ class GraphSurfacePlanningCoordinator:
                 existing_by_stable_key[existing.stable_key] = existing
             self.persistence.save_surface_plan(
                 scan_id,
-                graph_snapshot.snapshot_id,
+                durable_snapshot_id,
                 _surface_plan_data(inventory, grouping, self.maximum_target_nodes),
             )
         for group in grouping.groups:
@@ -172,6 +174,7 @@ class GraphSurfacePlanningCoordinator:
                 raise PersistenceConflictError(
                     "planner returned an investigation for a different graph surface group"
                 )
+            investigation = bind_storage_snapshot(investigation, durable_snapshot_id)
             if self.persistence is not None:
                 assert scan_id is not None
                 self.persistence.save(scan_id, investigation)
@@ -179,7 +182,7 @@ class GraphSurfacePlanningCoordinator:
             investigations.append(investigation)
         if self.persistence is not None:
             assert scan_id is not None
-            self.persistence.complete_surface_plan(scan_id, graph_snapshot.snapshot_id)
+            self.persistence.complete_surface_plan(scan_id, durable_snapshot_id)
         return GraphSurfacePlanningResult(
             snapshot_id=graph_snapshot.snapshot_id,
             inventory=inventory,
@@ -229,6 +232,8 @@ def _surface_plan_data(
     }
     return {
         "schema_version": 1,
+        # Preserve the original ledger field for records created before the
+        # pipeline distinguished Graphify and ORM snapshot identities.
         "snapshot_id": inventory.snapshot_id,
         "maximum_target_nodes": maximum_target_nodes,
         "mapping_counts": inventory.mapping_counts,

@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 from typing import ClassVar
+import hashlib
 
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.models import PolicyDecision
+from plaidnox_sast.graphify_adapter import CodeGraphSnapshot, CodeNode
 from plaidnox_sast.persistence.models import Base
 from plaidnox_sast.persistence.repositories import unit_of_work
 from plaidnox_sast.pipeline import SastPipeline, _stable_id
@@ -33,7 +35,101 @@ def test_pipeline_scans_a_non_git_source_snapshot(tmp_path):
     assert result.revision.startswith("snapshot-")
     assert result.scan_id
     assert result.metrics["target_code_executed"] is False
+    assert result.metrics["graphify_shadow_status"] == "disabled"
     assert result.findings
+
+
+def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
+    tmp_path, monkeypatch
+):
+    from plaidnox_sast.investigations import build_investigation
+
+    source = tmp_path / "app.js"
+    source.write_text("app.get('/accounts', listAccounts);\n", encoding="utf-8")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    graph_snapshot = CodeGraphSnapshot(
+        source_hashes={"app.js": source_hash},
+        nodes=(CodeNode("handler", "app.js", 1, "listAccounts", source_hash),),
+        edges=(),
+        unresolved_edges=0,
+        extractor_version="test",
+    )
+    monkeypatch.setattr(
+        "plaidnox_sast.pipeline.extract_structural_graph",
+        lambda *_args, **_kwargs: graph_snapshot,
+    )
+
+    class GraphContext(FakeRepositoryContext):
+        def to_dict(self):
+            return {
+                **super().to_dict(),
+                "entry_points": [
+                    {
+                        "entry_id": "accounts-list",
+                        "name": "List accounts",
+                        "evidence_locations": [
+                            {
+                                "path": "app.js",
+                                "start_line": 1,
+                                "end_line": 1,
+                                "source_content_hash": source_hash,
+                                "grounding_status": "verified_source_location",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class GraphPlanningAI(FakeContextualAI):
+        def build_repository_context(self, root, repository, commit, graph, business_context=""):
+            return GraphContext()
+
+        def plan_graph_investigation(
+            self,
+            context,
+            *,
+            codebase_id,
+            graph_snapshot,
+            context_broker,
+            target_node_ids,
+            surface_context,
+            stable_key,
+        ):
+            return build_investigation(
+                stable_key=stable_key,
+                codebase_id=codebase_id,
+                snapshot_id=graph_snapshot.snapshot_id,
+                graph_snapshot_id=graph_snapshot.snapshot_id,
+                target_ref={"node_ids": list(target_node_ids)},
+                reason="Review the externally reachable account handler.",
+                security_questions=("Can the caller access another account?",),
+                graph_refs=tuple(
+                    {
+                        "node_id": node_id,
+                        "snapshot_id": graph_snapshot.snapshot_id,
+                    }
+                    for node_id in target_node_ids
+                ),
+                source_windows=(),
+                context_dependencies=(),
+            )
+
+    result = SastPipeline().scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=GraphPlanningAI(),
+        graphify_shadow_planning=True,
+    )
+
+    assert result.metrics["graphify_shadow_status"] == "complete", (
+        result.metrics["graphify_shadow_error_type"],
+        result.metrics["graphify_shadow_error"],
+    )
+    assert result.metrics["graphify_nodes"] == 1
+    assert result.metrics["graphify_surfaces"] == 1
+    assert result.metrics["graphify_investigations"] == 1
+    assert result.repository_context["graphify_shadow_planning"]["status"] == "complete"
+    assert result.metrics["ai_discovery_candidates"] == 1
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):
