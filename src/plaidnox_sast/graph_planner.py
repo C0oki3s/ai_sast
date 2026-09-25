@@ -17,6 +17,7 @@ from .graphify_adapter import (
     CodeGraphSnapshot,
     CodeNode,
     GraphifyAdapterError,
+    graph_edge_identity,
 )
 from .investigations import Investigation, build_investigation
 from .redaction import redact_payload
@@ -344,20 +345,7 @@ def _node_sort_key(node: CodeNode) -> tuple[str, int, str]:
 
 
 def _edge_key(edge: CodeEdge) -> str:
-    identity = json.dumps(
-        [
-            edge.source_id,
-            edge.target_id,
-            edge.relation,
-            edge.provenance,
-            edge.path,
-            edge.line,
-            edge.source_hash,
-        ],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return graph_edge_identity(edge)
 
 
 def _node_payload(node: CodeNode, window: Mapping[str, Any]) -> dict[str, Any]:

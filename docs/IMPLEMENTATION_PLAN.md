@@ -219,7 +219,7 @@ its end-to-end exit condition.
 Exit condition: met by unit/E2E fixtures; repeated real-repository acceptance
 evidence remains required before production release.
 
-## 2. Graphify-backed investigations — next implementation phase
+## 2. Graphify-backed investigations — in progress
 
 The accepted target is [Graphify-backed investigations](../PLAN.md#graphify-backed-investigations-for-code-scanning):
 Graphify supplies versioned structural navigation; the AI planner groups
@@ -258,7 +258,16 @@ in `tests/test_graph_investigation_hunt.py`, the pipeline/ORM integration test
 `tests/test_graph_planner.py`,
 `tests/test_graph_surface_planning.py`, and `tests/test_pipeline.py`. Switch the
 default only after seeded-root recall, grounding, incremental invalidation, and
-checkpoint resume reach parity.
+checkpoint resume reach parity. Direct delta-to-investigation invalidation is
+now available as `affected_investigation_ids()` in
+`graphify_adapter.py`: it identifies investigations depending on changed source
+files, nodes, edges, and newly changed edges attached to their target nodes,
+without treating the global snapshot marker as a dependency on every task.
+`tests/test_graphify_adapter.py` verifies affected versus unrelated work and
+removed-edge dependencies. The next implementation step is wiring this mapping
+into cross-snapshot reuse and adding graph-derived reverse-dependency fanout;
+until then, cross-snapshot investigation reuse remains deferred and Graphify
+execution stays opt-in.
 
 The sections below describe the current Tree-sitter/`rg` runtime and its
 already implemented contracts. They are migration inputs, not the new target.

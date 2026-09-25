@@ -116,6 +116,108 @@ class GraphDelta:
     removed_edges: tuple[CodeEdge, ...]
 
 
+def affected_investigation_ids(
+    investigations: Iterable[Any], delta: GraphDelta
+) -> tuple[str, ...]:
+    """Return investigations whose explicit evidence intersects a graph delta.
+
+    The repository-wide snapshot dependency is intentionally ignored: treating it
+    as a dependency would invalidate every investigation after every edit. Callers
+    may add reverse-dependency fanout separately when their graph provider can
+    prove those relationships.
+    """
+    changed_paths = set(delta.added_files + delta.changed_files + delta.removed_files)
+    changed_nodes = set(delta.added_node_ids + delta.changed_node_ids + delta.removed_node_ids)
+    changed_edge_ids = {
+        graph_edge_identity(edge) for edge in (*delta.added_edges, *delta.removed_edges)
+    }
+    changed_edges = (*delta.added_edges, *delta.removed_edges)
+    affected: list[str] = []
+
+    for value in investigations:
+        payload = value.payload() if callable(getattr(value, "payload", None)) else value
+        if not isinstance(payload, Mapping):
+            continue
+        investigation_id = payload.get("investigation_id")
+        if not isinstance(investigation_id, str) or not investigation_id:
+            continue
+
+        node_ids = set(_nested_values(payload.get("target_ref", {}), "node_id"))
+        node_ids.update(_nested_values(payload.get("target_ref", {}), "node_ids"))
+        edge_ids = set(_nested_values(payload.get("target_ref", {}), "edge_id"))
+        for reference in payload.get("graph_refs", ()):
+            if isinstance(reference, Mapping):
+                node_ids.update(_nested_values(reference, "node_id"))
+                edge_ids.update(_nested_values(reference, "edge_id"))
+
+        dependencies = payload.get("context_dependencies", ())
+        for dependency in dependencies:
+            if not isinstance(dependency, Mapping):
+                continue
+            kind = dependency.get("kind")
+            key = dependency.get("key")
+            if not isinstance(key, str):
+                continue
+            if kind == "graph_node":
+                node_ids.add(key)
+            elif kind == "graph_edge":
+                edge_ids.add(key)
+            elif kind in {"file", "source_file"}:
+                if key in changed_paths:
+                    affected.append(investigation_id)
+                    break
+        else:
+            source_paths = {
+                str(window.get("path"))
+                for window in payload.get("source_windows", ())
+                if isinstance(window, Mapping) and isinstance(window.get("path"), str)
+            }
+            if (
+                source_paths & changed_paths
+                or node_ids & changed_nodes
+                or edge_ids & changed_edge_ids
+                or any(
+                    edge.source_id in node_ids or edge.target_id in node_ids
+                    for edge in changed_edges
+                )
+            ):
+                affected.append(investigation_id)
+
+    return tuple(sorted(set(affected)))
+
+
+def _nested_values(value: Any, key: str) -> set[str]:
+    """Collect typed graph references from bounded nested investigation data."""
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        item = value.get(key)
+        if isinstance(item, str):
+            found.add(item)
+        elif isinstance(item, (list, tuple)):
+            found.update(entry for entry in item if isinstance(entry, str))
+        for child in value.values():
+            found.update(_nested_values(child, key))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            found.update(_nested_values(child, key))
+    return found
+
+
+def graph_edge_identity(edge: CodeEdge) -> str:
+    """Stable fingerprint for one source-grounded Graphify edge."""
+    identity = [
+        edge.source_id,
+        edge.target_id,
+        edge.relation,
+        edge.provenance,
+        edge.path,
+        edge.line,
+        edge.source_hash,
+    ]
+    canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _edge_sort_key(edge: CodeEdge) -> tuple[str, str, str, str, int]:
     return (edge.source_id, edge.target_id, edge.relation, edge.path, edge.line)
 

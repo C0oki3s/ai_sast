@@ -5,8 +5,12 @@ from pathlib import Path
 import pytest
 
 from plaidnox_sast.graphify_adapter import (
+    CodeEdge,
+    GraphDelta,
     GraphifyAdapterError,
+    affected_investigation_ids,
     extract_structural_graph,
+    graph_edge_identity,
     normalize_extraction,
 )
 
@@ -181,3 +185,72 @@ def test_graphify_unsupported_admitted_file_is_visible_as_unindexed(tmp_path: Pa
     snapshot = normalize_extraction(tmp_path, [file], {"nodes": [], "edges": []})
 
     assert snapshot.unindexed_files == ("app.py",)
+
+
+def test_graph_delta_invalidates_only_investigations_using_changed_evidence() -> None:
+    investigations = [
+        {
+            "investigation_id": "auth",
+            "target_ref": {"node_id": "auth-node"},
+            "graph_refs": [{"node_id": "auth-node"}],
+            "source_windows": [{"path": "auth.py"}],
+            "context_dependencies": [
+                {"kind": "graph_node", "key": "auth-node", "hash": "old"},
+                {"kind": "graph_snapshot", "key": "old-snapshot", "hash": "old-snapshot"},
+            ],
+        },
+        {
+            "investigation_id": "orders",
+            "target_ref": {"node_id": "orders-node"},
+            "graph_refs": [{"node_id": "orders-node"}],
+            "source_windows": [{"path": "orders.py"}],
+            "context_dependencies": [
+                {"kind": "graph_snapshot", "key": "old-snapshot", "hash": "old-snapshot"}
+            ],
+        },
+        {
+            "investigation_id": "auth-callee",
+            "target_ref": {"node_id": "session-node"},
+            "graph_refs": [{"node_id": "session-node"}],
+            "source_windows": [{"path": "session.py"}],
+            "context_dependencies": [],
+        },
+    ]
+    delta = GraphDelta(
+        added_files=(),
+        changed_files=("auth.py",),
+        removed_files=(),
+        added_node_ids=(),
+        changed_node_ids=("auth-node",),
+        removed_node_ids=(),
+        added_edges=(
+            CodeEdge(
+                "auth-node",
+                "session-node",
+                "calls",
+                "EXTRACTED",
+                "auth.py",
+                24,
+                "new-source-hash",
+            ),
+        ),
+        removed_edges=(),
+    )
+
+    assert affected_investigation_ids(investigations, delta) == ("auth", "auth-callee")
+
+
+def test_graph_delta_matches_removed_edge_dependencies() -> None:
+    edge = CodeEdge("route", "handler", "calls", "EXTRACTED", "routes.py", 7, "old-hash")
+    investigations = [
+        {
+            "investigation_id": "route-handler",
+            "target_ref": {},
+            "graph_refs": [],
+            "source_windows": [],
+            "context_dependencies": [{"kind": "graph_edge", "key": graph_edge_identity(edge)}],
+        }
+    ]
+    delta = GraphDelta((), (), (), (), (), (), (), (edge,))
+
+    assert affected_investigation_ids(investigations, delta) == ("route-handler",)

@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .assets import load_json
-from .graphify_adapter import CodeEdge, CodeGraphSnapshot, CodeNode, GraphifyAdapterError
+from .graphify_adapter import (
+    CodeEdge,
+    CodeGraphSnapshot,
+    CodeNode,
+    GraphifyAdapterError,
+    graph_edge_identity,
+)
 from .redaction import redact
 
 
@@ -231,14 +236,4 @@ def _window_payload(window: SourceWindow) -> dict:
 
 
 def _edge_id(edge: CodeEdge) -> str:
-    identity = [
-        edge.source_id,
-        edge.target_id,
-        edge.relation,
-        edge.provenance,
-        edge.path,
-        edge.line,
-        edge.source_hash,
-    ]
-    canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return graph_edge_identity(edge)
