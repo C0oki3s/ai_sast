@@ -1509,6 +1509,7 @@ class CodeScanningRepository:
 
         recorded = self.session.execute(
             select(
+                FindingDependencyRecord.finding_id,
                 FindingDependencyRecord.dependency_key,
                 FindingDependencyRecord.dependency_hash,
             )
@@ -1523,14 +1524,22 @@ class CodeScanningRepository:
             )
         ).all()
 
+        missing_dependency_keys = {
+            dependency_key
+            for _finding_id, dependency_key, _dependency_hash in recorded
+            if dependency_key not in content_hash_by_stable_key
+        }
+        removed_dependency_findings = set(
+            self.findings_by_dependency_keys(codebase_id, missing_dependency_keys)
+        )
         changed_symbol_ids = {
             symbol_id_by_stable_key[dependency_key]
-            for dependency_key, dependency_hash in recorded
+            for _finding_id, dependency_key, dependency_hash in recorded
             if dependency_key in content_hash_by_stable_key
             and content_hash_by_stable_key[dependency_key] != dependency_hash
         }
         if not changed_symbol_ids:
-            return []
+            return sorted(removed_dependency_findings)
 
         affected_symbol_ids = self.reverse_dependencies(snapshot_id, changed_symbol_ids, hops)
         affected_stable_keys = {
@@ -1538,7 +1547,10 @@ class CodeScanningRepository:
             for symbol_id in affected_symbol_ids
             if symbol_id in stable_key_by_symbol_id
         }
-        return self.findings_by_dependency_keys(codebase_id, affected_stable_keys)
+        return sorted(
+            removed_dependency_findings
+            | set(self.findings_by_dependency_keys(codebase_id, affected_stable_keys))
+        )
 
     def flag_findings_for_revalidation(self, finding_ids: Iterable[str]) -> int:
         """Demote findings back to their pre-Deep-Hunt state so they are reviewed again.

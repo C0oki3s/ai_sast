@@ -487,3 +487,17 @@ def test_a_changed_callee_flags_its_own_and_its_callers_findings_but_leaves_unre
         assert repository.get_finding(callee_finding.finding_id).state == "discovered"
         # Unrelated code was reused: its finding is untouched by the callee mutation.
         assert repository.get_finding(unrelated_finding.finding_id).state == "validated"
+
+        snapshot_3 = repository.add_snapshot(
+            "snapshot-3", "codebase-1", "revision-3", "tree-hash-3", "context-v1"
+        )
+        repository.save_security_ir(
+            snapshot_3.snapshot_id,
+            source_files,
+            [caller, unrelated],
+            [],
+        )
+        removed_dependency_findings = repository.findings_requiring_revalidation(
+            "codebase-1", snapshot_3.snapshot_id, hops=3
+        )
+        assert callee_finding.finding_id in removed_dependency_findings
