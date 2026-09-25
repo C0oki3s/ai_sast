@@ -73,6 +73,7 @@ class GraphSurfaceGroup:
     group_id: str
     surface_keys: tuple[str, ...]
     node_ids: tuple[str, ...]
+    surface_context: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +328,25 @@ def group_connected_graph_targets(
             :32
         ]
         groups.append(
-            GraphSurfaceGroup(f"graph-group-{digest}", surface_keys, node_ids)
+            GraphSurfaceGroup(
+                f"graph-group-{digest}",
+                surface_keys,
+                node_ids,
+                tuple(
+                    {
+                        "surface_key": target.surface_key,
+                        "collection": target.collection,
+                        "label": target.label,
+                        "source_locations": list(target.source_locations),
+                        "node_ids": list(target.node_ids),
+                        "mapping_status": target.mapping_status.value,
+                    }
+                    for target in sorted(
+                        (eligible[index] for index in indices),
+                        key=lambda item: item.surface_key,
+                    )
+                ),
+            )
         )
     groups.sort(key=lambda item: (item.node_ids, item.surface_keys))
     return GraphTargetGrouping(tuple(groups), unmapped)

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -1141,7 +1141,10 @@ class PlaidNoxDeepHuntAgent:
         codebase_id: str,
         graph_snapshot: CodeGraphSnapshot,
         context_broker: GraphContextBroker,
-        target_node_id: str,
+        target_node_id: str | None = None,
+        target_node_ids: Sequence[str] | None = None,
+        surface_context: Sequence[Mapping[str, Any]] = (),
+        stable_key: str | None = None,
     ) -> Investigation:
         """Plan one Graphify-grounded investigation without making a finding verdict."""
 
@@ -1165,11 +1168,16 @@ class PlaidNoxDeepHuntAgent:
 
         planner = GraphInvestigationPlanner(complete)
         try:
-            investigation = planner.plan_target(
+            selected_targets = tuple(target_node_ids or ())
+            if not selected_targets and target_node_id:
+                selected_targets = (target_node_id,)
+            if not selected_targets:
+                raise GraphPlanningError("at least one Graphify target node is required")
+            investigation = planner.plan_targets(
                 codebase_id=codebase_id,
                 snapshot=graph_snapshot,
                 broker=context_broker,
-                target_node_id=target_node_id,
+                target_node_ids=selected_targets,
                 repository_context={
                     "architecture": context.architecture,
                     "applications": context.applications,
@@ -1179,6 +1187,8 @@ class PlaidNoxDeepHuntAgent:
                     "trust_boundaries": context.trust_boundaries,
                     "security_invariants": context.security_invariants,
                 },
+                surface_context=surface_context,
+                stable_key=stable_key,
             )
         except GraphPlanningError as exc:
             raise AIResponseError(str(exc)) from exc
@@ -1187,7 +1197,8 @@ class PlaidNoxDeepHuntAgent:
         self._emit(
             "graph_investigation_planned",
             investigation_id=investigation.investigation_id,
-            target_node_id=target_node_id,
+            target_node_id=selected_targets[0] if len(selected_targets) == 1 else None,
+            target_node_ids=list(selected_targets),
             graph_snapshot_id=graph_snapshot.snapshot_id,
             source_windows=len(investigation.source_windows),
         )
