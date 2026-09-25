@@ -64,6 +64,11 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
         load_json("schemas/hunt_plan.json")["properties"]["tasks"]["items"]["required"]
     )
     assert load_json("prompts/manifest.json")["version"]
+    graph_planner = load_json("schemas/graph_investigation_plan.json")
+    assert "security_questions" in graph_planner["required"]
+    assert graph_planner["properties"]["security_questions"]["maxItems"] == 12
+    assert "severity" not in graph_planner["properties"]
+    assert "graph_investigation_planning" in load_json("prompts/manifest.json")["operations"]
 
 
 def test_perplexity_sonar_uses_the_direct_native_provider_boundary():

@@ -15,13 +15,14 @@
     "graph_refs": {"type": "array", "items": {"$ref": "#/$defs/graph_ref"}},
     "source_windows": {"type": "array", "items": {"$ref": "#/$defs/source_window"}},
     "context_dependencies": {"type": "array", "items": {"type": "object"}},
+    "coverage_notes": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "prior_evidence_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "evidence_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "state": {"enum": ["planned", "running", "candidate", "no_candidate", "unresolved", "failed", "skipped"]},
     "checkpoint_ref": {"type": ["string", "null"], "maxLength": 512},
     "revision": {"type": "integer", "minimum": 1}
   },
-  "required": ["investigation_id", "schema_version", "stable_key", "codebase_id", "snapshot_id", "target_ref", "reason", "security_questions", "graph_refs", "source_windows", "context_dependencies", "prior_evidence_refs", "evidence_hash", "state", "checkpoint_ref", "revision"],
+  "required": ["investigation_id", "schema_version", "stable_key", "codebase_id", "snapshot_id", "target_ref", "reason", "security_questions", "graph_refs", "source_windows", "context_dependencies", "coverage_notes", "prior_evidence_refs", "evidence_hash", "state", "checkpoint_ref", "revision"],
   "$defs": {
     "graph_ref": {
       "type": "object",

@@ -42,6 +42,7 @@ def _investigation(*, excerpt: str = "return account;") -> Investigation:
             },
         ),
         context_dependencies=({"kind": "graph_node", "key": "node-account-update", "hash": source_hash},),
+        coverage_notes=(),
         prior_evidence_refs=(),
         evidence_hash="0" * 64,
     )

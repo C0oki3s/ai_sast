@@ -70,6 +70,33 @@ class GraphContextBroker:
     def neighborhood(self, node_id: str) -> GraphLookup:
         return self._related(node_id, relation=None, direction="both")
 
+    def source_window_around_node(
+        self,
+        node_id: str,
+        *,
+        lines_before: int,
+        lines_after: int,
+    ) -> SourceWindow:
+        """Read a small exact window around a graph node's verified source anchor."""
+        if lines_before < 0 or lines_after < 0:
+            raise ValueError("source context line counts must be nonnegative")
+        node = self._nodes.get(node_id)
+        if node is None:
+            raise GraphifyAdapterError("unknown graph node")
+        source = self.root / node.path
+        if source.resolve() != source or self.root not in source.parents:
+            raise GraphifyAdapterError("source path escaped the immutable snapshot")
+        try:
+            content = source.read_bytes()
+            if hashlib.sha256(content).hexdigest() != self.snapshot.source_hashes[node.path]:
+                raise GraphifyAdapterError("source changed after Graphify extraction")
+            line_count = len(content.decode("utf-8").splitlines())
+        except (OSError, UnicodeDecodeError) as exc:
+            raise GraphifyAdapterError("source window cannot be read") from exc
+        start = max(1, node.line - lines_before)
+        end = min(max(1, line_count), node.line + lines_after)
+        return self.source_window(node.path, start, end)
+
     def _related(self, node_id: str, *, relation: str | None, direction: str) -> GraphLookup:
         if node_id not in self._nodes:
             raise GraphifyAdapterError("unknown graph node")

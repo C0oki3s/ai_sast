@@ -22,7 +22,11 @@ from .cache_telemetry import LiteLLMCacheTelemetry
 from .context_fabric import ContextFabric, PreparedContext
 from .fingerprint import CandidateIndex
 from .controls import ModelUsageBudget
+from .graph_context import GraphContextBroker
+from .graphify_adapter import CodeGraphSnapshot, GraphifyAdapterError
+from .graph_planner import GraphInvestigationPlanner, GraphPlanningError
 from .errors import AIStageError
+from .investigations import Investigation
 from .graph import (
     RipgrepDiscovery,
     RipgrepQueryError,
@@ -1129,6 +1133,65 @@ class PlaidNoxDeepHuntAgent:
             knowledge_failures=knowledge_failures,
         )
         return HuntPlan(plan_id=plan_id, strategy=strategy, tasks=tasks)
+
+    def plan_graph_investigation(
+        self,
+        context: AIRepositoryContext,
+        *,
+        codebase_id: str,
+        graph_snapshot: CodeGraphSnapshot,
+        context_broker: GraphContextBroker,
+        target_node_id: str,
+    ) -> Investigation:
+        """Plan one Graphify-grounded investigation without making a finding verdict."""
+
+        def complete(payload: dict[str, Any]) -> Mapping[str, Any]:
+            response = self._structured_response(
+                "plaidnox_graph_investigation_plan",
+                load_json("schemas/graph_investigation_plan.json"),
+                "graph_investigation_planning",
+                payload,
+                max_output_tokens=int(
+                    load_json("runtime/code_intelligence.json")["maximum_planner_output_tokens"]
+                ),
+                model_tier=ModelTier.FAST,
+            )
+            try:
+                return dict(response_json(response))
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AIResponseError(
+                    f"AI Graphify investigation plan did not match the required schema: {_schema_failure(exc)}"
+                ) from exc
+
+        planner = GraphInvestigationPlanner(complete)
+        try:
+            investigation = planner.plan_target(
+                codebase_id=codebase_id,
+                snapshot=graph_snapshot,
+                broker=context_broker,
+                target_node_id=target_node_id,
+                repository_context={
+                    "architecture": context.architecture,
+                    "applications": context.applications,
+                    "business_context": context.business_context,
+                    "actors": context.actors,
+                    "sensitive_assets": context.sensitive_assets,
+                    "trust_boundaries": context.trust_boundaries,
+                    "security_invariants": context.security_invariants,
+                },
+            )
+        except GraphPlanningError as exc:
+            raise AIResponseError(str(exc)) from exc
+        except GraphifyAdapterError as exc:
+            raise AIResponseError(f"Graph context could not support investigation planning: {exc}") from exc
+        self._emit(
+            "graph_investigation_planned",
+            investigation_id=investigation.investigation_id,
+            target_node_id=target_node_id,
+            graph_snapshot_id=graph_snapshot.snapshot_id,
+            source_windows=len(investigation.source_windows),
+        )
+        return investigation
 
     def discover_candidates(
         self,

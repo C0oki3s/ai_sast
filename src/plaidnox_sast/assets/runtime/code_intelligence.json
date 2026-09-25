@@ -17,6 +17,12 @@
   "maximum_context_packet_slices": 24,
   "maximum_flow_depth": 6,
   "maximum_flow_edges": 80,
+  "planner_context_lines_before": 6,
+  "planner_context_lines_after": 12,
+  "maximum_planner_neighbor_nodes": 24,
+  "maximum_planner_neighbor_edges": 48,
+  "maximum_planner_input_characters": 80000,
+  "maximum_planner_output_tokens": 2500,
   "maximum_compact_context_items_per_section": 80,
   "audited_source_payload_keys": [
     "content",

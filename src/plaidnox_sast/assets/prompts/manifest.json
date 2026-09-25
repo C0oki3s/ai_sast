@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-25.7",
+  "version": "2026-09-25.8",
   "operations": {
     "recon_search_plan": {
       "system": "operations/recon_search_plan/system.md",
@@ -12,6 +12,11 @@
     "hunt_plan": {
       "system": "operations/hunt_plan/system.md",
       "user": "operations/hunt_plan/user.md"
+    },
+    "graph_investigation_planning": {
+      "system": "operations/graph_investigation_planning/system.md",
+      "user": "operations/graph_investigation_planning/user.md",
+      "contract_version": "2026-09-25.1"
     },
     "search_query_plan": {
       "system": "operations/search_query_plan/system.md",

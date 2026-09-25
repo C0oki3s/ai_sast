@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -31,6 +31,7 @@ class Investigation:
     graph_refs: tuple[dict[str, Any], ...]
     source_windows: tuple[dict[str, Any], ...]
     context_dependencies: tuple[dict[str, Any], ...]
+    coverage_notes: tuple[str, ...]
     prior_evidence_refs: tuple[str, ...]
     evidence_hash: str
     state: str = "planned"
@@ -50,6 +51,7 @@ class Investigation:
             "graph_refs": list(self.graph_refs),
             "source_windows": list(self.source_windows),
             "context_dependencies": list(self.context_dependencies),
+            "coverage_notes": list(self.coverage_notes),
             "prior_evidence_refs": list(self.prior_evidence_refs),
             "evidence_hash": self.evidence_hash,
             "state": self.state,
@@ -66,10 +68,51 @@ def investigation_evidence_hash(investigation: Investigation) -> str:
         "graph_refs": investigation.graph_refs,
         "source_windows": investigation.source_windows,
         "context_dependencies": investigation.context_dependencies,
+        "coverage_notes": investigation.coverage_notes,
         "prior_evidence_refs": investigation.prior_evidence_refs,
     }
     canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_investigation(
+    *,
+    stable_key: str,
+    codebase_id: str,
+    snapshot_id: str,
+    target_ref: dict[str, Any],
+    reason: str,
+    security_questions: tuple[str, ...],
+    graph_refs: tuple[dict[str, Any], ...],
+    source_windows: tuple[dict[str, Any], ...],
+    context_dependencies: tuple[dict[str, Any], ...],
+    coverage_notes: tuple[str, ...] = (),
+    prior_evidence_refs: tuple[str, ...] = (),
+) -> Investigation:
+    """Create a content-addressed investigation version from grounded evidence."""
+    draft = Investigation(
+        investigation_id="pending",
+        schema_version=1,
+        stable_key=stable_key,
+        codebase_id=codebase_id,
+        snapshot_id=snapshot_id,
+        target_ref=target_ref,
+        reason=reason,
+        security_questions=security_questions,
+        graph_refs=graph_refs,
+        source_windows=source_windows,
+        context_dependencies=context_dependencies,
+        coverage_notes=coverage_notes,
+        prior_evidence_refs=prior_evidence_refs,
+        evidence_hash="0" * 64,
+    )
+    evidence_hash = investigation_evidence_hash(draft)
+    identifier = hashlib.sha256(
+        f"{codebase_id}\0{stable_key}\0{evidence_hash}".encode("utf-8")
+    ).hexdigest()[:32]
+    result = replace(draft, investigation_id=identifier, evidence_hash=evidence_hash)
+    validate_investigation(result)
+    return result
 
 
 def validate_investigation(value: Investigation | dict[str, Any]) -> None:

@@ -227,9 +227,11 @@ security surfaces into bounded investigations; PlaidNox Deep Hunt retains final
 verdict ownership. The structural adapter, snapshot-delta contract, and first
 graph-backed context queries are implemented in `graphify_adapter.py` and
 `graph_context.py`. The versioned Investigation contract, tenant-scoped ORM
-ledger, and PostgreSQL migration are now implemented with evidence hashing,
-source-window validation, and revision-checked resumable states. Surface
-planning/coverage integration and runtime adoption remain. Switch the default only after seeded-root recall,
+ledger, PostgreSQL migration, and first AI planner slice are implemented. The
+planner receives one bounded Graphify neighborhood and cannot preserve model-
+invented graph references. Full surface enumeration/batching, scan-runtime
+ledger/checkpoint integration, and Deep Hunt invocation remain. Switch the
+default only after seeded-root recall,
 grounding, incremental invalidation, and checkpoint resume reach parity.
 
 The sections below describe the current Tree-sitter/`rg` runtime and its
