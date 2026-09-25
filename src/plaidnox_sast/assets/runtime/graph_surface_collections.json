@@ -2,8 +2,8 @@
   "collections": [
     {"name": "input_surfaces", "identity_fields": ["surface_id", "name"], "label_fields": ["name", "description"]},
     {"name": "trust_boundaries", "identity_fields": ["boundary_id", "name"], "label_fields": ["name", "description"]},
-    {"name": "sensitive_effects", "identity_fields": ["effect_id", "name"], "label_fields": ["effect_type", "operation"]},
-    {"name": "entry_points", "identity_fields": ["entry_id", "name"], "label_fields": ["entry_type", "operation"]},
+    {"name": "sensitive_effects", "identity_fields": ["effect_id", "name"], "label_fields": ["effect_type", "operation", "name"]},
+    {"name": "entry_points", "identity_fields": ["entry_id", "name"], "label_fields": ["entry_type", "operation", "name"]},
     {"name": "authentication_paths", "identity_fields": ["path_id", "name"], "label_fields": ["name", "identity_source"]},
     {"name": "authorization_decisions", "identity_fields": ["decision_id", "name"], "label_fields": ["name", "resource", "tenant_or_owner_control"]},
     {"name": "indirect_dispatch", "identity_fields": ["dispatch_id", "name"], "label_fields": ["name", "selection_mechanism"]},
