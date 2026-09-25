@@ -7,6 +7,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.assets import load_json, load_text
+from plaidnox_sast.graphify_adapter import (
+    CodeEdge,
+    CodeGraphSnapshot,
+    CodeNode,
+    graph_edge_identity,
+    graph_node_neighborhood_hash,
+)
 from plaidnox_sast.redaction import redact
 from plaidnox_sast.persistence.database import (
     DatabaseConfigurationError,
@@ -501,3 +508,73 @@ def test_a_changed_callee_flags_its_own_and_its_callers_findings_but_leaves_unre
             "codebase-1", snapshot_3.snapshot_id, hops=3
         )
         assert callee_finding.finding_id in removed_dependency_findings
+
+
+def test_graph_relationship_changes_invalidate_findings_linked_to_graph_slice():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    source_hash = "source-hash"
+    node = CodeNode("handler", "app.js", 4, "updateAccount", source_hash)
+    edge = CodeEdge("route", "handler", "calls", "tree_sitter", "app.js", 3, source_hash)
+    previous_graph = CodeGraphSnapshot(
+        source_hashes={"app.js": source_hash},
+        nodes=(node,),
+        edges=(edge,),
+        unresolved_edges=0,
+        extractor_version="test",
+    )
+    dependencies = [
+        FindingDependencyInput("source_file", "app.js", source_hash),
+        FindingDependencyInput("graph_node", node.id, node.source_hash),
+        FindingDependencyInput(
+            "graph_node_neighborhood",
+            node.id,
+            graph_node_neighborhood_hash(previous_graph, node.id),
+        ),
+        FindingDependencyInput("graph_edge", graph_edge_identity(edge), graph_edge_identity(edge)),
+    ]
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-graph", "local/graph", "Graph")
+        snapshot = repository.add_snapshot(
+            "snapshot-graph", "codebase-graph", "revision-graph", "tree-graph", "context-v1"
+        )
+        scan = repository.start_scan(
+            "scan-graph", "codebase-graph", snapshot.snapshot_id, "deep", "workflow-v1"
+        )
+        finding = repository.save_finding(
+            "finding-graph",
+            "codebase-graph",
+            scan.scan_id,
+            "fingerprint-graph",
+            "Authorization finding",
+            "authorization",
+            "high",
+            "validated",
+            0.9,
+            "The route reaches the handler without an ownership check.",
+            "Cross-account update.",
+            "Enforce ownership.",
+            {"deep_hunt": "supported"},
+            [],
+            dependencies,
+        )
+        assert repository.findings_requiring_graph_revalidation(
+            "codebase-graph", previous_graph
+        ) == []
+
+        # The file and node are unchanged, but the route-to-handler relationship
+        # disappeared. This must invalidate the finding because reachability was
+        # part of the evidence packet.
+        changed_graph = CodeGraphSnapshot(
+            source_hashes={"app.js": source_hash},
+            nodes=(node,),
+            edges=(),
+            unresolved_edges=0,
+            extractor_version="test",
+        )
+        stale = repository.findings_requiring_graph_revalidation(
+            "codebase-graph", changed_graph
+        )
+        assert stale == [finding.finding_id]

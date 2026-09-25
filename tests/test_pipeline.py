@@ -155,6 +155,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
                     "engine": "plaidnox-graphify-investigation",
                     "graph_investigation_id": investigation.investigation_id,
                     "graph_snapshot_id": investigation.graph_snapshot_id,
+                    "graph_refs": list(investigation.graph_refs),
                 },
             )
             return [candidate], {
@@ -210,9 +211,15 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             [stored[0].investigation_id],
             dependency_type="graph_investigation",
         )
+        graph_dependencies = repository.get_finding(linked_findings[0]).dependencies
     assert len(stored) == 1
     assert stored[0].state == "candidate"
     assert linked_findings
+    assert {dependency.dependency_type for dependency in graph_dependencies} >= {
+        "graph_node",
+        "graph_node_neighborhood",
+        "source_file",
+    }
 
     agent.return_no_candidate = True
     unchanged_findings = pipeline.scan_snapshot(

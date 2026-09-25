@@ -1558,6 +1558,57 @@ class CodeScanningRepository:
             | set(self.findings_by_dependency_keys(codebase_id, affected_stable_keys))
         )
 
+    def findings_requiring_graph_revalidation(
+        self, codebase_id: str, graph_snapshot: Any
+    ) -> list[str]:
+        """Invalidate findings when any explicitly linked Graphify fact changed or disappeared."""
+        from ..graphify_adapter import graph_edge_identity, graph_node_neighborhood_hash
+
+        nodes = {node.id: node for node in graph_snapshot.nodes}
+        edges = {graph_edge_identity(edge): edge for edge in graph_snapshot.edges}
+        rows = self.session.execute(
+            select(
+                FindingDependencyRecord.finding_id,
+                FindingDependencyRecord.dependency_type,
+                FindingDependencyRecord.dependency_key,
+                FindingDependencyRecord.dependency_hash,
+            )
+            .join(
+                FindingRecord,
+                FindingRecord.finding_id == FindingDependencyRecord.finding_id,
+            )
+            .where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingDependencyRecord.dependency_type.in_(
+                    (
+                        "source_file",
+                        "graph_node",
+                        "graph_node_neighborhood",
+                        "graph_edge",
+                        "graph_dependency_unresolved",
+                    )
+                ),
+            )
+        ).all()
+        stale: set[str] = set()
+        for finding_id, dependency_type, dependency_key, dependency_hash in rows:
+            if dependency_type == "source_file":
+                current_hash = graph_snapshot.source_hashes.get(dependency_key)
+            elif dependency_type == "graph_node":
+                node = nodes.get(dependency_key)
+                current_hash = node.source_hash if node else None
+            elif dependency_type == "graph_node_neighborhood":
+                current_hash = graph_node_neighborhood_hash(graph_snapshot, dependency_key)
+            elif dependency_type == "graph_edge":
+                edge = edges.get(dependency_key)
+                current_hash = graph_edge_identity(edge) if edge else None
+            else:
+                current_hash = None
+            if current_hash != dependency_hash:
+                stale.add(finding_id)
+        return sorted(stale)
+
     def flag_findings_for_revalidation(self, finding_ids: Iterable[str]) -> int:
         """Demote findings back to their pre-Deep-Hunt state so they are reviewed again.
 

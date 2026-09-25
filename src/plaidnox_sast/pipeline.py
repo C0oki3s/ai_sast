@@ -37,7 +37,12 @@ from .graph_surface_planning import (
     GraphifySnapshotOrmStore,
     InvestigationOrmStore,
 )
-from .graphify_adapter import affected_investigation_ids, extract_structural_graph
+from .graphify_adapter import (
+    affected_investigation_ids,
+    extract_structural_graph,
+    graph_edge_identity,
+    graph_node_neighborhood_hash,
+)
 from .investigations import investigation_from_payload, validate_investigation
 from .routers import CandidateRouter
 from .models import (
@@ -366,6 +371,7 @@ def _symbol_at_location(symbols_by_path: dict[str, list], path: str, line: int):
 def _finding_dependencies(
     finding: Finding,
     symbols: list[SymbolInput],
+    graph_snapshot=None,
 ) -> list[FindingDependencyInput]:
     """Link a verified finding to every evidenced Security IR symbol."""
 
@@ -406,6 +412,62 @@ def _finding_dependencies(
             graph_investigation_id,
             graph_snapshot_id,
         )
+    if graph_snapshot is not None:
+        nodes_by_id = {node.id: node for node in graph_snapshot.nodes}
+        edges_by_id = {
+            graph_edge_identity(edge): edge for edge in graph_snapshot.edges
+        }
+        graph_refs = finding.metadata.get("graph_refs", [])
+        graph_ref_failures: list[str] = []
+        if finding.metadata.get("engine") == "plaidnox-graphify-investigation" and not graph_refs:
+            graph_ref_failures.append("missing_graph_refs")
+        if isinstance(graph_refs, list):
+            for index, reference in enumerate(graph_refs):
+                if not isinstance(reference, dict):
+                    graph_ref_failures.append(f"malformed:{index}")
+                    continue
+                reference_snapshot = str(reference.get("snapshot_id", ""))
+                if reference_snapshot != graph_snapshot.snapshot_id:
+                    graph_ref_failures.append(f"stale_snapshot:{index}")
+                    continue
+                node_id = str(reference.get("node_id", ""))
+                edge_id = str(reference.get("edge_id", ""))
+                if not node_id and not edge_id:
+                    graph_ref_failures.append(f"missing_identity:{index}")
+                node = nodes_by_id.get(node_id)
+                if node is not None:
+                    dependencies[f"graph-node:{node_id}"] = FindingDependencyInput(
+                        "graph_node", node_id, node.source_hash
+                    )
+                    neighborhood_hash = graph_node_neighborhood_hash(
+                        graph_snapshot, node_id
+                    )
+                    if neighborhood_hash:
+                        dependencies[f"graph-neighborhood:{node_id}"] = FindingDependencyInput(
+                            "graph_node_neighborhood", node_id, neighborhood_hash
+                        )
+                elif node_id:
+                    graph_ref_failures.append(f"missing_node:{index}")
+                edge = edges_by_id.get(edge_id)
+                if edge is not None:
+                    dependencies[f"graph-edge:{edge_id}"] = FindingDependencyInput(
+                        "graph_edge", edge_id, graph_edge_identity(edge)
+                    )
+                elif edge_id:
+                    graph_ref_failures.append(f"missing_edge:{index}")
+        elif graph_refs:
+            graph_ref_failures.append("invalid_graph_refs_collection")
+        for failure in graph_ref_failures:
+            failure_key = hashlib.sha256(failure.encode("utf-8")).hexdigest()
+            dependencies[f"graph-unresolved:{failure_key}"] = FindingDependencyInput(
+                "graph_dependency_unresolved", failure_key, "unresolved"
+            )
+        for path, _start, _end in locations:
+            source_hash = graph_snapshot.source_hashes.get(path)
+            if source_hash:
+                dependencies[f"source-file:{path}"] = FindingDependencyInput(
+                    "source_file", path, source_hash
+                )
     return list(dependencies.values())
 
 
@@ -501,6 +563,7 @@ class SastPipeline:
         persistence_error = ""
         persistence_findings_flagged_for_revalidation = 0
         graphify_findings_flagged_for_revalidation = 0
+        graph_snapshot = None
         symbols_by_path: dict[str, list] = {}
         if self.session_factory is not None:
             try:
@@ -714,6 +777,7 @@ class SastPipeline:
                         else None
                     )
                     invalidated_prior_investigation_ids: frozenset[str] = frozenset()
+                    graphify_invalidated_finding_ids: set[str] = set()
                     reusable_no_candidate_ids: frozenset[str] = frozenset()
                     if graph_persistence is not None:
                         intelligence_config = load_json("runtime/code_intelligence.json")
@@ -777,10 +841,8 @@ class SastPipeline:
                                         invalidated_prior_investigation_ids,
                                         dependency_type="graph_investigation",
                                     )
-                                    graphify_findings_flagged_for_revalidation = (
-                                        repository.flag_findings_for_revalidation(
-                                            affected_finding_ids
-                                        )
+                                    graphify_invalidated_finding_ids.update(
+                                        affected_finding_ids
                                     )
                             graphify_changed_file_count = len(
                                 graph_delta.added_files
@@ -799,6 +861,20 @@ class SastPipeline:
                                 invalidated_prior_investigation_ids
                             )
                         graph_snapshot_store.save(scan_id, snapshot_id, graph_snapshot)
+                        with unit_of_work(self.session_factory, self.tenant_id) as repository:
+                            graph_stale_finding_ids = set(
+                                repository.findings_requiring_graph_revalidation(
+                                    codebase_id, graph_snapshot
+                                )
+                            )
+                            graphify_invalidated_finding_ids.update(
+                                graph_stale_finding_ids
+                            )
+                            graphify_findings_flagged_for_revalidation = (
+                                repository.flag_findings_for_revalidation(
+                                    graphify_invalidated_finding_ids
+                                )
+                            )
 
                     def plan_graph_group(**arguments):
                         nonlocal graphify_checkpoint_reused, graphify_checkpoint_saved
@@ -1639,6 +1715,7 @@ class SastPipeline:
                         dependencies = _finding_dependencies(
                             finding,
                             persisted_ir[1] if persisted_ir is not None else [],
+                            graph_snapshot=graph_snapshot,
                         )
                         validation_data = {
                             "deep_hunt": finding.metadata.get("deep_hunt", {}),
