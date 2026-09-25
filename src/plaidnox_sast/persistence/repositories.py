@@ -983,6 +983,47 @@ class CodeScanningRepository:
         ).all()
         return [_scan_finding_value(row) for row in rows]
 
+    def reusable_scan_findings(
+        self,
+        scan_id: str,
+        *,
+        codebase_id: str,
+        workflow_version: str,
+        context_scope_hash: str,
+    ) -> list[ScanFindingValue]:
+        """Read prior report snapshots only for a successful identical analysis context."""
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+                ScanRunRecord.codebase_id == codebase_id,
+                ScanRunRecord.scan_status == "SUCCESSFUL",
+                ScanRunRecord.workflow_version == workflow_version,
+            )
+        )
+        if scan is None or scan.scan_parameters.get("context_scope_hash") != context_scope_hash:
+            return []
+        rows = self.session.execute(
+            select(ScanFindingRecord, FindingRecord.state)
+            .join(FindingRecord, FindingRecord.finding_id == ScanFindingRecord.finding_id)
+            .where(
+                ScanFindingRecord.scan_id == scan_id,
+                ScanFindingRecord.tenant_id == self.tenant_id,
+                ScanFindingRecord.report_schema_version == 1,
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingRecord.state.in_(("validated", "open", "in_progress")),
+            )
+            .order_by(ScanFindingRecord.fingerprint)
+        ).all()
+        return [
+            _scan_finding_value(record)
+            for record, _state in rows
+            if isinstance(record.report_data, dict)
+            and record.report_data.get("schema_version") == 1
+            and isinstance(record.report_data.get("taint_path"), list)
+        ]
+
     def record_model_usage(
         self,
         usage_event_id: str,
@@ -1994,6 +2035,21 @@ class CodeScanningRepository:
             .where(
                 InvestigationRecord.tenant_id == self.tenant_id,
                 InvestigationRecord.scan_id == scan_id,
+            )
+            .order_by(InvestigationRecord.created_at, InvestigationRecord.investigation_id)
+        ).all()
+        return [_investigation_value(row) for row in rows]
+
+    def list_investigations_for_snapshot(
+        self, codebase_id: str, snapshot_id: str
+    ) -> list[InvestigationValue]:
+        """Load immutable investigation identities attached to a codebase snapshot."""
+        rows = self.session.scalars(
+            select(InvestigationRecord)
+            .where(
+                InvestigationRecord.tenant_id == self.tenant_id,
+                InvestigationRecord.codebase_id == codebase_id,
+                InvestigationRecord.snapshot_id == snapshot_id,
             )
             .order_by(InvestigationRecord.created_at, InvestigationRecord.investigation_id)
         ).all()

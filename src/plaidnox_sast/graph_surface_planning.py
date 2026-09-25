@@ -76,6 +76,12 @@ class InvestigationOrmStore:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.list_investigations(scan_id)
 
+    def list_for_snapshot(
+        self, codebase_id: str, snapshot_id: str
+    ) -> list[InvestigationValue]:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.list_investigations_for_snapshot(codebase_id, snapshot_id)
+
     def list_for_codebase(self, codebase_id: str) -> list[InvestigationValue]:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.list_investigations_for_codebase(codebase_id)

@@ -207,8 +207,22 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert len(stored) == 1
     assert stored[0].state == "candidate"
 
-    source.write_text("app.get('/accounts', listAccounts); // changed\n", encoding="utf-8")
     agent.return_no_candidate = True
+    unchanged_findings = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
+        graphify_investigations=True,
+    )
+    assert unchanged_findings.metrics["graphify_verified_findings_carried_forward"] == 1
+    assert len(unchanged_findings.findings) == 1
+    assert unchanged_findings.findings[0].metadata["carried_forward"] is True
+    with unit_of_work(factory, "default") as repository:
+        carried_report = repository.scan_findings(unchanged_findings.scan_id)
+    assert len(carried_report) == 1
+    assert carried_report[0].report_data["scan_id"] == unchanged_findings.scan_id
+
+    source.write_text("app.get('/accounts', listAccounts); // changed\n", encoding="utf-8")
     rerun = pipeline.scan_snapshot(
         tmp_path,
         "local/account-service",
@@ -219,11 +233,12 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         "previous_graph_snapshot_id"
     ] == result.repository_context["graphify_shadow_planning"]["graph_snapshot_id"]
     assert rerun.repository_context["graphify_shadow_planning"]["changed_file_count"] == 1
+    assert rerun.metrics["graphify_verified_findings_carried_forward"] == 0
     assert rerun.repository_context["graphify_shadow_planning"][
         "invalidated_prior_investigation_count"
     ] == 1
     assert agent.graph_plan_calls == 2
-    assert agent.graph_hunt_calls == 2
+    assert agent.graph_hunt_calls == 3
     with unit_of_work(factory, "default") as repository:
         rerun_investigations = repository.list_investigations(rerun.scan_id)
         rerun_scan = repository.get_scan(rerun.scan_id)
@@ -252,7 +267,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert unchanged.metrics["graphify_hunt_no_candidate_reused"] == 1
     assert unchanged.metrics["graphify_hunt_results"][0]["status"] == "reused_no_candidate"
     assert agent.graph_plan_calls == 2
-    assert agent.graph_hunt_calls == 2
+    assert agent.graph_hunt_calls == 3
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):

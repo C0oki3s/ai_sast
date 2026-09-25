@@ -42,6 +42,7 @@ from .investigations import investigation_from_payload, validate_investigation
 from .routers import CandidateRouter
 from .models import (
     Depth,
+    Evidence,
     Finding,
     FindingState,
     ModelTier,
@@ -180,6 +181,7 @@ def _finding_report_data(
         "uuid": finding_id,
         "duplicate_of": None,
         "fingerprint": finding.fingerprint,
+        "rule_id": finding.rule_id,
         "title": redact_sensitive_values(finding.title)[:1000],
         "tags": [redact_sensitive_values(str(tag))[:255] for tag in tags[:50]],
         "description": redact_sensitive_values(finding.message)[:8000],
@@ -227,6 +229,122 @@ def _finding_report_data(
         "repo_url": codebase if codebase.startswith(("https://", "http://")) else None,
         "sourceHost": None,
     }
+
+
+def _finding_from_saved_report(report: dict[str, Any], codebase: str) -> Finding:
+    """Restore a reportable verified finding while preserving its original proof metadata."""
+    taint_path = report["taint_path"]
+    primary = next(
+        (item for item in taint_path if item.get("file") == report["affected_file"]),
+        taint_path[0],
+    )
+    evidence = Evidence(
+        path=str(primary["file"]),
+        start_line=int(primary["line"]),
+        end_line=max(int(primary["line"]), int(primary.get("end_line", primary["line"]))),
+        snippet=str(report.get("affected_code", "")),
+        source_symbol=str(report.get("root_cause_symbol", "")),
+        sink_symbol="",
+        graph_path=[
+            f"{item['file']}:{item['line']}"
+            for item in taint_path
+            if item.get("file") and item.get("line")
+        ],
+    )
+    evidence_locations = [
+        {
+            "path": str(item["file"]),
+            "start_line": int(item["line"]),
+            "end_line": max(int(item["line"]), int(item.get("end_line", item["line"]))),
+            "role": str(item.get("type", "propagation")),
+            "description": str(item.get("description", "")),
+        }
+        for item in taint_path
+        if item.get("file") and item.get("line")
+    ]
+    deep_hunt = {
+        "proof_plan": report.get("proof_plan", ""),
+        "regression_test": report.get("regression_test_expectation", ""),
+        "security_invariant": report.get("security_invariant", ""),
+        "gained_capability": report.get("gained_capability", ""),
+        "attack_path": report.get("attack_path", ""),
+        "gate_results": report.get("validation_gates", []),
+        "evidence_gaps": report.get("evidence_gaps", []),
+        "evidence_locations": evidence_locations,
+    }
+    occurrence_count = max(1, int(report.get("occurrence_count", 1)))
+    metadata = {
+        "deep_hunt": deep_hunt,
+        "classification_references": report.get("classification_references", []),
+        "evidence_packet": report.get("evidence_packet", {}),
+        "evidence_locations": evidence_locations,
+        "root_cause_symbol": report.get("root_cause_symbol", ""),
+        "proof_of_concept": report.get("proof_of_concept", ""),
+        "tags": report.get("tags", []),
+        "duplicate_reports": occurrence_count - 1,
+        "carried_forward": True,
+    }
+    severity = Severity(str(report["severity"]).lower())
+    confidence = float(report["confidence"])
+    return Finding(
+        fingerprint=str(report["fingerprint"]),
+        repository=codebase,
+        rule_id=str(report["rule_id"]),
+        title=str(report["title"]),
+        vulnerability_class=str(report["category"]),
+        severity=severity,
+        confidence=confidence,
+        state=FindingState.VALIDATED,
+        message=str(report["description"]),
+        impact=str(report.get("business_impact", "")),
+        remediation=str(report.get("recommendation", "")),
+        evidence=evidence,
+        priority_score=priority_score(severity, confidence, "standard"),
+        validator="plaidnox-deep-hunt",
+        metadata=metadata,
+    )
+
+
+def _saved_report_matches_graph(
+    report: dict[str, Any],
+    *,
+    root: Path,
+    graph_snapshot,
+    exclude: list[str],
+    max_file_bytes: int,
+) -> bool:
+    """Require every carried evidence range to remain inside the exact indexed snapshot."""
+    if (
+        report.get("schema_version") != 1
+        or not report.get("rule_id")
+        or not report.get("fingerprint")
+        or report.get("state") not in {"validated", "open", "in_progress"}
+    ):
+        return False
+    locations = report.get("taint_path")
+    if not isinstance(locations, list) or not locations:
+        return False
+    source_hashes = graph_snapshot.source_hashes
+    for location in locations:
+        if not isinstance(location, dict):
+            return False
+        path = str(location.get("file", "")).replace("\\", "/")
+        if path not in source_hashes:
+            return False
+        target = (root / path).resolve()
+        if root.resolve() not in target.parents or not source_file_is_admitted(
+            root, target, exclude=exclude, max_file_bytes=max_file_bytes
+        ):
+            return False
+        try:
+            start = int(location["line"])
+            end = max(start, int(location.get("end_line", start)))
+            line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+        if start < 1 or end > line_count:
+            return False
+    return True
 
 
 def _occurrence_count(metadata: dict) -> int:
@@ -466,6 +584,7 @@ class SastPipeline:
         graphify_changed_node_count = 0
         graphify_changed_edge_count = 0
         graphify_invalidated_investigation_count = 0
+        graphify_prior_scan_findings = []
         context_builder = getattr(deep_hunt_agent, "build_repository_context", None)
         planner = getattr(deep_hunt_agent, "plan_tasks", None)
         discovery = getattr(deep_hunt_agent, "discover_candidates", None)
@@ -609,8 +728,27 @@ class SastPipeline:
                             graph_delta = graph_snapshot.difference(
                                 previous_graph.graph_snapshot
                             )
-                            previous_investigations = graph_persistence.list_for_scan(
-                                previous_graph.scan_id
+                            if (
+                                graphify_investigations
+                                and load_json("runtime/code_intelligence.json").get(
+                                    "reuse_unchanged_verified_findings", False
+                                )
+                                and graph_snapshot.snapshot_id
+                                == previous_graph.graph_snapshot.snapshot_id
+                            ):
+                                with unit_of_work(
+                                    self.session_factory, self.tenant_id
+                                ) as repository:
+                                    graphify_prior_scan_findings = (
+                                        repository.reusable_scan_findings(
+                                            previous_graph.scan_id,
+                                            codebase_id=codebase_id,
+                                            workflow_version=workflow_version,
+                                            context_scope_hash=context_scope_hash,
+                                        )
+                                    )
+                            previous_investigations = graph_persistence.list_for_snapshot(
+                                codebase_id, previous_graph.snapshot_id
                             )
                             invalidated_prior_investigation_ids = frozenset(
                                 affected_investigation_ids(
@@ -1140,6 +1278,8 @@ class SastPipeline:
         ai_consolidation_error = ""
         ai_consolidation_unexpected_failure = False
         pre_consolidation_findings = len(findings)
+        graphify_carried_forward_findings = 0
+        graphify_rejected_stale_report_snapshots = 0
         try:
             findings = consolidator(findings)
             for finding in findings:
@@ -1153,6 +1293,28 @@ class SastPipeline:
             ai_consolidation_error_type = type(exc).__name__
             ai_consolidation_error = str(exc)[:240]
             ai_consolidation_unexpected_failure = not isinstance(exc, AIStageError)
+        current_fingerprints = {finding.fingerprint for finding in findings}
+        for saved in graphify_prior_scan_findings:
+            report = saved.report_data
+            if report.get("fingerprint") in current_fingerprints:
+                continue
+            if not _saved_report_matches_graph(
+                report,
+                root=root,
+                graph_snapshot=graph_snapshot,
+                exclude=config.exclude,
+                max_file_bytes=config.max_file_bytes,
+            ):
+                graphify_rejected_stale_report_snapshots += 1
+                continue
+            try:
+                finding = _finding_from_saved_report(report, codebase)
+            except (KeyError, TypeError, ValueError):
+                graphify_rejected_stale_report_snapshots += 1
+                continue
+            findings.append(finding)
+            current_fingerprints.add(finding.fingerprint)
+            graphify_carried_forward_findings += 1
         findings.sort(
             key=lambda item: (
                 -item.priority_score,
@@ -1265,6 +1427,8 @@ class SastPipeline:
                     item.get("status") == "reused_no_candidate"
                     for item in graphify_hunt_results
                 ),
+                "graphify_verified_findings_carried_forward": graphify_carried_forward_findings,
+                "graphify_prior_report_snapshots_rejected": graphify_rejected_stale_report_snapshots,
                 "graphify_hunt_unresolved_obligations": sum(
                     int(item.get("unresolved_count", 0)) for item in graphify_hunt_results
                 ),
@@ -1457,23 +1621,24 @@ class SastPipeline:
                             "route_depth": finding.metadata.get("route_depth", ""),
                             "route_task_class": finding.metadata.get("route_task_class", ""),
                         }
-                        repository.save_finding(
-                            finding_id,
-                            codebase_id,
-                            scan_id,
-                            finding.fingerprint,
-                            finding.title,
-                            finding.vulnerability_class,
-                            finding.severity.value,
-                            finding.state.value,
-                            finding.confidence,
-                            finding.message,
-                            finding.impact,
-                            finding.remediation,
-                            validation_data,
-                            evidence,
-                            dependencies,
-                        )
+                        if not finding.metadata.get("carried_forward"):
+                            repository.save_finding(
+                                finding_id,
+                                codebase_id,
+                                scan_id,
+                                finding.fingerprint,
+                                finding.title,
+                                finding.vulnerability_class,
+                                finding.severity.value,
+                                finding.state.value,
+                                finding.confidence,
+                                finding.message,
+                                finding.impact,
+                                finding.remediation,
+                                validation_data,
+                                evidence,
+                                dependencies,
+                            )
                         repository.save_scan_finding(
                             scan_id=scan_id,
                             finding_id=finding_id,
