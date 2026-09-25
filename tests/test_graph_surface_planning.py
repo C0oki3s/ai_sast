@@ -4,11 +4,18 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.graph_context import GraphContextBroker
 from plaidnox_sast.graph_planner import GraphInvestigationPlanner
-from plaidnox_sast.graph_surface_planning import GraphSurfacePlanningCoordinator
+from plaidnox_sast.graph_surface_planning import (
+    GraphSurfacePlanningCoordinator,
+    InvestigationOrmStore,
+)
 from plaidnox_sast.graphify_adapter import CodeEdge, CodeGraphSnapshot, CodeNode
+from plaidnox_sast.persistence.models import Base
+from plaidnox_sast.persistence.repositories import unit_of_work
 
 
 def _snapshot(root: Path, *, connected: bool) -> CodeGraphSnapshot:
@@ -116,3 +123,72 @@ def test_coordinator_reports_oversized_connected_groups_without_ai_call(tmp_path
         == "connected_surface_group_exceeds_planner_target_bound"
     )
     assert len(result.planning_gaps[0].surface_keys) == 1
+
+
+def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Path):
+    snapshot = _snapshot(tmp_path, connected=True)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-a", "example/account", "Account")
+        repository.add_snapshot(
+            snapshot.snapshot_id,
+            "codebase-a",
+            "revision-a",
+            "tree-hash-a",
+            "context-v1",
+        )
+        repository.start_scan(
+            "scan-a", "codebase-a", snapshot.snapshot_id, "deep", "workflow-v1"
+        )
+
+    persistence = InvestigationOrmStore(factory, "tenant-a")
+    broker = GraphContextBroker(tmp_path, snapshot)
+    model_calls = []
+    planner = GraphInvestigationPlanner(
+        lambda payload: (
+            model_calls.append(payload)
+            or {
+                "reason": "Review account identity selection.",
+                "security_questions": ["Can another principal select this account?"],
+                "supporting_node_ids": [],
+                "supporting_edge_keys": [],
+                "coverage_notes": [],
+            }
+        )
+    )
+    coordinator = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot,
+            broker=broker,
+            repository_context={},
+            **arguments,
+        ),
+        persistence=persistence,
+    )
+    arguments = {
+        "codebase_id": "codebase-a",
+        "scan_id": "scan-a",
+        "repository_context": _context(snapshot),
+        "graph_snapshot": snapshot,
+    }
+
+    first = coordinator.plan(**arguments)
+    resumed = GraphSurfacePlanningCoordinator(
+        lambda **_arguments: pytest.fail("persisted investigation should be reused"),
+        persistence=persistence,
+    ).plan(**arguments)
+
+    assert len(model_calls) == 1
+    assert first.persisted_groups == 1
+    assert first.reused_groups == 0
+    assert resumed.persisted_groups == 0
+    assert resumed.reused_groups == 1
+    assert (
+        resumed.investigations[0].investigation_id
+        == first.investigations[0].investigation_id
+    )
+    assert (
+        resumed.investigations[0].evidence_hash == first.investigations[0].evidence_hash
+    )

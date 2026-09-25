@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.orm import Session, sessionmaker
+
 from .assets import load_json
 from .graph_targets import (
     GraphTargetInventory,
@@ -15,7 +17,12 @@ from .graph_targets import (
     map_repository_surfaces_to_graph,
 )
 from .graphify_adapter import CodeGraphSnapshot
-from .investigations import Investigation
+from .investigations import Investigation, validate_investigation
+from .persistence.repositories import (
+    InvestigationValue,
+    PersistenceConflictError,
+    unit_of_work,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +40,8 @@ class GraphSurfacePlanningResult:
     grouping: GraphTargetGrouping
     investigations: tuple[Investigation, ...]
     planning_gaps: tuple[GraphSurfacePlanningGap, ...]
+    reused_groups: int = 0
+    persisted_groups: int = 0
 
     @property
     def mapping_gap_count(self) -> int:
@@ -41,6 +50,22 @@ class GraphSurfacePlanningResult:
             and target.mapping_status is not GraphTargetMappingStatus.AMBIGUOUS
             for target in self.inventory.targets
         )
+
+
+class InvestigationOrmStore:
+    """Commit each completed planning unit through its own tenant ORM transaction."""
+
+    def __init__(self, factory: sessionmaker[Session], tenant_id: str) -> None:
+        self.factory = factory
+        self.tenant_id = tenant_id
+
+    def list_for_scan(self, scan_id: str) -> list[InvestigationValue]:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.list_investigations(scan_id)
+
+    def save(self, scan_id: str, investigation: Investigation) -> InvestigationValue:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.save_investigation(scan_id, investigation)
 
 
 class GraphSurfacePlanningCoordinator:
@@ -57,8 +82,10 @@ class GraphSurfacePlanningCoordinator:
         plan_group: Callable[..., Investigation],
         *,
         maximum_target_nodes: int | None = None,
+        persistence: InvestigationOrmStore | None = None,
     ) -> None:
         self.plan_group = plan_group
+        self.persistence = persistence
         runtime = load_json("runtime/code_intelligence.json")
         self.maximum_target_nodes = int(
             maximum_target_nodes
@@ -72,6 +99,7 @@ class GraphSurfacePlanningCoordinator:
         self,
         *,
         codebase_id: str,
+        scan_id: str | None = None,
         repository_context: Mapping[str, Any],
         graph_snapshot: CodeGraphSnapshot,
     ) -> GraphSurfacePlanningResult:
@@ -79,6 +107,22 @@ class GraphSurfacePlanningCoordinator:
         grouping = group_connected_graph_targets(inventory, graph_snapshot)
         investigations: list[Investigation] = []
         gaps: list[GraphSurfacePlanningGap] = []
+        reused_groups = 0
+        persisted_groups = 0
+        existing_by_stable_key: dict[str, InvestigationValue] = {}
+        if self.persistence is not None:
+            if not scan_id:
+                raise ValueError(
+                    "scan_id is required when investigation persistence is configured"
+                )
+            for existing in self.persistence.list_for_scan(scan_id):
+                if existing.snapshot_id != graph_snapshot.snapshot_id:
+                    continue
+                if existing.stable_key in existing_by_stable_key:
+                    raise PersistenceConflictError(
+                        "multiple stored investigation versions share one surface group and snapshot"
+                    )
+                existing_by_stable_key[existing.stable_key] = existing
         for group in grouping.groups:
             if len(group.node_ids) > self.maximum_target_nodes:
                 gaps.append(
@@ -90,18 +134,63 @@ class GraphSurfacePlanningCoordinator:
                     )
                 )
                 continue
-            investigations.append(
-                self.plan_group(
-                    codebase_id=codebase_id,
-                    target_node_ids=group.node_ids,
-                    surface_context=group.surface_context,
-                    stable_key=group.group_id,
-                )
+            existing = existing_by_stable_key.get(group.group_id)
+            if existing is not None:
+                investigation = _restore_investigation(existing)
+                if investigation.codebase_id != codebase_id:
+                    raise PersistenceConflictError(
+                        "stored investigation belongs to another codebase"
+                    )
+                investigations.append(investigation)
+                reused_groups += 1
+                continue
+            investigation = self.plan_group(
+                codebase_id=codebase_id,
+                target_node_ids=group.node_ids,
+                surface_context=group.surface_context,
+                stable_key=group.group_id,
             )
+            if investigation.stable_key != group.group_id:
+                raise PersistenceConflictError(
+                    "planner returned an investigation for a different graph surface group"
+                )
+            if self.persistence is not None:
+                assert scan_id is not None
+                self.persistence.save(scan_id, investigation)
+                persisted_groups += 1
+            investigations.append(investigation)
         return GraphSurfacePlanningResult(
             snapshot_id=graph_snapshot.snapshot_id,
             inventory=inventory,
             grouping=grouping,
             investigations=tuple(investigations),
             planning_gaps=tuple(gaps),
+            reused_groups=reused_groups,
+            persisted_groups=persisted_groups,
         )
+
+
+def _restore_investigation(value: InvestigationValue) -> Investigation:
+    data = dict(value.investigation_data)
+    for field in (
+        "security_questions",
+        "graph_refs",
+        "source_windows",
+        "context_dependencies",
+        "coverage_notes",
+        "prior_evidence_refs",
+    ):
+        data[field] = tuple(data[field])
+    investigation = Investigation(**data)
+    validate_investigation(investigation)
+    if (
+        investigation.investigation_id != value.investigation_id
+        or investigation.snapshot_id != value.snapshot_id
+        or investigation.stable_key != value.stable_key
+        or investigation.evidence_hash != value.evidence_hash
+        or investigation.state != value.state
+    ):
+        raise PersistenceConflictError(
+            "stored investigation row conflicts with its payload"
+        )
+    return investigation
