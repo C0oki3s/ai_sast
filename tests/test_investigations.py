@@ -120,3 +120,4 @@ def test_investigation_schema_is_a_deployable_orm_table():
     Base.metadata.create_all(engine)
 
     assert "code_scanning_investigations" in Base.metadata.tables
+    assert "code_scanning_surface_plans" in Base.metadata.tables

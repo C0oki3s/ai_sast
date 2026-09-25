@@ -21,6 +21,7 @@ from .investigations import Investigation, validate_investigation
 from .persistence.repositories import (
     InvestigationValue,
     PersistenceConflictError,
+    SurfacePlanningValue,
     unit_of_work,
 )
 
@@ -66,6 +67,18 @@ class InvestigationOrmStore:
     def save(self, scan_id: str, investigation: Investigation) -> InvestigationValue:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.save_investigation(scan_id, investigation)
+
+    def save_surface_plan(
+        self, scan_id: str, snapshot_id: str, planning_data: dict[str, Any]
+    ) -> SurfacePlanningValue:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.save_surface_planning(scan_id, snapshot_id, planning_data)
+
+    def complete_surface_plan(
+        self, scan_id: str, snapshot_id: str
+    ) -> SurfacePlanningValue:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.complete_surface_planning(scan_id, snapshot_id)
 
 
 class GraphSurfacePlanningCoordinator:
@@ -123,6 +136,11 @@ class GraphSurfacePlanningCoordinator:
                         "multiple stored investigation versions share one surface group and snapshot"
                     )
                 existing_by_stable_key[existing.stable_key] = existing
+            self.persistence.save_surface_plan(
+                scan_id,
+                graph_snapshot.snapshot_id,
+                _surface_plan_data(inventory, grouping, self.maximum_target_nodes),
+            )
         for group in grouping.groups:
             if len(group.node_ids) > self.maximum_target_nodes:
                 gaps.append(
@@ -159,6 +177,9 @@ class GraphSurfacePlanningCoordinator:
                 self.persistence.save(scan_id, investigation)
                 persisted_groups += 1
             investigations.append(investigation)
+        if self.persistence is not None:
+            assert scan_id is not None
+            self.persistence.complete_surface_plan(scan_id, graph_snapshot.snapshot_id)
         return GraphSurfacePlanningResult(
             snapshot_id=graph_snapshot.snapshot_id,
             inventory=inventory,
@@ -194,3 +215,57 @@ def _restore_investigation(value: InvestigationValue) -> Investigation:
             "stored investigation row conflicts with its payload"
         )
     return investigation
+
+
+def _surface_plan_data(
+    inventory: GraphTargetInventory,
+    grouping: GraphTargetGrouping,
+    maximum_target_nodes: int,
+) -> dict[str, Any]:
+    oversized_group_ids = {
+        group.group_id
+        for group in grouping.groups
+        if len(group.node_ids) > maximum_target_nodes
+    }
+    return {
+        "schema_version": 1,
+        "snapshot_id": inventory.snapshot_id,
+        "maximum_target_nodes": maximum_target_nodes,
+        "mapping_counts": inventory.mapping_counts,
+        "surface_targets": [
+            {
+                "surface_key": target.surface_key,
+                "collection": target.collection,
+                "label": target.label,
+                "mapping_status": target.mapping_status.value,
+                "node_ids": list(target.node_ids),
+                "source_locations": list(target.source_locations),
+                "gap_reason": target.gap_reason,
+            }
+            for target in inventory.targets
+        ],
+        "groups": [
+            {
+                "group_id": group.group_id,
+                "surface_keys": list(group.surface_keys),
+                "node_ids": list(group.node_ids),
+                "planning_status": (
+                    "gap"
+                    if group.group_id in oversized_group_ids
+                    else "eligible_for_planning"
+                ),
+            }
+            for group in grouping.groups
+        ],
+        "unmapped_surface_keys": list(grouping.unmapped_surface_keys),
+        "planning_gaps": [
+            {
+                "group_id": group.group_id,
+                "surface_keys": list(group.surface_keys),
+                "node_ids": list(group.node_ids),
+                "reason": "connected_surface_group_exceeds_planner_target_bound",
+            }
+            for group in grouping.groups
+            if group.group_id in oversized_group_ids
+        ],
+    }

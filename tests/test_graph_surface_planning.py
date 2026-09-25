@@ -159,21 +159,39 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
             }
         )
     )
-    coordinator = GraphSurfacePlanningCoordinator(
-        lambda **arguments: planner.plan_targets(
+    fail_before_first_plan = True
+
+    def plan_group(**arguments):
+        nonlocal fail_before_first_plan
+        if fail_before_first_plan:
+            fail_before_first_plan = False
+            raise RuntimeError("synthetic planner interruption")
+        return planner.plan_targets(
             snapshot=snapshot,
             broker=broker,
             repository_context={},
             **arguments,
-        ),
+        )
+
+    coordinator = GraphSurfacePlanningCoordinator(
+        plan_group,
         persistence=persistence,
     )
     arguments = {
         "codebase_id": "codebase-a",
         "scan_id": "scan-a",
-        "repository_context": _context(snapshot),
+        "repository_context": _context(snapshot, include_unmapped=True),
         "graph_snapshot": snapshot,
     }
+
+    with pytest.raises(RuntimeError, match="synthetic planner interruption"):
+        coordinator.plan(**arguments)
+    with unit_of_work(factory, "tenant-a") as repository:
+        interrupted = repository.get_surface_planning("scan-a")
+    assert interrupted is not None
+    assert interrupted.state == "planning"
+    assert interrupted.planning_data["mapping_counts"]["no_location"] == 1
+    assert len(interrupted.planning_data["unmapped_surface_keys"]) == 1
 
     first = coordinator.plan(**arguments)
     resumed = GraphSurfacePlanningCoordinator(
@@ -184,6 +202,12 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     assert len(model_calls) == 1
     assert first.persisted_groups == 1
     assert first.reused_groups == 0
+    with unit_of_work(factory, "tenant-a") as repository:
+        completed = repository.get_surface_planning("scan-a")
+    assert completed is not None
+    assert completed.state == "complete"
+    assert completed.revision == 2
+    assert completed.planning_data == interrupted.planning_data
     assert resumed.persisted_groups == 0
     assert resumed.reused_groups == 1
     assert (

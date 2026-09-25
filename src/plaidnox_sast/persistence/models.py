@@ -539,6 +539,36 @@ class InvestigationRecord(TimestampMixin, Base):
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class SurfacePlanningRecord(TimestampMixin, Base):
+    """Durable mapping/grouping ledger, including explicit planning gaps."""
+
+    __tablename__ = "code_scanning_surface_plans"
+    __table_args__ = (
+        Index(
+            "ix_code_scanning_surface_plan_tenant_snapshot",
+            "tenant_id",
+            "snapshot_id",
+        ),
+        CheckConstraint(
+            "revision > 0 AND state IN ('planning', 'complete')",
+            name="ck_code_scanning_surface_plan_state_revision",
+        ),
+    )
+
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="planning")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    planning_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
 class KnowledgeUsageRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_knowledge_usage"
     __table_args__ = (Index("ix_code_scanning_knowledge_usage_task", "scan_id", "task_id"),)

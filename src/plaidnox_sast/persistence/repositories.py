@@ -40,6 +40,7 @@ from .models import (
     SecurityKnowledgeRecord,
     SecurityMemoryRecord,
     SnapshotRecord,
+    SurfacePlanningRecord,
     SourceFileRecord,
     SymbolSummaryRecord,
     SymbolRecord,
@@ -274,6 +275,16 @@ class InvestigationValue:
     checkpoint_ref: str | None
     revision: int
     attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SurfacePlanningValue:
+    scan_id: str
+    tenant_id: str
+    snapshot_id: str
+    state: str
+    revision: int
+    planning_data: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1952,6 +1963,76 @@ class CodeScanningRepository:
         ).all()
         return [_investigation_value(row) for row in rows]
 
+    def save_surface_planning(
+        self, scan_id: str, snapshot_id: str, planning_data: dict[str, Any]
+    ) -> SurfacePlanningValue:
+        """Persist the immutable surface mapping/grouping ledger before AI planning."""
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None or scan.snapshot_id != snapshot_id:
+            raise PersistenceConflictError(
+                "surface planning scan/snapshot is outside the tenant scope"
+            )
+        existing = self.session.scalar(
+            select(SurfacePlanningRecord).where(
+                SurfacePlanningRecord.scan_id == scan_id,
+                SurfacePlanningRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if existing is not None:
+            if (
+                existing.snapshot_id != snapshot_id
+                or existing.planning_data != planning_data
+            ):
+                raise PersistenceConflictError(
+                    "surface planning identity has conflicting snapshot or coverage data"
+                )
+            return _surface_planning_value(existing)
+        record = SurfacePlanningRecord(
+            scan_id=scan_id,
+            tenant_id=self.tenant_id,
+            snapshot_id=snapshot_id,
+            state="planning",
+            revision=1,
+            planning_data=planning_data,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return _surface_planning_value(record)
+
+    def complete_surface_planning(
+        self, scan_id: str, snapshot_id: str
+    ) -> SurfacePlanningValue:
+        """Mark the persisted grouping ledger complete after every bounded unit resolves."""
+        record = self.session.scalar(
+            select(SurfacePlanningRecord).where(
+                SurfacePlanningRecord.scan_id == scan_id,
+                SurfacePlanningRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None or record.snapshot_id != snapshot_id:
+            raise PersistenceConflictError(
+                "surface planning record does not exist for this tenant snapshot"
+            )
+        if record.state == "planning":
+            record.state = "complete"
+            record.revision += 1
+            self.session.flush()
+        return _surface_planning_value(record)
+
+    def get_surface_planning(self, scan_id: str) -> SurfacePlanningValue | None:
+        record = self.session.scalar(
+            select(SurfacePlanningRecord).where(
+                SurfacePlanningRecord.scan_id == scan_id,
+                SurfacePlanningRecord.tenant_id == self.tenant_id,
+            )
+        )
+        return _surface_planning_value(record) if record is not None else None
+
     def lease_next_task(
         self,
         plan_id: str,
@@ -2571,4 +2652,15 @@ def _investigation_value(record: InvestigationRecord) -> InvestigationValue:
         checkpoint_ref=record.checkpoint_ref,
         revision=record.revision,
         attempt_count=record.attempt_count,
+    )
+
+
+def _surface_planning_value(record: SurfacePlanningRecord) -> SurfacePlanningValue:
+    return SurfacePlanningValue(
+        scan_id=record.scan_id,
+        tenant_id=record.tenant_id,
+        snapshot_id=record.snapshot_id,
+        state=record.state,
+        revision=record.revision,
+        planning_data=dict(record.planning_data),
     )

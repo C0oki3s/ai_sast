@@ -8,6 +8,7 @@
     "migrations/postgresql/0004_symbol_summaries.sql",
     "migrations/postgresql/0005_sparse_overlay_summaries.sql",
     "migrations/postgresql/0006_investigations.sql",
-    "migrations/postgresql/0007_scan_finding_reports.sql"
+    "migrations/postgresql/0007_scan_finding_reports.sql",
+    "migrations/postgresql/0008_graph_surface_planning.sql"
   ]
 }
