@@ -247,8 +247,11 @@ trigger another model call. Source excerpts are rechecked against the current
 snapshot and redaction output before every model request. Context request yield,
 continuation count, and characters are reported. Typed request-to-graph mappings
 live in `runtime/graph_context_queries.json`, separate from resolver execution.
-Durable replay of the final
-disposition remains follow-on work. An unresolved question or failed execution remains visible in
+The validated aggregate candidate/disposition result is also checkpointed per
+investigation identity and evidence hash; it replays without graph queries or
+model calls, then transitions the current scan's ORM lifecycle independently.
+Failed or contract-invalid investigations do not write this result checkpoint.
+An unresolved question or failed execution remains visible in
 coverage and makes an opt-in Graphify investigation run incomplete. Tests are
 in `tests/test_graph_investigation_hunt.py`, `tests/test_graph_planner.py`,
 `tests/test_graph_surface_planning.py`, and `tests/test_pipeline.py`. Switch the

@@ -11,6 +11,7 @@ from plaidnox_sast.ai import AIResponseError, PlaidNoxDeepHuntAgent
 from plaidnox_sast.graph_context import GraphContextBroker
 from plaidnox_sast.graphify_adapter import normalize_extraction
 from plaidnox_sast.investigations import build_investigation
+from plaidnox_sast.checkpoint import ScanCheckpoint
 
 
 def _investigation(root: Path):
@@ -98,6 +99,8 @@ def _candidate(path="handler.py", start=1, end=2):
 
 def _agent(response):
     agent = PlaidNoxDeepHuntAgent.__new__(PlaidNoxDeepHuntAgent)
+    agent.checkpoint = None
+    agent.event_sink = None
     observed = {}
     responses = list(response) if isinstance(response, list) else [response]
 
@@ -307,3 +310,25 @@ def test_graph_investigation_rejects_tampered_stored_excerpt(tmp_path: Path):
     with pytest.raises(AIResponseError, match="does not match its source"):
         agent.hunt_graph_investigation(tmp_path, tampered)
     assert not observed
+
+
+def test_graph_investigation_checkpoint_replays_validated_result_without_model_call(tmp_path: Path):
+    investigation = _investigation(tmp_path)
+    checkpoint = ScanCheckpoint(tmp_path / "scan.sqlite", "snapshot-and-prompt-scope")
+    agent, observed = _agent(_answer(investigation))
+    agent.configure_checkpoint(checkpoint)
+
+    candidates, first = agent.hunt_graph_investigation(tmp_path, investigation)
+
+    assert candidates == []
+    assert first["checkpoint_saved"] is True
+    assert len(observed["round_payloads"]) == 1
+    agent._structured_response = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("a completed investigation must replay without an LLM call")
+    )
+
+    replayed_candidates, replayed = agent.hunt_graph_investigation(tmp_path, investigation)
+
+    assert replayed_candidates == []
+    assert replayed["checkpoint_reused"] is True
+    assert replayed["obligation_results"] == first["obligation_results"]

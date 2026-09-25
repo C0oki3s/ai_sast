@@ -1153,6 +1153,12 @@ class SastPipeline:
                 "graphify_hunt_context_characters": sum(
                     int(item.get("context_characters", 0)) for item in graphify_hunt_results
                 ),
+                "graphify_hunt_checkpoint_reused": sum(
+                    bool(item.get("checkpoint_reused", False)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_checkpoint_saved": sum(
+                    bool(item.get("checkpoint_saved", False)) for item in graphify_hunt_results
+                ),
                 "graphify_hunt_results": graphify_hunt_results,
                 "graphify_shadow_error_type": graphify_shadow_error_type,
                 "graphify_shadow_error": graphify_shadow_error,

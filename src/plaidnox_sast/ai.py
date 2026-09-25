@@ -1224,6 +1224,30 @@ class PlaidNoxDeepHuntAgent:
         for window in investigation.source_windows:
             source_windows.append(_validate_graph_investigation_window(root, window))
 
+        checkpoint_key = unit_key(
+            "graphify_investigation_hunt_v1",
+            investigation.investigation_id,
+            investigation.evidence_hash,
+            investigation.graph_snapshot_id,
+        )
+        if self.checkpoint is not None:
+            saved = self.checkpoint.get("graphify_investigation_hunt", checkpoint_key)
+            if saved is not None:
+                if (
+                    saved.get("investigation_id") != investigation.investigation_id
+                    or saved.get("evidence_hash") != investigation.evidence_hash
+                ):
+                    raise AIResponseError("Checkpointed Graphify hunt does not match its investigation identity")
+                candidates = [candidate_from_dict(item) for item in saved["candidates"]]
+                disposition = dict(saved["disposition"])
+                disposition["checkpoint_reused"] = True
+                self._emit(
+                    "graph_investigation_checkpoint_reused",
+                    investigation_id=investigation.investigation_id,
+                    candidates=len(candidates),
+                )
+                return candidates, disposition
+
         if not investigation.security_questions:
             raise AIResponseError("Graphify investigation has no security questions")
         obligation_ids = [f"{investigation.investigation_id}:q{index:03d}" for index, _ in enumerate(investigation.security_questions, 1)]
@@ -1417,7 +1441,7 @@ class PlaidNoxDeepHuntAgent:
                 )[:1600]
                 item["context_requests"] = []
         obligations = [final_by_id[item] for item in obligation_ids]
-        return all_candidates, {
+        disposition = {
             "investigation_id": investigation.investigation_id,
             "obligation_results": obligations,
             "candidate_count": len(all_candidates),
@@ -1429,7 +1453,22 @@ class PlaidNoxDeepHuntAgent:
             "continuation_calls": continuation_calls,
             "context_truncated": context_truncated,
             "context_characters": context_characters,
+            "checkpoint_reused": False,
+            "checkpoint_saved": False,
         }
+        if self.checkpoint is not None:
+            disposition["checkpoint_saved"] = True
+            self.checkpoint.put(
+                "graphify_investigation_hunt",
+                checkpoint_key,
+                {
+                    "investigation_id": investigation.investigation_id,
+                    "evidence_hash": investigation.evidence_hash,
+                    "candidates": [candidate_to_dict(item) for item in all_candidates],
+                    "disposition": disposition,
+                },
+            )
+        return all_candidates, disposition
 
     def discover_candidates(
         self,
