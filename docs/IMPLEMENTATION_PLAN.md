@@ -240,10 +240,15 @@ verdict. Investigation execution remains opt-in with
 When PostgreSQL persistence is configured, investigation lifecycle transitions
 are compare-and-swap persisted (`planned → running → candidate/no_candidate/
 unresolved/failed`). Structured discovery responses use the existing LiteLLM
-response checkpoint, so completed calls replay without provider calls. The
-current graph investigation discovery is one request per investigation; typed
-Graphify context expansion and durable replay of the final disposition are the
-next follow-on. An unresolved question or failed execution remains visible in
+response checkpoint, so completed calls replay without provider calls. Typed
+Graphify context expansion is bounded to one delta continuation, at most three
+requests and a configured source-character budget; repeat/empty context cannot
+trigger another model call. Source excerpts are rechecked against the current
+snapshot and redaction output before every model request. Context request yield,
+continuation count, and characters are reported. Typed request-to-graph mappings
+live in `runtime/graph_context_queries.json`, separate from resolver execution.
+Durable replay of the final
+disposition remains follow-on work. An unresolved question or failed execution remains visible in
 coverage and makes an opt-in Graphify investigation run incomplete. Tests are
 in `tests/test_graph_investigation_hunt.py`, `tests/test_graph_planner.py`,
 `tests/test_graph_surface_planning.py`, and `tests/test_pipeline.py`. Switch the

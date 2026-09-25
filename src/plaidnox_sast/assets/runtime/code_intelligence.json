@@ -24,6 +24,12 @@
   "maximum_planner_target_nodes": 12,
   "maximum_planner_input_characters": 80000,
   "maximum_planner_output_tokens": 2500,
+  "maximum_investigation_context_rounds": 1,
+  "maximum_investigation_context_requests": 3,
+  "investigation_context_lines_before": 6,
+  "investigation_context_lines_after": 12,
+  "maximum_investigation_context_results": 8,
+  "maximum_investigation_context_characters": 32000,
   "maximum_compact_context_items_per_section": 80,
   "audited_source_payload_keys": [
     "content",

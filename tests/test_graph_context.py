@@ -74,3 +74,32 @@ def test_graph_broker_reports_truncation_without_claiming_completeness(tmp_path:
 
     assert result.truncated
     assert len(result.edges) == 1
+
+
+def test_graph_broker_resolves_typed_call_context_with_provenance_and_source(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    broker = GraphContextBroker(tmp_path, snapshot)
+
+    result = broker.resolve_request(
+        {"kind": "callees", "symbol": "entry()", "path": "service.py"}
+    )
+
+    assert [node["label"] for node in result["nodes"]] == ["effect()"]
+    assert result["edges"][0]["relation"] == "calls"
+    assert result["edges"][0]["provenance"] == "AMBIGUOUS"
+    assert result["edges"][0]["edge_id"]
+    assert result["source_windows"][0]["path"] == "service.py"
+    assert result["source_windows"][0]["content_hash"] == snapshot.source_hashes["service.py"]
+
+
+def test_graph_broker_does_not_claim_evidence_for_unmatched_typed_request(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    broker = GraphContextBroker(tmp_path, snapshot)
+
+    result = broker.resolve_request(
+        {"kind": "callers", "symbol": "missing()", "path": "service.py"}
+    )
+
+    assert result["nodes"] == []
+    assert result["edges"] == []
+    assert result["source_windows"] == []

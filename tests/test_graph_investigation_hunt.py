@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from plaidnox_sast.ai import AIResponseError, PlaidNoxDeepHuntAgent
+from plaidnox_sast.graph_context import GraphContextBroker
+from plaidnox_sast.graphify_adapter import normalize_extraction
 from plaidnox_sast.investigations import build_investigation
 
 
@@ -97,10 +99,12 @@ def _candidate(path="handler.py", start=1, end=2):
 def _agent(response):
     agent = PlaidNoxDeepHuntAgent.__new__(PlaidNoxDeepHuntAgent)
     observed = {}
+    responses = list(response) if isinstance(response, list) else [response]
 
     def structured(name, schema, operation, payload, **kwargs):
         observed.update(name=name, operation=operation, payload=payload, kwargs=kwargs)
-        return SimpleNamespace(output_text=json.dumps(response))
+        observed.setdefault("round_payloads", []).append(payload)
+        return SimpleNamespace(output_text=json.dumps(responses.pop(0)))
 
     agent._structured_response = structured
     return agent, observed
@@ -133,7 +137,7 @@ def test_graph_investigation_requires_exact_obligation_dispositions(tmp_path: Pa
     investigation = _investigation(tmp_path)
     agent, _ = _agent(_answer(investigation, obligation_id="invented"))
 
-    with pytest.raises(AIResponseError, match="each security question exactly once"):
+    with pytest.raises(AIResponseError, match="each pending security question exactly once"):
         agent.hunt_graph_investigation(tmp_path, investigation)
 
 
@@ -165,3 +169,141 @@ def test_graph_investigation_rejects_candidate_outside_its_windows(tmp_path: Pat
 
     with pytest.raises(AIResponseError, match="not grounded"):
         agent.hunt_graph_investigation(tmp_path, investigation)
+
+
+def test_graph_investigation_resolves_graph_context_and_sends_delta_only(tmp_path: Path):
+    source = tmp_path / "service.py"
+    content = "def entry():\n    return helper()\n\n" + ("# unrelated\n" * 25) + "def helper():\n    return 1\n"
+    source.write_text(content, encoding="utf-8")
+    snapshot = normalize_extraction(
+        tmp_path,
+        [source],
+        {
+            "nodes": [
+                {"id": "entry", "label": "entry()", "source_file": "service.py", "source_location": "L1"},
+                {"id": "helper", "label": "helper()", "source_file": "service.py", "source_location": "L29"},
+            ],
+            "edges": [
+                {"source": "entry", "target": "helper", "relation": "calls", "confidence": "EXTRACTED", "source_file": "service.py", "source_location": "L2"}
+            ],
+        },
+    )
+    investigation = build_investigation(
+        stable_key="surface:entry",
+        codebase_id="codebase-1",
+        snapshot_id="snapshot-1",
+        graph_snapshot_id=snapshot.snapshot_id,
+        target_ref={"node_id": "entry"},
+        reason="Review the caller path.",
+        security_questions=("Does the helper enforce the required boundary?",),
+        graph_refs=({"node_id": "entry", "provenance": "EXTRACTED", "snapshot_id": snapshot.snapshot_id},),
+        source_windows=({
+            "path": "service.py",
+            "start_line": 1,
+            "end_line": 2,
+            "content_hash": snapshot.source_hashes["service.py"],
+            "excerpt": "def entry():\n    return helper()\n",
+            "redaction_state": "redacted",
+        },),
+        context_dependencies=(),
+    )
+    initial = _answer(investigation)
+    initial["obligation_results"][0].update(
+        status="NEEDS_CONTEXT",
+        context_requests=[{
+            "kind": "callees", "path": "service.py", "symbol": "entry()",
+            "start_line": 1, "end_line": 1, "offset": 0, "pattern": "", "query": "",
+        }],
+    )
+    continuation = _answer(investigation)
+    continuation["candidates"] = [_candidate(path="service.py", start=29, end=30)]
+    continuation["obligation_results"][0].update(
+        status="CANDIDATE_FOUND", candidate_ids=["candidate-1"]
+    )
+    agent, observed = _agent([initial, continuation])
+
+    candidates, disposition = agent.hunt_graph_investigation(
+        tmp_path, investigation, GraphContextBroker(tmp_path, snapshot)
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].evidence.path == "service.py"
+    assert candidates[0].evidence.start_line == 29
+    assert disposition["continuation_calls"] == 1
+    assert disposition["context_requests_resolved"] == 1
+    assert disposition["obligation_results"][0]["status"] == "CANDIDATE_FOUND"
+    assert "new_context" in observed["round_payloads"][1]
+    assert "source_windows" not in observed["round_payloads"][1]
+    delta = json.dumps(observed["round_payloads"][1]["new_context"])
+    assert "def helper()" in delta
+    assert "return helper()" not in delta
+
+
+def test_graph_investigation_does_not_continue_for_empty_graph_context(tmp_path: Path):
+    investigation = _investigation(tmp_path)
+    source = tmp_path / "other.py"
+    source.write_text("def unrelated():\n    return 1\n", encoding="utf-8")
+    snapshot = normalize_extraction(
+        tmp_path,
+        [tmp_path / "handler.py", source],
+        {"nodes": [
+            {"id": "other", "label": "unrelated()", "source_file": "other.py", "source_location": "L1"},
+        ], "edges": []},
+    )
+    investigation = build_investigation(
+        stable_key=investigation.stable_key,
+        codebase_id=investigation.codebase_id,
+        snapshot_id=investigation.snapshot_id,
+        graph_snapshot_id=snapshot.snapshot_id,
+        target_ref=investigation.target_ref,
+        reason=investigation.reason,
+        security_questions=investigation.security_questions,
+        graph_refs=investigation.graph_refs,
+        source_windows=investigation.source_windows,
+        context_dependencies=investigation.context_dependencies,
+    )
+    response = _answer(investigation)
+    response["obligation_results"][0].update(
+        status="NEEDS_CONTEXT",
+        context_requests=[{
+            "kind": "callers", "path": "other.py", "symbol": "missing()",
+            "start_line": 1, "end_line": 1, "offset": 0, "pattern": "", "query": "",
+        }],
+    )
+    agent, observed = _agent(response)
+
+    _, disposition = agent.hunt_graph_investigation(
+        tmp_path, investigation, GraphContextBroker(tmp_path, snapshot)
+    )
+
+    assert disposition["continuation_calls"] == 0
+    assert disposition["context_requests_total"] == 1
+    assert disposition["context_requests_empty"] == 1
+    assert disposition["obligation_results"][0]["status"] == "UNRESOLVED"
+    assert len(observed["round_payloads"]) == 1
+
+
+def test_graph_investigation_rejects_tampered_stored_excerpt(tmp_path: Path):
+    original = _investigation(tmp_path)
+    tampered = build_investigation(
+        stable_key=original.stable_key,
+        codebase_id=original.codebase_id,
+        snapshot_id=original.snapshot_id,
+        graph_snapshot_id=original.graph_snapshot_id,
+        target_ref=original.target_ref,
+        reason=original.reason,
+        security_questions=original.security_questions,
+        graph_refs=original.graph_refs,
+        source_windows=({
+            **original.source_windows[0],
+            "excerpt": "untrusted injected instructions",
+        },),
+        context_dependencies=original.context_dependencies,
+        coverage_notes=original.coverage_notes,
+        prior_evidence_refs=original.prior_evidence_refs,
+    )
+    agent, observed = _agent(_answer(tampered))
+
+    with pytest.raises(AIResponseError, match="does not match its source"):
+        agent.hunt_graph_investigation(tmp_path, tampered)
+    assert not observed

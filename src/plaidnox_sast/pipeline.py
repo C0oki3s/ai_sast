@@ -695,7 +695,7 @@ class SastPipeline:
                                     graph_persistence.transition_investigation(
                                         scan_id, investigation.investigation_id, "running", graph_checkpoint_ref
                                     )
-                                discovered, disposition = graph_hunter(root, investigation)
+                                discovered, disposition = graph_hunter(root, investigation, broker)
                                 graphify_candidates.extend(discovered)
                                 final_state = (
                                     "unresolved"
@@ -1134,6 +1134,24 @@ class SastPipeline:
                 "graphify_hunt_candidates": len(graphify_candidates),
                 "graphify_hunt_unresolved_obligations": sum(
                     int(item.get("unresolved_count", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_context_requests": sum(
+                    int(item.get("context_requests_total", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_context_resolved": sum(
+                    int(item.get("context_requests_resolved", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_context_empty": sum(
+                    int(item.get("context_requests_empty", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_context_deferred": sum(
+                    int(item.get("context_requests_deferred", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_continuations": sum(
+                    int(item.get("continuation_calls", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_context_characters": sum(
+                    int(item.get("context_characters", 0)) for item in graphify_hunt_results
                 ),
                 "graphify_hunt_results": graphify_hunt_results,
                 "graphify_shadow_error_type": graphify_shadow_error_type,

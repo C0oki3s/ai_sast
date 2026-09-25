@@ -17,6 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
 
+from jsonschema import Draft202012Validator
+
 from .assets import load_json
 from .cache_telemetry import LiteLLMCacheTelemetry
 from .context_fabric import ContextFabric, PreparedContext
@@ -1205,7 +1207,10 @@ class PlaidNoxDeepHuntAgent:
         return investigation
 
     def hunt_graph_investigation(
-        self, root: Path, investigation: Investigation
+        self,
+        root: Path,
+        investigation: Investigation,
+        context_broker: GraphContextBroker | None = None,
     ) -> tuple[list[Candidate], dict[str, Any]]:
         """Review one immutable Graphify investigation and return grounded hypotheses.
 
@@ -1217,106 +1222,213 @@ class PlaidNoxDeepHuntAgent:
         validate_investigation(investigation)
         source_windows: list[dict[str, Any]] = []
         for window in investigation.source_windows:
-            relative = Path(str(window["path"]))
-            target = (root / relative).resolve()
-            if root.resolve() not in target.parents or not target.is_file():
-                raise AIResponseError("Graphify investigation source window is outside the repository")
-            try:
-                source = target.read_bytes()
-            except OSError as exc:
-                raise AIResponseError("Graphify investigation source window is unavailable") from exc
-            if hashlib.sha256(source).hexdigest() != str(window["content_hash"]):
-                raise AIResponseError("Graphify investigation source window is stale")
-            lines = source.decode("utf-8", errors="replace").splitlines()
-            start, end = int(window["start_line"]), int(window["end_line"])
-            if start < 1 or end < start or end > len(lines):
-                raise AIResponseError("Graphify investigation source window has invalid line bounds")
-            source_windows.append({
-                "path": str(window["path"]),
-                "start_line": start,
-                "end_line": end,
-                "content_hash": str(window["content_hash"]),
-                "excerpt": str(window["excerpt"]),
-                "redaction_state": str(window["redaction_state"]),
-            })
+            source_windows.append(_validate_graph_investigation_window(root, window))
 
         if not investigation.security_questions:
             raise AIResponseError("Graphify investigation has no security questions")
         obligation_ids = [f"{investigation.investigation_id}:q{index:03d}" for index, _ in enumerate(investigation.security_questions, 1)]
-        payload = {
-            "investigation": investigation.payload(),
-            "obligations": [
-                {"obligation_id": obligation_id, "question": question}
-                for obligation_id, question in zip(obligation_ids, investigation.security_questions, strict=True)
-            ],
-            "source_windows": source_windows,
-        }
-        response = self._structured_response(
-            "plaidnox_graph_investigation_hunt",
-            load_json("schemas/vulnerability_discovery.json"),
-            "graph_investigation_hunt",
-            payload,
-            model_tier=ModelTier.STANDARD,
-        )
-        try:
-            result = dict(response_json(response))
-        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AIResponseError(f"Graphify investigation response was not valid structured JSON: {_schema_failure(exc)}") from exc
+        question_by_id = dict(zip(obligation_ids, investigation.security_questions, strict=True))
+        rounds = int(load_json("runtime/code_intelligence.json")["maximum_investigation_context_rounds"])
+        maximum_requests = int(load_json("runtime/code_intelligence.json")["maximum_investigation_context_requests"])
+        prior_refs = {str(item.get("edge_id")) for item in investigation.graph_refs if item.get("edge_id")}
+        known_windows = {_graph_window_identity(item) for item in source_windows}
+        final_by_id: dict[str, dict[str, Any]] = {}
+        all_candidates: list[Candidate] = []
+        candidate_ids: set[str] = set()
+        context_requests_total = 0
+        context_requests_resolved = 0
+        context_requests_empty = 0
+        context_requests_deferred = 0
+        continuation_calls = 0
+        context_truncated = False
+        context_characters = 0
+        maximum_context_characters = int(load_json("runtime/code_intelligence.json")["maximum_investigation_context_characters"])
 
-        obligations = result.get("obligation_results", [])
-        observed_ids = [str(item.get("obligation_id", "")) for item in obligations if isinstance(item, dict)]
-        if len(observed_ids) != len(obligation_ids) or set(observed_ids) != set(obligation_ids):
-            raise AIResponseError("Graphify investigation response did not disposition each security question exactly once")
-        candidate_items = result.get("candidates", [])
-        candidates: list[Candidate] = []
-        for item in candidate_items:
-            if not isinstance(item, dict):
-                raise AIResponseError("Graphify investigation candidate was malformed")
-            segment = {
-                "path": "",
-                "start_line": 0,
-                "end_line": 0,
-            }
-            candidate = _candidate_from_ai_item(
-                root,
-                item,
-                segment,
-                allowed_source_windows=source_windows,
+        def review_round(*, pending_ids: list[str], evidence_windows: list[dict[str, Any]], delta: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[Candidate]]:
+            obligations_payload = [
+                {"obligation_id": item, "question": question_by_id[item]}
+                for item in pending_ids
+            ]
+            if delta is None:
+                investigation_payload = {
+                    "investigation_id": investigation.investigation_id,
+                    "snapshot_id": investigation.snapshot_id,
+                    "graph_snapshot_id": investigation.graph_snapshot_id,
+                    "target_ref": investigation.target_ref,
+                    "reason": investigation.reason,
+                    "security_questions": list(investigation.security_questions),
+                    "graph_refs": list(investigation.graph_refs),
+                    "coverage_notes": list(investigation.coverage_notes),
+                }
+                payload = {"investigation": investigation_payload, "obligations": obligations_payload, "source_windows": evidence_windows}
+            else:
+                payload = {
+                    "investigation_id": investigation.investigation_id,
+                    "unresolved_obligations": obligations_payload,
+                    "prior_dispositions": [
+                        {"obligation_id": key, "status": value["status"], "reason": value["reason"]}
+                        for key, value in sorted(final_by_id.items()) if key not in pending_ids
+                    ],
+                    "prior_candidate_summaries": [
+                        {"candidate_id": str(item.metadata.get("candidate_id", "")), "root_cause": item.metadata.get("root_cause", {}), "gained_capability": item.metadata.get("gained_capability", "")}
+                        for item in all_candidates
+                    ],
+                    "new_context": delta,
+                }
+            response = self._structured_response(
+                "plaidnox_graph_investigation_hunt",
+                load_json("schemas/vulnerability_discovery.json"),
+                "graph_investigation_hunt",
+                payload,
+                model_tier=ModelTier.STANDARD,
             )
-            if candidate is None:
-                raise AIResponseError("Graphify investigation candidate was not grounded in its source windows")
-            candidate.metadata.update({
-                "engine": "plaidnox-graphify-investigation",
-                "graph_investigation_id": investigation.investigation_id,
-                "graph_snapshot_id": investigation.graph_snapshot_id,
-                "graph_refs": list(investigation.graph_refs),
-            })
-            candidates.append(candidate)
+            try:
+                result = dict(response_json(response))
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AIResponseError(f"Graphify investigation response was not valid structured JSON: {_schema_failure(exc)}") from exc
+            schema_errors = sorted(
+                Draft202012Validator(load_json("schemas/vulnerability_discovery.json")).iter_errors(result),
+                key=lambda error: list(error.absolute_path),
+            )
+            if schema_errors:
+                location = ".".join(str(item) for item in schema_errors[0].absolute_path) or "root"
+                raise AIResponseError(
+                    f"Graphify investigation response violated its schema at {location}: {schema_errors[0].message}"
+                )
+            dispositions = result.get("obligation_results", [])
+            observed_ids = [str(item.get("obligation_id", "")) for item in dispositions if isinstance(item, dict)]
+            if len(observed_ids) != len(pending_ids) or set(observed_ids) != set(pending_ids):
+                raise AIResponseError("Graphify investigation response did not disposition each pending security question exactly once")
+            candidate_items = result.get("candidates", [])
+            candidates: list[Candidate] = []
+            for item in candidate_items:
+                if not isinstance(item, dict):
+                    raise AIResponseError("Graphify investigation candidate was malformed")
+                candidate = _candidate_from_ai_item(root, item, {}, allowed_source_windows=evidence_windows)
+                if candidate is None:
+                    raise AIResponseError("Graphify investigation candidate was not grounded in its source windows")
+                candidate_id = str(item.get("candidate_id", ""))
+                if not candidate_id or candidate_id in candidate_ids:
+                    raise AIResponseError("Graphify investigation candidates must have unique non-empty IDs")
+                candidate_ids.add(candidate_id)
+                candidate.metadata.update({
+                    "engine": "plaidnox-graphify-investigation",
+                    "graph_investigation_id": investigation.investigation_id,
+                    "graph_snapshot_id": investigation.graph_snapshot_id,
+                    "graph_refs": list(investigation.graph_refs) + list((delta or {}).get("graph_refs", [])),
+                })
+                candidates.append(candidate)
+            candidates_by_id = {str(item.get("candidate_id", "")) for item in candidate_items}
+            linked_ids: set[str] = set()
+            for item in dispositions:
+                if not isinstance(item, dict):
+                    raise AIResponseError("Graphify investigation obligation result was malformed")
+                linked = set(item.get("candidate_ids", []))
+                if item.get("status") == "CANDIDATE_FOUND":
+                    if not linked or not linked <= candidates_by_id:
+                        raise AIResponseError("Graphify investigation disposition referenced an unknown or missing candidate")
+                    linked_ids.update(linked)
+                elif linked:
+                    raise AIResponseError("Only CANDIDATE_FOUND dispositions may reference candidates")
+                if item.get("status") != "NEEDS_CONTEXT" and item.get("context_requests"):
+                    raise AIResponseError("Only NEEDS_CONTEXT dispositions may request repository context")
+            if linked_ids != candidates_by_id:
+                raise AIResponseError("Every Graphify candidate must be linked to a CANDIDATE_FOUND disposition")
+            return dispositions, candidates
 
-        candidates_by_id = {str(item.get("candidate_id", "")) for item in candidate_items}
-        if len(candidates_by_id) != len(candidate_items) or "" in candidates_by_id:
-            raise AIResponseError("Graphify investigation candidates must have unique non-empty IDs")
-        linked_candidate_ids: set[str] = set()
-        for item in obligations:
-            if not isinstance(item, dict):
-                raise AIResponseError("Graphify investigation obligation result was malformed")
-            status = item.get("status")
-            linked = set(item.get("candidate_ids", []))
-            if status == "CANDIDATE_FOUND":
-                if not linked or not linked <= candidates_by_id:
-                    raise AIResponseError("Graphify investigation disposition referenced an unknown or missing candidate")
-                linked_candidate_ids.update(linked)
-            elif linked:
-                raise AIResponseError("Only CANDIDATE_FOUND dispositions may reference candidates")
-            if status != "NEEDS_CONTEXT" and item.get("context_requests"):
-                raise AIResponseError("Only NEEDS_CONTEXT dispositions may request repository context")
-        if linked_candidate_ids != candidates_by_id:
-            raise AIResponseError("Every Graphify candidate must be linked to a CANDIDATE_FOUND disposition")
-        return candidates, {
+        pending_ids = list(obligation_ids)
+        dispositions, round_candidates = review_round(pending_ids=pending_ids, evidence_windows=source_windows, delta=None)
+        all_candidates.extend(round_candidates)
+        for item in dispositions:
+            final_by_id[str(item["obligation_id"])] = item
+
+        broker_matches = context_broker is not None and context_broker.snapshot.snapshot_id == investigation.graph_snapshot_id
+        for _ in range(rounds):
+            pending = [item for item in final_by_id.values() if item["status"] == "NEEDS_CONTEXT"]
+            if not pending:
+                break
+            pending_ids = [str(item["obligation_id"]) for item in pending]
+            requests = [request for item in pending for request in item.get("context_requests", [])]
+            context_requests_total += len(requests)
+            if not broker_matches or not requests or maximum_requests < 1:
+                context_requests_deferred += len(requests)
+                break
+            context_requests_deferred += max(0, len(requests) - maximum_requests)
+            new_context_windows: dict[tuple, dict[str, Any]] = {}
+            new_refs: dict[str, dict[str, Any]] = {}
+            for request in requests[:maximum_requests]:
+                try:
+                    resolved = context_broker.resolve_request(request, maximum_results=int(load_json("runtime/code_intelligence.json")["maximum_investigation_context_results"]))
+                except Exception:
+                    resolved = {"nodes": [], "edges": [], "source_windows": [], "truncated": False}
+                context_truncated = context_truncated or bool(resolved.get("truncated"))
+                added_evidence = False
+                for window in resolved.get("source_windows", []):
+                    try:
+                        accepted = _validate_graph_investigation_window(root, window)
+                    except AIResponseError:
+                        continue
+                    key = _graph_window_identity(accepted)
+                    window_characters = len(accepted["excerpt"])
+                    if key not in known_windows and context_characters + sum(len(item["excerpt"]) for item in new_context_windows.values()) + window_characters <= maximum_context_characters:
+                        known_windows.add(key)
+                        new_context_windows[key] = accepted
+                        added_evidence = True
+                refs_before = len(new_refs)
+                for edge in resolved.get("edges", []):
+                    edge_id = str(edge.get("edge_id", ""))
+                    if not edge_id:
+                        continue
+                    if edge_id not in prior_refs:
+                        prior_refs.add(edge_id)
+                        new_refs[edge_id] = {"edge_id": edge_id, "relation": str(edge.get("relation", "")), "provenance": str(edge.get("provenance", "AMBIGUOUS")), "snapshot_id": investigation.graph_snapshot_id}
+                added_evidence = added_evidence or len(new_refs) > refs_before
+                if added_evidence:
+                    context_requests_resolved += 1
+                else:
+                    context_requests_empty += 1
+            delta_windows = list(new_context_windows.values())
+            if not delta_windows and not new_refs:
+                break
+            context_characters += sum(len(item["excerpt"]) for item in delta_windows)
+            delta = {
+                "source_windows": delta_windows,
+                "graph_relationships": list(new_refs.values()),
+                "truncated": context_truncated,
+            }
+            # Graph relationships without new source still count as new machine evidence;
+            # source-grounded candidate claims remain limited to exact supplied windows.
+            dispositions, round_candidates = review_round(
+                pending_ids=pending_ids,
+                evidence_windows=delta_windows,
+                delta=delta,
+            )
+            continuation_calls += 1
+            all_candidates.extend(round_candidates)
+            for item in dispositions:
+                final_by_id[str(item["obligation_id"])] = item
+
+        for item in final_by_id.values():
+            if item["status"] == "NEEDS_CONTEXT":
+                item["status"] = "UNRESOLVED"
+                item["reason"] = (
+                    str(item.get("reason", "")).strip()
+                    + " Graphify context did not add new evidence within the configured expansion bound."
+                )[:1600]
+                item["context_requests"] = []
+        obligations = [final_by_id[item] for item in obligation_ids]
+        return all_candidates, {
             "investigation_id": investigation.investigation_id,
             "obligation_results": obligations,
-            "candidate_count": len(candidates),
+            "candidate_count": len(all_candidates),
             "unresolved_count": sum(item.get("status") in {"NEEDS_CONTEXT", "UNRESOLVED"} for item in obligations),
+            "context_requests_total": context_requests_total,
+            "context_requests_resolved": context_requests_resolved,
+            "context_requests_empty": context_requests_empty,
+            "context_requests_deferred": context_requests_deferred,
+            "continuation_calls": continuation_calls,
+            "context_truncated": context_truncated,
+            "context_characters": context_characters,
         }
 
     def discover_candidates(
@@ -4072,6 +4184,52 @@ def _candidate_from_ai_item(
             "required_context": [str(value) for value in item.get("required_context", [])],
             "candidate_id": str(item.get("candidate_id", "")),
         },
+    )
+
+
+def _validate_graph_investigation_window(root: Path, window: Mapping[str, Any]) -> dict[str, Any]:
+    """Revalidate broker/planner source provenance immediately before model input."""
+    try:
+        relative = Path(str(window["path"]))
+        start = int(window["start_line"])
+        end = int(window["end_line"])
+        expected_hash = str(window["content_hash"])
+        excerpt = str(window["excerpt"])
+        redaction_state = str(window["redaction_state"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AIResponseError("Graphify investigation source window is malformed") from exc
+    target = (root / relative).resolve()
+    if root.resolve() not in target.parents or not target.is_file():
+        raise AIResponseError("Graphify investigation source window is outside the repository")
+    try:
+        source = target.read_bytes()
+    except OSError as exc:
+        raise AIResponseError("Graphify investigation source window is unavailable") from exc
+    if hashlib.sha256(source).hexdigest() != expected_hash:
+        raise AIResponseError("Graphify investigation source window is stale")
+    lines = source.decode("utf-8", errors="replace").splitlines(keepends=True)
+    if start < 1 or end < start or end > len(lines):
+        raise AIResponseError("Graphify investigation source window has invalid line bounds")
+    if redaction_state not in {"redacted", "not_required"}:
+        raise AIResponseError("Graphify investigation source window has an invalid redaction state")
+    if _redact("".join(lines[start - 1 : end])) != excerpt:
+        raise AIResponseError("Graphify investigation source window excerpt does not match its source")
+    return {
+        "path": relative.as_posix(),
+        "start_line": start,
+        "end_line": end,
+        "content_hash": expected_hash,
+        "excerpt": excerpt,
+        "redaction_state": redaction_state,
+    }
+
+
+def _graph_window_identity(window: Mapping[str, Any]) -> tuple[str, int, int, str]:
+    return (
+        str(window.get("path", "")),
+        int(window.get("start_line", 0)),
+        int(window.get("end_line", 0)),
+        str(window.get("content_hash", "")),
     )
 
 
