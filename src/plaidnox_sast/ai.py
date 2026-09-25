@@ -59,6 +59,7 @@ from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Seve
 from .prompts import render_operation
 from .redaction import redact as _redact
 from .redaction import redact_payload
+from .worksets import security_worksets_from_graph, security_worksets_from_regions
 
 
 _RATE_LIMIT_ERROR_NAMES = frozenset({"RateLimitError"})
@@ -168,6 +169,7 @@ class AIRepositoryContext:
     build_time_variants: list[dict[str, Any]] = field(default_factory=list)
     coverage_ledger: list[dict[str, Any]] = field(default_factory=list)
     analysis_scope_paths: list[str] = field(default_factory=list)
+    annotation_grounding: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +200,7 @@ class AIRepositoryContext:
             "build_time_variants": self.build_time_variants,
             "coverage_ledger": self.coverage_ledger,
             "analysis_scope_paths": self.analysis_scope_paths,
+            "annotation_grounding": self.annotation_grounding,
         }
 
 
@@ -836,6 +839,11 @@ class PlaidNoxDeepHuntAgent:
         sampled_files, truncated_file_areas = _balanced_area_sample(
             file_pool, int(runtime["repository_ir_file_limit"]), lambda item: item.path
         )
+        surface_inventory = _security_surface_inventory(
+            root,
+            graph,
+            include_paths=scope_paths if incremental else None,
+        )
         manifest_inventory = (
             [item for item in inventory if str(item["path"]) in scope_paths]
             if incremental
@@ -901,7 +909,13 @@ class PlaidNoxDeepHuntAgent:
                     "truncated": len(sampled_files) < len(graph.files),
                     "areas_with_omitted_context": truncated_file_areas,
                 },
+                "security_surfaces": {
+                    key: value
+                    for key, value in surface_inventory.items()
+                    if key != "surfaces"
+                },
             },
+            "security_surface_inventory": surface_inventory,
         }
         if incremental and preparation is not None:
             manifest.pop("security_ir", None)
@@ -951,6 +965,14 @@ class PlaidNoxDeepHuntAgent:
             applications = list(payload["applications"])
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError(f"AI repository context did not match the required schema: {_schema_failure(exc)}") from exc
+        grounding_summary = _ground_repository_annotations(
+            payload,
+            root,
+            graph,
+            preparation.previous_repository_context
+            if preparation is not None and preparation.overlay is not None
+            else None,
+        )
         context = AIRepositoryContext(
             codebase=codebase,
             revision=revision,
@@ -980,6 +1002,7 @@ class PlaidNoxDeepHuntAgent:
             build_time_variants=[dict(item) for item in payload.get("build_time_variants", [])],
             coverage_ledger=[dict(item) for item in payload.get("coverage_ledger", [])],
             analysis_scope_paths=sorted(scope_paths) if scope_paths else source_tree,
+            annotation_grounding=grounding_summary,
         )
         self._record_search_query_errors("recon", context, recon_errors)
         if self.context_store is not None and preparation is not None:
@@ -1138,6 +1161,8 @@ class PlaidNoxDeepHuntAgent:
         self._record_search_query_errors("candidate_discovery", context, search_errors)
         if not segments:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
+        segments, workset_stats = _security_workset_review_units(segments)
+        self._emit("discovery_worksets_attached", **workset_stats)
 
         # One index for the whole scan: the same bug reported from overlapping
         # segments or continuations must be hunted once.
@@ -1146,18 +1171,35 @@ class PlaidNoxDeepHuntAgent:
         def analyze(segment: dict[str, Any]) -> tuple[list[Candidate], list[Exception]]:
             segment_candidates: list[Candidate] = []
             errors: list[Exception] = []
-            # Identity is the code region itself; task/query ids are provenance and
-            # must not force a re-review of unchanged code.
+            # Identity is the bounded workset batch. Region-level source windows
+            # and task/query IDs remain provenance, not work identity.
             checkpoint_key = unit_key(
-                "discovery-v2",
-                {key: segment[key] for key in ("path", "start_line", "end_line", "content")},
+                "discovery-workset-v1",
+                {
+                    "workset_id": segment["security_workset"]["workset_id"],
+                    "evidence_hash": segment["security_workset"]["evidence_hash"],
+                    "batch_index": segment["security_workset"]["batch_index"],
+                },
             )
             if self.checkpoint is not None:
                 saved = self.checkpoint.get("discovery", checkpoint_key)
                 if saved is not None:
-                    self._emit("checkpoint_reused", stage="discovery", path=segment["path"], start_line=segment["start_line"])
+                    self._emit(
+                        "checkpoint_reused",
+                        stage="discovery",
+                        path=segment["path"],
+                        start_line=segment["start_line"],
+                        workset_id=segment["security_workset"]["workset_id"],
+                        batch_index=segment["security_workset"]["batch_index"],
+                    )
                     return [candidate_from_dict(item) for item in saved["candidates"]], []
-            self._emit("source_segment_started", path=segment["path"], start_line=segment["start_line"])
+            self._emit(
+                "discovery_workset_batch_started",
+                path=segment["path"],
+                start_line=segment["start_line"],
+                workset_id=segment["security_workset"]["workset_id"],
+                batch_index=segment["security_workset"]["batch_index"],
+            )
             related_tasks = _tasks_for_segment(
                 plan,
                 str(segment["path"]),
@@ -1171,7 +1213,13 @@ class PlaidNoxDeepHuntAgent:
                         str(segment["path"]),
                     ),
                     "hunt_plan": {"strategy": plan.strategy, "tasks": related_tasks} if plan else None,
-                    "source_segment": segment,
+                    "source_segment": {
+                        key: segment[key]
+                        for key in ("path", "start_line", "end_line", "task_ids", "query_ids")
+                        if key in segment
+                    },
+                    "source_windows": segment["allowed_source_windows"],
+                    "security_workset": segment.get("security_workset", {}),
                     "continuation_focus": next_focus,
                 }
                 try:
@@ -1184,7 +1232,12 @@ class PlaidNoxDeepHuntAgent:
                     payload = response_json(response)
                     new_candidates = 0
                     for item in payload["candidates"]:
-                        candidate = _candidate_from_ai_item(root, item, segment)
+                        candidate = _candidate_from_ai_item(
+                            root,
+                            item,
+                            segment,
+                            allowed_source_windows=segment["allowed_source_windows"],
+                        )
                         if candidate is None:
                             continue
                         if not candidate_index.admit(candidate):
@@ -1224,9 +1277,11 @@ class PlaidNoxDeepHuntAgent:
                     except Exception:  # noqa: BLE001 - early triage is an optimisation only
                         break
             self._emit(
-                "source_segment_completed",
+                "discovery_workset_batch_completed",
                 path=segment["path"],
                 start_line=segment["start_line"],
+                workset_id=segment["security_workset"]["workset_id"],
+                batch_index=segment["security_workset"]["batch_index"],
                 candidates=len(segment_candidates),
                 errors=len(errors),
             )
@@ -2757,6 +2812,111 @@ def _balanced_area_sample(
     return selected, truncated_areas
 
 
+def _security_surface_inventory(
+    root: Path,
+    graph: StructuralGraph,
+    *,
+    include_paths: set[str] | None = None,
+) -> dict[str, Any]:
+    """Build a bounded, syntax-only workset index for repository reconnaissance."""
+    config = load_json("runtime/security_worksets.json")
+    all_worksets = security_worksets_from_graph(root, graph)
+    worksets = all_worksets
+    if include_paths is not None:
+        worksets = [
+            item
+            for item in all_worksets
+            if any(
+                location.path in include_paths
+                for security_slice in item.slices
+                for location in security_slice.locations
+            )
+        ]
+    limit = int(config["maximum_repository_context_surfaces"])
+    location_limit = int(config["maximum_repository_context_locations_per_surface"])
+    excerpt_limit = int(config["maximum_repository_context_primary_excerpt_characters"])
+    if min(limit, location_limit, excerpt_limit) < 1:
+        raise ValueError("repository security-surface limits must be positive")
+
+    counts: dict[str, int] = {}
+    for workset in worksets:
+        counts[workset.surface_type] = counts.get(workset.surface_type, 0) + 1
+    selected, omitted_areas = _balanced_area_sample(
+        worksets,
+        limit,
+        lambda item: item.surface_id.split("::", 1)[0],
+    )
+    surfaces: list[dict[str, Any]] = []
+    for workset in selected:
+        all_locations = []
+        seen_locations: set[tuple[str, int, int, str]] = set()
+        primary_excerpt = ""
+        primary_excerpt_truncated = False
+        related_symbols: set[str] = set()
+        for security_slice in workset.slices:
+            for location in security_slice.locations:
+                key = (
+                    location.path,
+                    location.start_line,
+                    location.end_line,
+                    location.symbol_id,
+                )
+                if key not in seen_locations:
+                    seen_locations.add(key)
+                    all_locations.append(location)
+                if location.symbol_id == workset.surface_id and not primary_excerpt:
+                    primary_excerpt = location.excerpt[:excerpt_limit]
+                    primary_excerpt_truncated = len(location.excerpt) > excerpt_limit
+            for fact in security_slice.facts:
+                if fact.get("kind") in {
+                    "route_registration_symbol_reference",
+                    "top_level_call_symbol_reference",
+                }:
+                    symbol_id_value = str(fact.get("symbol_id", ""))
+                    if symbol_id_value:
+                        related_symbols.add(symbol_id_value)
+        surfaces.append(
+            {
+                "surface_type": workset.surface_type,
+                "surface_id": workset.surface_id,
+                "complete": workset.complete,
+                "primary_excerpt": primary_excerpt,
+                "primary_excerpt_truncated": primary_excerpt_truncated,
+                "source_locations": [
+                    {
+                        "path": item.path,
+                        "start_line": item.start_line,
+                        "end_line": item.end_line,
+                        "symbol_id": item.symbol_id,
+                    }
+                    for item in all_locations[:location_limit]
+                ],
+                "omitted_location_count": max(0, len(all_locations) - location_limit),
+                "related_symbol_ids": sorted(related_symbols),
+                "unresolved_edge_ids": list(workset.unresolved_edge_ids),
+                "relationship_limitations": list(
+                    workset.metadata.get("relationship_limitations", [])
+                ),
+            }
+        )
+    return {
+        "source": "tree_sitter_syntax_worksets",
+        "scope": "incremental_analysis_paths" if include_paths is not None else "repository",
+        "total": len(worksets),
+        "included": len(selected),
+        "truncated": len(selected) < len(worksets),
+        "omitted_surface_count": max(0, len(worksets) - len(selected)),
+        "outside_scope_surface_count": max(0, len(all_worksets) - len(worksets)),
+        "omitted_areas": omitted_areas,
+        "counts_by_surface_type": dict(sorted(counts.items())),
+        "surfaces": surfaces,
+        "interpretation_limits": [
+            "syntax observations do not prove callable roles, trust, reachability, data flow, or side effects",
+            "omitted surfaces remain unreviewed by this bounded inventory",
+        ],
+    }
+
+
 def _source_inventory(
     root: Path,
     exclude: list[str] | None = None,
@@ -2984,8 +3144,19 @@ def _search_segments(
                 "start_line": start_line,
                 "end_line": end_line,
                 "content": _redact("\n".join(lines[start_line - 1 : end_line])),
+                "content_hash": _indexed_file_hash(graph, hit.path),
                 "query_ids": [],
                 "task_ids": [],
+                "anchor_type": (
+                    "http_route"
+                    if enclosing is not None and enclosing.kind == "route"
+                    else "code_symbol" if enclosing is not None else "source_region"
+                ),
+                "anchor_id": (
+                    (enclosing.qualified_name or enclosing.name)
+                    if enclosing is not None
+                    else f"{start_line}:{end_line}"
+                ),
                 "security_ir_slice": _related_ir(graph, hit.path, enclosing.name if enclosing else ""),
             },
         )
@@ -3015,6 +3186,9 @@ def _search_segments(
     for segment in fallback_segments:
         segment["query_ids"] = []
         segment["task_ids"] = sorted(focus_paths[str(segment["path"])])
+        segment["content_hash"] = _indexed_file_hash(graph, str(segment["path"]))
+        segment["anchor_type"] = "source_region"
+        segment["anchor_id"] = f"{segment['start_line']}:{segment['end_line']}"
         covering = _covering_region(regions, segment, float(runtime_agent["region_overlap_ratio"]))
         if covering is not None:
             # Already reviewed as part of another region: only record the extra obligation.
@@ -3027,6 +3201,132 @@ def _search_segments(
         stats["regions"] = len(regions)
         stats["fallback_regions"] = fallback_added
     return sorted(regions, key=lambda item: (str(item["path"]), int(item["start_line"])))
+
+
+def _indexed_file_hash(graph: StructuralGraph | None, path: str) -> str:
+    if graph is None:
+        return ""
+    file_ir = next((item for item in graph.files if item.path == path), None)
+    return file_ir.content_hash if file_ir is not None else ""
+
+
+def _security_workset_review_units(
+    segments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Group region evidence under canonical worksets and bounded review batches.
+
+    Workset batches become the discovery units. Each keeps every underlying
+    region as an exact source window for candidate grounding; source excerpts
+    are sent once, through the serialized workset slices.
+    """
+
+    worksets = security_worksets_from_regions(segments)
+    by_location: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for segment in segments:
+        path = str(segment.get("path", ""))
+        start = int(segment.get("start_line", 1))
+        end = int(segment.get("end_line", start))
+        anchor_type = str(segment.get("anchor_type", "line_range"))
+        anchor_id = str(segment.get("anchor_id", "")).strip() or f"{start}:{end}"
+        surface_id = f"{path}::{anchor_id}"
+        if anchor_type == "line_range":
+            surface_id = f"{surface_id}::{start}-{end}"
+        key = (
+            path,
+            start,
+            end,
+            surface_id,
+        )
+        by_location[key] = segment
+
+    review_units: list[dict[str, Any]] = []
+    all_windows: set[tuple[str, int, int]] = set()
+    for workset in worksets:
+        source_segments: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+        for evidence_slice in workset.slices:
+            for location in evidence_slice.locations:
+                key = (
+                    location.path,
+                    location.start_line,
+                    location.end_line,
+                    location.symbol_id,
+                )
+                source_segment = by_location.get(key)
+                if source_segment is None:
+                    raise AIResponseError(
+                        "a workset evidence slice could not be linked to its source region"
+                    )
+                source_segments[key] = source_segment
+        batches = workset.batches()
+        slice_by_id = {item.slice_id: item for item in workset.slices}
+        for batch in batches:
+            batch_segments: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+            source_windows: list[dict[str, Any]] = []
+            for batch_slice in batch["slices"]:
+                source_slice = slice_by_id.get(str(batch_slice["slice_id"]))
+                if source_slice is None:
+                    raise AIResponseError("a workset batch referenced an unknown evidence slice")
+                for location in source_slice.locations:
+                    key = (
+                        location.path,
+                        location.start_line,
+                        location.end_line,
+                        location.symbol_id,
+                    )
+                    batch_segments[key] = source_segments[key]
+                    source_windows.append(
+                        {
+                            "path": location.path,
+                            "start_line": location.start_line,
+                            "end_line": location.end_line,
+                        }
+                    )
+                    all_windows.add(key)
+            members = list(batch_segments.values())
+            if not members:
+                raise AIResponseError("a workset batch contained no source windows")
+            representative = min(
+                members,
+                key=lambda item: (str(item["path"]), int(item["start_line"])),
+            )
+            review_units.append(
+                {
+                    "path": str(representative["path"]),
+                    "start_line": int(representative["start_line"]),
+                    "end_line": int(representative["end_line"]),
+                    "task_ids": sorted(
+                        {str(task_id) for item in members for task_id in item.get("task_ids", [])}
+                    ),
+                    "query_ids": sorted(
+                        {str(query_id) for item in members for query_id in item.get("query_ids", [])}
+                    ),
+                    "allowed_source_windows": source_windows,
+                    "_source_region_keys": [
+                        {
+                            "path": path,
+                            "start_line": start,
+                            "end_line": end,
+                            "surface_id": surface_id,
+                        }
+                        for path, start, end, surface_id in sorted(batch_segments)
+                    ],
+                    "security_workset": {
+                        **batch,
+                        "surface_type": workset.surface_type,
+                        "surface_id": workset.surface_id,
+                        "slice_count": batch["all_slices_count"],
+                        "evidence_source": "region_security_ir_adapter",
+                        "semantic_relationships_validated": False,
+                    },
+                }
+            )
+    return review_units, {
+        "regions": len(segments),
+        "regions_with_worksets": len(all_windows),
+        "unique_worksets": len(worksets),
+        "review_batches": len(review_units),
+        "incomplete_worksets": sum(not item.complete for item in worksets),
+    }
 
 
 def _covering_region(regions: list[dict[str, Any]], segment: dict[str, Any], ratio: float) -> dict[str, Any] | None:
@@ -3066,6 +3366,11 @@ def _merge_regions(
                 close = int(item["start_line"]) - int(current["end_line"]) <= gap
                 span_chars = len(str(current["content"])) + len(str(item["content"]))
                 if (overlap / length >= ratio or close) and span_chars <= limit:
+                    if (
+                        current.get("anchor_type") != item.get("anchor_type")
+                        or current.get("anchor_id") != item.get("anchor_id")
+                    ):
+                        current["anchor_type"] = "source_region"
                     current["end_line"] = max(int(current["end_line"]), int(item["end_line"]))
                     current["query_ids"] = sorted({*current["query_ids"], *item["query_ids"]})
                     current["task_ids"] = sorted({*current["task_ids"], *item["task_ids"]})
@@ -3076,6 +3381,8 @@ def _merge_regions(
         if current is not None:
             merged_all.append(current)
     for region in merged_all:
+        if region.get("anchor_type") == "source_region":
+            region["anchor_id"] = f"{region['start_line']}:{region['end_line']}"
         if int(region.get("merged_windows", 1)) > 1:
             try:
                 lines = (root / str(region["path"])).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -3191,6 +3498,171 @@ def _schema_failure(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
+_GROUNDED_ANNOTATION_COLLECTIONS = (
+    "input_surfaces",
+    "trust_boundaries",
+    "sensitive_effects",
+    "entry_points",
+    "authentication_paths",
+    "authorization_decisions",
+)
+
+
+def _annotation_record_identity(collection: str, record: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return a stable-enough identity for carrying evidence across an overlay."""
+
+    stable_id = record.get("entry_id") or record.get("effect_id")
+    if stable_id:
+        return (collection, str(stable_id))
+    anchor = record.get("location") or record.get("decision_location") or ""
+    return (collection, str(record.get("name", "")), str(anchor))
+
+
+def _ground_repository_annotations(
+    payload: dict[str, Any],
+    root: Path,
+    graph: StructuralGraph,
+    previous_context: Mapping[str, Any] | None = None,
+) -> dict[str, int]:
+    """Ground model-reported context locations against this immutable source graph.
+
+    This validates only source identity and location. It deliberately does not
+    establish that the associated architectural or security claim is true.
+    """
+
+    root = root.resolve()
+    indexed_files = {item.path: item for item in graph.files}
+    prior_by_collection: dict[str, dict[tuple[str, ...], list[dict[str, Any]]]] = {}
+    if previous_context is not None:
+        for collection in _GROUNDED_ANNOTATION_COLLECTIONS:
+            records = previous_context.get(collection, [])
+            by_identity: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+            if isinstance(records, list):
+                for record in records:
+                    if not isinstance(record, Mapping):
+                        continue
+                    locations = record.get("evidence_locations", [])
+                    if isinstance(locations, list) and locations:
+                        by_identity[_annotation_record_identity(collection, record)] = [
+                            dict(location) for location in locations if isinstance(location, Mapping)
+                        ]
+            prior_by_collection[collection] = by_identity
+
+    summary = {
+        "records_total": 0,
+        "records_with_verified_locations": 0,
+        "records_with_partial_locations": 0,
+        "records_without_verified_locations": 0,
+        "locations_verified": 0,
+        "locations_unverified": 0,
+        "locations_carried_forward": 0,
+        "semantic_claims_validated": 0,
+    }
+
+    for collection in _GROUNDED_ANNOTATION_COLLECTIONS:
+        records = payload.get(collection, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            summary["records_total"] += 1
+            locations = record.get("evidence_locations")
+            if not isinstance(locations, list) or not locations:
+                prior = prior_by_collection.get(collection, {}).get(
+                    _annotation_record_identity(collection, record), []
+                )
+                prior = [
+                    location
+                    for location in prior
+                    if _verify_annotation_location(root, indexed_files, location)[0]
+                    == "verified_source_location"
+                ]
+                if prior:
+                    locations = [dict(location, provenance="carried_forward") for location in prior]
+                    record["evidence_locations"] = locations
+                    summary["locations_carried_forward"] += len(locations)
+                else:
+                    locations = []
+
+            valid_count = 0
+            attempted_count = 0
+            for location in locations:
+                if not isinstance(location, dict):
+                    continue
+                attempted_count += 1
+                status, source_hash = _verify_annotation_location(root, indexed_files, location)
+                location["grounding_status"] = status
+                if source_hash:
+                    location["source_content_hash"] = source_hash
+                    valid_count += 1
+                    summary["locations_verified"] += 1
+                else:
+                    location.pop("source_content_hash", None)
+                    summary["locations_unverified"] += 1
+
+            if valid_count == attempted_count and valid_count:
+                state = "verified"
+                summary["records_with_verified_locations"] += 1
+            elif valid_count:
+                state = "partial"
+                summary["records_with_partial_locations"] += 1
+            else:
+                state = "unverified" if attempted_count else "none"
+                summary["records_without_verified_locations"] += 1
+            record["annotation_provenance"] = {
+                "origin": "repository_context_model",
+                "location_grounding": state,
+                "semantic_claim_validation": "not_performed",
+            }
+
+    return summary
+
+
+def _verify_annotation_location(
+    root: Path,
+    indexed_files: Mapping[str, Any],
+    location: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Validate a location and optional quote against the indexed file version."""
+
+    raw_path = location.get("path")
+    if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
+        return "invalid_path", None
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        return "path_outside_snapshot", None
+    normalized = relative.as_posix()
+    file_ir = indexed_files.get(normalized)
+    if file_ir is None:
+        return "path_not_indexed", None
+    source_path = (root / relative).resolve()
+    if source_path != root and root not in source_path.parents:
+        return "path_outside_snapshot", None
+    try:
+        content = source_path.read_bytes()
+    except OSError:
+        return "source_unreadable", None
+    source_hash = hashlib.sha256(content).hexdigest()
+    if source_hash != file_ir.content_hash:
+        return "source_version_mismatch", None
+    try:
+        start_line = int(location["start_line"])
+        end_line = int(location["end_line"])
+    except (KeyError, TypeError, ValueError):
+        return "invalid_line_range", None
+    lines = content.decode("utf-8", errors="replace").splitlines()
+    if start_line < 1 or end_line < start_line or end_line > len(lines):
+        return "invalid_line_range", None
+    quote = location.get("quote")
+    if quote:
+        expected = " ".join(str(quote).split())
+        actual = " ".join(" ".join(lines[start_line - 1 : end_line]).split())
+        if expected not in actual:
+            return "quote_mismatch", None
+    return "verified_source_location", source_hash
+
+
 def _repository_context_from_saved(
     saved: dict[str, object],
     codebase: str,
@@ -3235,6 +3707,11 @@ def _repository_context_from_saved(
         build_time_variants=dictionaries("build_time_variants"),
         coverage_ledger=dictionaries("coverage_ledger"),
         analysis_scope_paths=[],
+        annotation_grounding=(
+            dict(saved["annotation_grounding"])
+            if isinstance(saved.get("annotation_grounding"), dict)
+            else {}
+        ),
     )
 
 

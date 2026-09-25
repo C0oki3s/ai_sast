@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-24.6",
+  "version": "2026-09-25.7",
   "operations": {
     "recon_search_plan": {
       "system": "operations/recon_search_plan/system.md",
@@ -20,7 +20,7 @@
     "vulnerability_discovery": {
       "system": "operations/vulnerability_discovery/system.md",
       "user": "operations/vulnerability_discovery/user.md",
-      "contract_version": "2026-09-24.14"
+      "contract_version": "2026-09-25.7"
     },
     "security_review": {
       "system": "operations/security_review/system.md",

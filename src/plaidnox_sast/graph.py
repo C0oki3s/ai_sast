@@ -51,6 +51,7 @@ class Symbol:
     kind: str = "symbol"
     qualified_name: str = ""
     signature: str = ""
+    content_hash: str = ""
 
 
 @dataclass(slots=True)
@@ -59,6 +60,7 @@ class Call:
     callee: str
     path: str
     line: int
+    end_line: int = 0
 
 
 @dataclass(slots=True)
@@ -123,6 +125,45 @@ class StructuralGraph:
                 if symbol.path in changed
             ],
         }
+
+
+def stable_symbol_id(stable_key: str) -> str:
+    """Return the existing cross-snapshot persistence ID for a symbol key."""
+    digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:16]
+    return f"sym-{digest}"
+
+
+def stable_symbol_keys(symbols: Iterable[Symbol]) -> dict[int, str]:
+    """Build persistence-compatible stable keys for one symbol collection."""
+    by_path: dict[str, list[Symbol]] = {}
+    for symbol in symbols:
+        by_path.setdefault(symbol.path, []).append(symbol)
+
+    result: dict[int, str] = {}
+    for path, entries in sorted(by_path.items()):
+        ordered = sorted(entries, key=lambda item: item.line)
+        identity_counts: dict[tuple[str, str], int] = {}
+        for symbol in ordered:
+            name = symbol.qualified_name or symbol.name
+            key = (symbol.kind, name)
+            identity_counts[key] = identity_counts.get(key, 0) + 1
+        duplicate_occurrences: dict[tuple[str, str, str], int] = {}
+        for symbol in ordered:
+            name = symbol.qualified_name or symbol.name
+            stable_key = f"{path}:{symbol.kind}:{name}"
+            if identity_counts[(symbol.kind, name)] > 1:
+                normalized_signature = "\n".join(
+                    line.rstrip() for line in symbol.signature.splitlines()
+                ).strip()
+                signature_hash = hashlib.sha256(
+                    normalized_signature.encode("utf-8")
+                ).hexdigest()[:16]
+                duplicate_key = (symbol.kind, name, signature_hash)
+                occurrence = duplicate_occurrences.get(duplicate_key, 0)
+                duplicate_occurrences[duplicate_key] = occurrence + 1
+                stable_key = f"{stable_key}:{signature_hash}:{occurrence}"
+            result[id(symbol)] = stable_key
+    return result
 
 
 def source_files(
@@ -195,7 +236,10 @@ def _source_file_is_admitted(
         resolved = candidate.resolve()
     except (OSError, ValueError):
         return False
-    if root not in resolved.parents or not candidate.is_file():
+    # A source-looking symlink can point at a sensitive file such as .env while
+    # passing extension and exclusion checks on the link name. Require the
+    # admitted path itself to be the canonical path within this snapshot.
+    if resolved != candidate or root not in resolved.parents or not candidate.is_file():
         return False
     if ignored_directories.intersection(candidate.relative_to(root).parts):
         return False
@@ -464,6 +508,7 @@ def _tree_sitter_ir(
                         node.type,
                         current,
                         _symbol_signature(node, content),
+                        hashlib.sha256(content[node.start_byte : node.end_byte]).hexdigest(),
                     )
                 )
         if node.type == "call_expression":
@@ -476,7 +521,15 @@ def _tree_sitter_ir(
             function_node = node.child_by_field_name("function") or node.child_by_field_name("name")
             callee = _node_text(function_node, content) if function_node is not None else ""
             if callee:
-                calls.append(Call(current or relative, callee, relative, node.start_point[0] + 1))
+                calls.append(
+                    Call(
+                        current or relative,
+                        callee,
+                        relative,
+                        node.start_point[0] + 1,
+                        node.end_point[0] + 1,
+                    )
+                )
         if node.type in reference_types and len(references) < maximum_references:
             target = _node_text(node, content)
             parent_name = node.parent.child_by_field_name("name") if node.parent is not None else None
@@ -537,7 +590,16 @@ def _express_route(node: Any, content: bytes, relative: str) -> Symbol | None:
         return None
     route = _node_text(first, content).strip("'\"`")
     name = f"{method.upper()} {route}"
-    return Symbol(name, relative, node.start_point[0] + 1, node.end_point[0] + 1, "route", f"route:{name}", "")
+    return Symbol(
+        name,
+        relative,
+        node.start_point[0] + 1,
+        node.end_point[0] + 1,
+        "route",
+        f"route:{name}",
+        "",
+        hashlib.sha256(content[node.start_byte : node.end_byte]).hexdigest(),
+    )
 
 
 _EXPRESS_METHODS = frozenset({"get", "post", "put", "patch", "delete", "all", "use"})
@@ -551,7 +613,18 @@ def _fallback_ir(
 ) -> FileSecurityIR:
     text = content.decode("utf-8", errors="replace")
     name = Path(relative).as_posix()
-    symbols = [Symbol(name, relative, 1, max(1, len(text.splitlines())), "file", name, "")]
+    symbols = [
+        Symbol(
+            name,
+            relative,
+            1,
+            max(1, len(text.splitlines())),
+            "file",
+            name,
+            "",
+            hashlib.sha256(content).hexdigest(),
+        )
+    ]
     return FileSecurityIR(
         path=relative,
         language=language or "unknown",

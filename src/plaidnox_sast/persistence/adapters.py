@@ -34,6 +34,7 @@ from ..context_fabric import (
 )
 from ..graph import StructuralGraph
 from ..knowledge import KnowledgeDecision, KnowledgeEntry
+from ..worksets import security_summaries_from_graph
 from .repositories import (
     SECURITY_IR_CONTEXT_VERSION,
     KnowledgeInput,
@@ -86,12 +87,20 @@ class PostgresContextFabricStore:
             existing = repo.get_snapshot(snapshot_id)
             if existing is not None:
                 repo.save_security_ir(snapshot_id, *security_ir_inputs(root, graph))
+                repo.save_security_summaries(
+                    snapshot_id,
+                    [item.to_dict() for item in security_summaries_from_graph(graph)],
+                )
                 return ContextBase(snapshot_id, repository, commit, repo.count_symbols(snapshot_id), reused=True)
             repo.add_codebase(codebase_id, external_key=repository, display_name=repository)
             repo.add_snapshot(
                 snapshot_id, codebase_id, commit, snapshot_tree_hash(graph), SECURITY_IR_CONTEXT_VERSION
             )
             repo.save_security_ir(snapshot_id, *security_ir_inputs(root, graph))
+            repo.save_security_summaries(
+                snapshot_id,
+                [item.to_dict() for item in security_summaries_from_graph(graph)],
+            )
             return ContextBase(snapshot_id, repository, commit, repo.count_symbols(snapshot_id))
 
     def prepare_snapshot(
@@ -201,7 +210,14 @@ class PostgresContextFabricStore:
                 SECURITY_IR_CONTEXT_VERSION,
                 parent_snapshot_id=base.context_id,
             )
+            repo.attach_snapshot_parent(snapshot_id, base.context_id)
+            repo.clear_snapshot_security_summaries(snapshot_id)
             repo.save_security_ir(snapshot_id, files, symbols, edges)
+            repo.save_overlay_security_summaries(
+                snapshot_id,
+                base.context_id,
+                [item.to_dict() for item in security_summaries_from_graph(graph)],
+            )
 
         reused = (
             100
@@ -218,6 +234,11 @@ class PostgresContextFabricStore:
             affected_symbols=affected,
             context_reused_percent=reused,
         )
+
+    def effective_security_summaries(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """Read the base-plus-overlay summary view for a tenant-owned snapshot."""
+        with unit_of_work(self.session_factory, self.tenant_id) as repo:
+            return repo.list_effective_security_summaries(snapshot_id)
 
     def add_memory(
         self,

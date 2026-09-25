@@ -91,6 +91,14 @@ def test_source_inventory_enforces_excludes_and_maximum_size(tmp_path):
     assert [path.name for path in files] == ["keep.py"]
 
 
+def test_source_inventory_rejects_symlink_to_sensitive_content(tmp_path):
+    (tmp_path / ".env").write_text("PRIVATE_VALUE=example\n", encoding="utf-8")
+    (tmp_path / "allowed.py").symlink_to(".env")
+
+    assert source_files(tmp_path) == []
+    assert build_structural_graph(tmp_path).files == []
+
+
 def test_source_inventory_recognizes_common_extensionless_manifests(tmp_path):
     for filename in ("go.mod", "requirements.txt", "build.gradle", "Cargo.lock"):
         (tmp_path / filename).write_text("module metadata\n", encoding="utf-8")

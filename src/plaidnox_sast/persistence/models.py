@@ -249,6 +249,46 @@ class SymbolRecord(TimestampMixin, Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class SymbolSummaryRecord(TimestampMixin, Base):
+    __tablename__ = "code_scanning_symbol_summaries"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "symbol_id", name="uq_code_scanning_symbol_summary"),
+        Index("ix_code_scanning_symbol_summary_snapshot", "snapshot_id", "content_hash"),
+    )
+
+    summary_record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+    )
+    symbol_id: Mapped[str] = mapped_column(String(2048), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class OverlaySymbolSummaryRecord(TimestampMixin, Base):
+    """Sparse summary delta for a child snapshot; deleted symbols use tombstones."""
+
+    __tablename__ = "code_scanning_overlay_symbol_summaries"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "symbol_id", name="uq_code_scanning_overlay_symbol_summary"),
+        CheckConstraint(
+            "(summary_state = 'active' AND content_hash IS NOT NULL AND summary_data IS NOT NULL) OR "
+            "(summary_state = 'deleted' AND content_hash IS NULL AND summary_data IS NULL)",
+            name="ck_code_scanning_overlay_symbol_summary_state",
+        ),
+        Index("ix_code_scanning_overlay_symbol_summary_snapshot", "snapshot_id", "summary_state"),
+    )
+
+    summary_record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+    )
+    symbol_id: Mapped[str] = mapped_column(String(2048), nullable=False)
+    summary_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    summary_data: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+
+
 class CodeEdgeRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_edges"
     __table_args__ = (

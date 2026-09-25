@@ -12,6 +12,14 @@ SCM acquisition and feedback are outside this architecture.
 
 ## Runtime
 
+The current runtime below still uses Tree-sitter and AI-directed `rg`.
+The accepted replacement is documented in
+[Graphify-backed investigations](../PLAN.md#graphify-backed-investigations-for-code-scanning): Graphify
+for structural navigation, a graph-first Context Broker, and bounded AI
+investigations. Independent Deep Hunt, exact grounding, and recursive variant
+search remain mandatory. This diagram is not a claim that the replacement is
+already deployed.
+
 ```mermaid
 flowchart LR
     SNAP[Immutable source snapshot] --> RG[AI-directed ripgrep discovery]
@@ -40,7 +48,7 @@ flowchart LR
 
 ## Discovery and code reading
 
-`rg` is the primary discovery/navigation mechanism. The LLM creates bounded
+In the current runtime, `rg` is the primary discovery/navigation mechanism. The LLM creates bounded
 queries from the codebase architecture, hunt task, business context, threat
 context, and retrieved knowledge. Query definitions and response schemas are
 versioned assets; they are not embedded in orchestration code.

@@ -29,6 +29,13 @@ knowledge store use tenant-scoped PostgreSQL repositories.
 
 ## Code reading
 
+The accepted next runtime uses Graphify for versioned structural navigation
+and stores only stable graph/source references plus investigation-scoped
+security annotations in Context Fabric. Raw Graphify IDs are normalized before
+they become durable dependencies. The current path described below remains
+active until the adapter and investigation pipeline pass parity tests; see
+[Graphify-backed investigations](../PLAN.md#graphify-backed-investigations-for-code-scanning).
+
 AI-created ripgrep queries are the primary discovery mechanism. Tree-sitter
 maintains a compact Security IR of symbols, imports, calls, routes, and selected
 security facts. The Context Compiler expands a search hit to the smallest

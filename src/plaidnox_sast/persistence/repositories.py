@@ -16,7 +16,7 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import load_json
-from ..graph import StructuralGraph, Symbol
+from ..graph import StructuralGraph, Symbol, stable_symbol_id, stable_symbol_keys
 from ..redaction import redact_payload
 from .models import (
     ArtifactRecord,
@@ -30,6 +30,7 @@ from .models import (
     HuntPlanRecord,
     HuntTaskRecord,
     KnowledgeUsageRecord,
+    OverlaySymbolSummaryRecord,
     RepositoryContextRecord,
     ScanJobRecord,
     ScanRunRecord,
@@ -37,6 +38,7 @@ from .models import (
     SecurityMemoryRecord,
     SnapshotRecord,
     SourceFileRecord,
+    SymbolSummaryRecord,
     SymbolRecord,
     TenantControlRecord,
     UsageEventRecord,
@@ -65,7 +67,7 @@ def stable_id(prefix: str, *parts: str) -> str:
 def symbol_id(stable_key: str) -> str:
     """Return the cross-snapshot identity used for a Security IR symbol."""
 
-    return f"sym-{_hash(stable_key)}"
+    return stable_symbol_id(stable_key)
 
 
 # Versions the shape of `security_ir_inputs()`'s output, independent of prompt wording.
@@ -730,6 +732,30 @@ class CodeScanningRepository:
         self.session.flush()
         return _snapshot_value(record)
 
+    def attach_snapshot_parent(self, snapshot_id: str, parent_snapshot_id: str) -> None:
+        """Attach an initially indexed revision to its immutable base exactly once."""
+        child = self.session.scalar(
+            select(SnapshotRecord).where(
+                SnapshotRecord.snapshot_id == snapshot_id,
+                SnapshotRecord.tenant_id == self.tenant_id,
+            )
+        )
+        parent = self.get_snapshot(parent_snapshot_id)
+        if child is None or parent is None:
+            raise PersistenceConflictError("snapshot or parent is outside the tenant scope")
+        if child.parent_snapshot_id not in (None, parent_snapshot_id):
+            raise PersistenceConflictError("immutable snapshot is already attached to another parent")
+        child.parent_snapshot_id = parent_snapshot_id
+        self.session.flush()
+
+    def clear_snapshot_security_summaries(self, snapshot_id: str) -> None:
+        """Remove a just-indexed full summary set before storing its sparse overlay delta."""
+        if self.get_snapshot(snapshot_id) is None:
+            raise PersistenceConflictError("snapshot does not exist in the tenant scope")
+        self.session.execute(
+            delete(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id)
+        )
+
     def start_scan(
         self,
         scan_id: str,
@@ -1051,6 +1077,164 @@ class CodeScanningRepository:
             )
         self.session.flush()
         return True
+
+    def save_security_summaries(
+        self, snapshot_id: str, summaries: Iterable[dict[str, Any]]
+    ) -> int:
+        """Persist immutable content-versioned summaries for one tenant snapshot."""
+        if self.get_snapshot(snapshot_id) is None:
+            raise PersistenceConflictError("snapshot does not exist in the tenant scope")
+        incoming = {str(item["symbol_id"]): dict(item) for item in summaries}
+        from ..worksets import validate_security_contract
+
+        for symbol_id_value, data in incoming.items():
+            validate_security_contract("security_summary", data)
+            if data["symbol_id"] != symbol_id_value:
+                raise PersistenceConflictError("summary key does not match its symbol identity")
+        existing_rows = self.session.execute(
+            select(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id)
+        ).scalars().all()
+        existing = {item.symbol_id: item for item in existing_rows}
+        if existing and set(existing) != set(incoming):
+            raise PersistenceConflictError(
+                "immutable snapshot has a conflicting symbol summary set"
+            )
+        inserted = 0
+        for symbol_id_value, data in incoming.items():
+            content_hash = str(data.get("content_hash", ""))
+            prior = existing.get(symbol_id_value)
+            if prior is not None:
+                if prior.content_hash != content_hash or prior.summary_data != data:
+                    raise PersistenceConflictError(
+                        "immutable snapshot has conflicting symbol summary data"
+                    )
+                continue
+            record_id = stable_id("summary", snapshot_id, symbol_id_value)
+            self.session.add(
+                SymbolSummaryRecord(
+                    summary_record_id=record_id,
+                    snapshot_id=snapshot_id,
+                    symbol_id=symbol_id_value,
+                    content_hash=content_hash,
+                    summary_data=data,
+                )
+            )
+            inserted += 1
+        self.session.flush()
+        return inserted
+
+    def list_security_summaries(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """Load summaries only from an existing tenant-owned snapshot."""
+        if self.get_snapshot(snapshot_id) is None:
+            raise PersistenceConflictError("snapshot does not exist in the tenant scope")
+        rows = self.session.execute(
+            select(SymbolSummaryRecord.summary_data)
+            .where(SymbolSummaryRecord.snapshot_id == snapshot_id)
+            .order_by(SymbolSummaryRecord.symbol_id)
+        ).scalars().all()
+        return [dict(item) for item in rows]
+
+    def save_overlay_security_summaries(
+        self,
+        snapshot_id: str,
+        base_snapshot_id: str,
+        summaries: Iterable[dict[str, Any]],
+    ) -> int:
+        """Persist only changed summaries and deletion tombstones for a child snapshot."""
+        snapshot = self.get_snapshot(snapshot_id)
+        base_snapshot = self.get_snapshot(base_snapshot_id)
+        if snapshot is None or base_snapshot is None:
+            raise PersistenceConflictError("overlay snapshot or base is outside the tenant scope")
+        child_record = self.session.scalar(
+            select(SnapshotRecord).where(
+                SnapshotRecord.snapshot_id == snapshot_id,
+                SnapshotRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if child_record is None or child_record.parent_snapshot_id != base_snapshot_id:
+            raise PersistenceConflictError("summary overlay must reference its declared parent snapshot")
+
+        incoming = {str(item["symbol_id"]): dict(item) for item in summaries}
+        from ..worksets import validate_security_contract
+
+        for symbol_id_value, data in incoming.items():
+            validate_security_contract("security_summary", data)
+            if data["symbol_id"] != symbol_id_value:
+                raise PersistenceConflictError("summary key does not match its symbol identity")
+        base = {item["symbol_id"]: item for item in self.list_effective_security_summaries(base_snapshot_id)}
+        expected: dict[str, tuple[str, str | None, dict[str, Any] | None]] = {}
+        for symbol_id_value, data in incoming.items():
+            if base.get(symbol_id_value) != data:
+                expected[symbol_id_value] = ("active", str(data.get("content_hash", "")), data)
+        for symbol_id_value in set(base) - set(incoming):
+            expected[symbol_id_value] = ("deleted", None, None)
+
+        existing_rows = self.session.execute(
+            select(OverlaySymbolSummaryRecord).where(
+                OverlaySymbolSummaryRecord.snapshot_id == snapshot_id
+            )
+        ).scalars().all()
+        existing = {item.symbol_id: item for item in existing_rows}
+        if existing and set(existing) != set(expected):
+            raise PersistenceConflictError("immutable summary overlay has a conflicting delta set")
+
+        inserted = 0
+        for symbol_id_value, (state, content_hash, data) in expected.items():
+            prior = existing.get(symbol_id_value)
+            if prior is not None:
+                if (prior.summary_state, prior.content_hash, prior.summary_data) != (state, content_hash, data):
+                    raise PersistenceConflictError("immutable summary overlay has conflicting data")
+                continue
+            self.session.add(
+                OverlaySymbolSummaryRecord(
+                    summary_record_id=stable_id("overlay-summary", snapshot_id, symbol_id_value),
+                    snapshot_id=snapshot_id,
+                    symbol_id=symbol_id_value,
+                    summary_state=state,
+                    content_hash=content_hash,
+                    summary_data=data,
+                )
+            )
+            inserted += 1
+        self.session.flush()
+        return inserted
+
+    def list_effective_security_summaries(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """Resolve immutable base and sparse child deltas, validating tenant ownership."""
+        chain: list[str] = []
+        current_id: str | None = snapshot_id
+        while current_id is not None:
+            record = self.session.scalar(
+                select(SnapshotRecord).where(
+                    SnapshotRecord.snapshot_id == current_id,
+                    SnapshotRecord.tenant_id == self.tenant_id,
+                )
+            )
+            if record is None:
+                raise PersistenceConflictError("snapshot does not exist in the tenant scope")
+            chain.append(current_id)
+            current_id = record.parent_snapshot_id
+
+        effective: dict[str, dict[str, Any]] = {}
+        for revision_id in reversed(chain):
+            base_rows = self.session.execute(
+                select(SymbolSummaryRecord.symbol_id, SymbolSummaryRecord.summary_data).where(
+                    SymbolSummaryRecord.snapshot_id == revision_id
+                )
+            ).all()
+            for row in base_rows:
+                effective[row.symbol_id] = dict(row.summary_data)
+            overlay_rows = self.session.execute(
+                select(OverlaySymbolSummaryRecord).where(
+                    OverlaySymbolSummaryRecord.snapshot_id == revision_id
+                )
+            ).scalars().all()
+            for row in overlay_rows:
+                if row.summary_state == "deleted":
+                    effective.pop(row.symbol_id, None)
+                elif row.summary_data is not None:
+                    effective[row.symbol_id] = dict(row.summary_data)
+        return [effective[key] for key in sorted(effective)]
 
     def list_symbol_identities(self, snapshot_id: str) -> list[SymbolIdentity]:
         rows = self.session.execute(
@@ -1857,23 +2041,13 @@ def security_ir_inputs(
         if not any(entry.kind != "route" for entry in entries):
             # Routes alone leave module-level code unowned; keep the file symbol too.
             entries = [*entries, Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file")]
-        identity_counts: dict[tuple[str, str], int] = {}
-        for entry in entries:
-            name = entry.qualified_name or entry.name
-            identity_counts[(entry.kind, name)] = identity_counts.get((entry.kind, name), 0) + 1
-        duplicate_occurrences: dict[tuple[str, str, str], int] = {}
+        stable_key_by_symbol = stable_symbol_keys(entries)
         for entry in entries:
             name = entry.qualified_name or entry.name
             line = entry.line
             end = max(line, entry.end_line)
             content = "\n".join(line_text.rstrip() for line_text in lines[line - 1 : min(end, len(lines))]).strip()
-            stable_key = f"{file_ir.path}:{entry.kind}:{name}"
-            if identity_counts[(entry.kind, name)] > 1:
-                signature_hash = hashlib.sha256(entry.signature.strip().encode("utf-8")).hexdigest()[:16]
-                duplicate_key = (entry.kind, name, signature_hash)
-                occurrence = duplicate_occurrences.get(duplicate_key, 0)
-                duplicate_occurrences[duplicate_key] = occurrence + 1
-                stable_key = f"{stable_key}:{signature_hash}:{occurrence}"
+            stable_key = stable_key_by_symbol[id(entry)]
             symbol_inputs.append(
                 SymbolInput(
                     stable_key=stable_key,

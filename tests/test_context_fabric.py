@@ -1,6 +1,8 @@
+import pytest
+
 from plaidnox_sast.cli import _record_context_base
 from plaidnox_sast.context_fabric import ContextFabricStore, _snapshot_symbols
-from plaidnox_sast.graph import build_structural_graph
+from plaidnox_sast.graph import build_structural_graph, stable_symbol_id, stable_symbol_keys
 from plaidnox_sast.pipeline import SastPipeline
 
 
@@ -38,6 +40,9 @@ class _Plan:
 
 def test_context_base_is_content_addressed_and_reused(sample_repo, tmp_path):
     store = ContextFabricStore(tmp_path / "context.sqlite")
+    (sample_repo / "helper.js").write_text(
+        "function helper(value) { return String(value); }\n", encoding="utf-8"
+    )
     graph = build_structural_graph(sample_repo)
 
     first = store.create_base("owner/repo", "a" * 40, sample_repo, graph)
@@ -46,6 +51,60 @@ def test_context_base_is_content_addressed_and_reused(sample_repo, tmp_path):
     assert first.context_id == second.context_id
     assert first.symbol_count > 0
     assert second.reused is True
+    summaries = store.list_security_summaries(first.context_id)
+    assert summaries
+    assert all(len(item["content_hash"]) == 64 for item in summaries)
+    assert any(item["unresolved_relationship_ids"] for item in summaries)
+    stable_keys = stable_symbol_keys(graph.symbols + graph.routes)
+    assert {item["symbol_id"] for item in summaries} == {
+        stable_symbol_id(stable_keys[id(symbol)])
+        for symbol in graph.symbols
+        if symbol.kind != "route"
+    }
+
+
+def test_context_base_rejects_conflicting_summary_for_immutable_revision(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "service.py"
+    source.write_text("def load():\n    return 1\n", encoding="utf-8")
+    store = ContextFabricStore(tmp_path / "context.sqlite")
+    store.create_base("owner/repo", "revision-a", repository, build_structural_graph(repository))
+
+    source.write_text("def load():\n    return 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="immutable Context Fabric snapshot"):
+        store.create_base("owner/repo", "revision-a", repository, build_structural_graph(repository))
+
+
+def test_overlay_tombstone_hides_deleted_summary_and_recomputes_caller(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "service.py"
+    source.write_text(
+        "def persist(value):\n    return value\n\n"
+        "def handle(value):\n    return persist(value)\n",
+        encoding="utf-8",
+    )
+    store = ContextFabricStore(tmp_path / "context.sqlite")
+    base_graph = build_structural_graph(repository)
+    base = store.create_base("owner/repo", "revision-a", repository, base_graph)
+    base_summaries = {
+        item["facts"][0]["name"]: item
+        for item in store.list_security_summaries(base.context_id)
+    }
+
+    source.write_text("def handle(value):\n    return persist(value)\n", encoding="utf-8")
+    overlay = store.create_overlay(
+        base, "revision-b", repository, ["service.py"], build_structural_graph(repository)
+    )
+
+    effective = {
+        item["facts"][0]["name"]: item
+        for item in store.effective_security_summaries(overlay.overlay_id)
+    }
+    assert "persist" not in effective
+    assert effective["handle"]["content_hash"] != base_summaries["handle"]["content_hash"]
+    assert effective["handle"]["unresolved_relationship_ids"]
 
 
 def test_overlay_keeps_changed_code_and_revalidates_only_linked_finding(sample_repo, tmp_path):
@@ -107,10 +166,27 @@ def test_changed_callee_keeps_identity_and_revalidates_unchanged_caller(tmp_path
         ["app.js"],
         build_structural_graph(repository),
     )
+    base_summaries = {
+        item["facts"][0]["name"]: item
+        for item in store.list_security_summaries(base.context_id)
+    }
+    overlay_summaries = {
+        item["facts"][0]["name"]: item
+        for item in store.list_overlay_security_summaries(overlay.overlay_id)
+    }
 
     assert base_ids["loadAccount"] in overlay.changed_symbols
     assert base_ids["handleRequest"] not in overlay.changed_symbols
     assert base_ids["handleRequest"] in overlay.affected_symbols
+    assert set(overlay_summaries) == {"loadAccount", "handleRequest"}
+    assert (
+        overlay_summaries["loadAccount"]["content_hash"]
+        != base_summaries["loadAccount"]["content_hash"]
+    )
+    assert (
+        overlay_summaries["handleRequest"]["content_hash"]
+        == base_summaries["handleRequest"]["content_hash"]
+    )
 
 
 def test_unrelated_change_reuses_linked_finding_context(tmp_path):

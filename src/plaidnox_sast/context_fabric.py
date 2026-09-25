@@ -16,11 +16,94 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .assets import load_json, load_text
-from .graph import StructuralGraph, Symbol
+from .graph import StructuralGraph, Symbol, stable_symbol_id, stable_symbol_keys
+from .worksets import security_summaries_from_graph, validate_security_contract
 
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _persist_security_summaries(
+    conn: sqlite3.Connection, context_id: str, graph: StructuralGraph
+) -> None:
+    existing_rows = conn.execute(
+        load_text("sql/context/list_symbol_summaries.sql"), (context_id,)
+    ).fetchall()
+    existing = {row["symbol_id"]: json.loads(row["summary_json"]) for row in existing_rows}
+    summaries = security_summaries_from_graph(graph)
+    for summary in summaries:
+        value = summary.to_dict()
+        validate_security_contract("security_summary", value)
+        prior = existing.get(summary.symbol_id)
+        if prior is not None:
+            if prior != value:
+                raise ValueError(
+                "immutable Context Fabric snapshot has conflicting symbol summary data"
+            )
+            continue
+        conn.execute(
+            load_text("sql/context/insert_symbol_summary.sql"),
+            (
+                context_id,
+                summary.symbol_id,
+                summary.content_hash,
+                json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+    incoming_ids = {item.symbol_id for item in summaries}
+    if existing and set(existing) != incoming_ids:
+        raise ValueError(
+            "immutable Context Fabric snapshot has a conflicting symbol summary set"
+        )
+
+
+def _persist_overlay_security_summaries(
+    conn: sqlite3.Connection,
+    overlay_id: str,
+    summaries: Iterable[dict[str, Any]],
+    deleted_symbol_ids: Iterable[str] = (),
+) -> None:
+    existing_rows = conn.execute(
+        load_text("sql/context/list_overlay_summary_states.sql"), (overlay_id,)
+    ).fetchall()
+    existing = {
+        row["symbol_id"]: (
+            row["summary_state"],
+            json.loads(row["summary_json"]) if row["summary_json"] is not None else None,
+        )
+        for row in existing_rows
+    }
+    incoming = {str(item["symbol_id"]): dict(item) for item in summaries}
+    for symbol_id, value in incoming.items():
+        validate_security_contract("security_summary", value)
+        prior = existing.get(symbol_id)
+        if prior is not None:
+            if prior != ("active", value):
+                raise ValueError("immutable Context Fabric overlay has conflicting summary data")
+            continue
+        conn.execute(
+            load_text("sql/context/insert_overlay_symbol_summary.sql"),
+            (
+                overlay_id,
+                symbol_id,
+                str(value["content_hash"]),
+                json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+    deleted = set(deleted_symbol_ids) - set(incoming)
+    for symbol_id in deleted:
+        prior = existing.get(symbol_id)
+        if prior is not None:
+            if prior != ("deleted", None):
+                raise ValueError("immutable Context Fabric overlay has conflicting summary tombstone")
+            continue
+        conn.execute(
+            load_text("sql/context/insert_overlay_summary_tombstone.sql"),
+            (overlay_id, symbol_id),
+        )
+    if existing and set(existing) != set(incoming) | deleted:
+        raise ValueError("immutable Context Fabric overlay has a conflicting summary set")
 
 
 def _normalise(value: str) -> str:
@@ -175,6 +258,7 @@ class ContextFabricStore:
                 load_text("sql/context/find_base.sql"), (repository, commit)
             ).fetchone()
             if prior:
+                _persist_security_summaries(conn, prior["context_id"], graph)
                 conn.executemany(
                     load_text("sql/context/insert_context_file.sql"),
                     [(prior["context_id"], item.path, item.content_hash) for item in graph.files],
@@ -202,7 +286,49 @@ class ContextFabricStore:
                 load_text("sql/context/insert_context_file.sql"),
                 [(context_id, item.path, item.content_hash) for item in graph.files],
             )
+            _persist_security_summaries(conn, context_id, graph)
             return ContextBase(context_id, repository, commit, len(symbols))
+
+    def list_security_summaries(self, context_id: str) -> list[dict[str, Any]]:
+        """Load versioned structural summaries from an immutable local base."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                load_text("sql/context/list_symbol_summaries.sql"), (context_id,)
+            ).fetchall()
+        return [json.loads(row["summary_json"]) for row in rows]
+
+    def list_overlay_security_summaries(self, overlay_id: str) -> list[dict[str, Any]]:
+        """Load only changed-symbol summaries stored in a branch overlay."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                load_text("sql/context/list_overlay_symbol_summaries.sql"), (overlay_id,)
+            ).fetchall()
+        return [json.loads(row["summary_json"]) for row in rows]
+
+    def effective_security_summaries(self, overlay_id: str) -> list[dict[str, Any]]:
+        """Merge base summaries with changed overlay records and deletion tombstones."""
+        with self._connect() as conn:
+            base = conn.execute(
+                load_text("sql/context/select_overlay_base.sql"), (overlay_id,)
+            ).fetchone()
+            if base is None:
+                raise ValueError("Context Fabric overlay does not exist")
+            base_rows = conn.execute(
+                load_text("sql/context/list_symbol_summaries.sql"),
+                (base["base_context_id"],),
+            ).fetchall()
+            overlay_rows = conn.execute(
+                load_text("sql/context/list_overlay_summary_states.sql"), (overlay_id,)
+            ).fetchall()
+        merged = {
+            row["symbol_id"]: json.loads(row["summary_json"]) for row in base_rows
+        }
+        for row in overlay_rows:
+            if row["summary_state"] == "deleted":
+                merged.pop(row["symbol_id"], None)
+            else:
+                merged[row["symbol_id"]] = json.loads(row["summary_json"])
+        return [merged[key] for key in sorted(merged)]
 
     def prepare_snapshot(
         self,
@@ -313,6 +439,20 @@ class ContextFabricStore:
                 load_text("sql/context/select_base_symbols.sql"), (base.context_id,)
             ).fetchall()
             prior_by_id = {row["symbol_id"]: row for row in base_symbols}
+            current_summaries = security_summaries_from_graph(graph)
+            current_summary_by_id = {item.symbol_id: item.to_dict() for item in current_summaries}
+            base_summary_by_id = {
+                row["symbol_id"]: json.loads(row["summary_json"])
+                for row in conn.execute(
+                    load_text("sql/context/list_symbol_summaries.sql"),
+                    (base.context_id,),
+                ).fetchall()
+            }
+            summary_update_ids = {
+                symbol_id
+                for symbol_id, summary in current_summary_by_id.items()
+                if base_summary_by_id.get(symbol_id) != summary
+            }
             current_ids = {item[0] for item in current}
             changed_ids: list[str] = []
             for symbol_id, path, name, line, content_hash, _content in current:
@@ -322,7 +462,12 @@ class ContextFabricStore:
             for row in base_symbols:
                 if row["path"] in changed and row["symbol_id"] not in current_ids:
                     changed_ids.append(row["symbol_id"])
+            for symbol_id, summary in current_summary_by_id.items():
+                prior_summary = base_summary_by_id.get(symbol_id)
+                if prior_summary is None or prior_summary["content_hash"] != summary["content_hash"]:
+                    changed_ids.append(symbol_id)
 
+            changed_ids = sorted(set(changed_ids))
             affected = self._reverse_dependencies(conn, base.context_id, changed_ids)
             overlay_id = f"ovl-{_sha256(base.context_id + ':' + head_commit)[:12]}"
             conn.execute(
@@ -331,12 +476,36 @@ class ContextFabricStore:
             )
             conn.executemany(
                 load_text("sql/context/upsert_overlay_change.sql"),
-                [(overlay_id, symbol_id) for symbol_id in changed_ids],
+                [
+                    (
+                        overlay_id,
+                        symbol_id,
+                        "deleted"
+                        if symbol_id not in current_ids and symbol_id not in current_summary_by_id
+                        else "modified"
+                        if symbol_id in prior_by_id
+                        else "added",
+                    )
+                    for symbol_id in changed_ids
+                ],
             )
             conn.execute(load_text("sql/context/delete_overlay_symbols.sql"), (overlay_id,))
             conn.executemany(
                 load_text("sql/context/insert_overlay_symbol.sql"),
                 [(overlay_id, symbol_id, path, name, line, content) for symbol_id, path, name, line, _content_hash, content in current],
+            )
+            changed_id_set = set(changed_ids)
+            current_summary_ids = {item.symbol_id for item in current_summaries}
+            base_summary_ids = set(base_summary_by_id)
+            _persist_overlay_security_summaries(
+                conn,
+                overlay_id,
+                [
+                    item.to_dict()
+                    for item in current_summaries
+                    if item.symbol_id in summary_update_ids
+                ],
+                deleted_symbol_ids=(base_summary_ids & changed_id_set) - current_summary_ids,
             )
             reused = 100 if base.symbol_count == 0 else round(max(0, base.symbol_count - len(set(changed_ids))) * 100 / base.symbol_count)
             return ContextOverlay(overlay_id, base.context_id, base.repository, head_commit, changed, sorted(set(changed_ids)), affected, reused)
@@ -461,25 +630,15 @@ def _snapshot_symbols(
         entries = sorted(symbols_by_path.get(relative, []), key=lambda item: item.line)
         if not entries:
             entries = [Symbol(relative, relative, 1, max(1, len(lines)), "file", relative, "")]
-        identity_counts: dict[tuple[str, str], int] = {}
-        for symbol in entries:
-            name = symbol.qualified_name or symbol.name
-            identity_counts[(symbol.kind, name)] = identity_counts.get((symbol.kind, name), 0) + 1
-        duplicate_occurrences: dict[tuple[str, str, str], int] = {}
+        stable_key_by_symbol = stable_symbol_keys(entries)
         for symbol in entries:
             name = symbol.qualified_name or symbol.name
             line = symbol.line
             end = max(symbol.end_line, line)
             content = _normalise("\n".join(lines[line - 1 : min(end, len(lines))]))
             content_hash = _sha256(content)
-            stable_key = f"{relative}:{symbol.kind}:{name}"
-            if identity_counts[(symbol.kind, name)] > 1:
-                signature_hash = _sha256(_normalise(symbol.signature))[:16]
-                duplicate_key = (symbol.kind, name, signature_hash)
-                occurrence = duplicate_occurrences.get(duplicate_key, 0)
-                duplicate_occurrences[duplicate_key] = occurrence + 1
-                stable_key = f"{stable_key}:{signature_hash}:{occurrence}"
-            symbol_id = f"sym-{_sha256(stable_key)[:16]}"
+            stable_key = stable_key_by_symbol[id(symbol)]
+            symbol_id = stable_symbol_id(stable_key)
             records.append((symbol_id, relative, name, line, content_hash, content))
     return records
 

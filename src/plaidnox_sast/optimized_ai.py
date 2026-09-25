@@ -30,12 +30,13 @@ from .ai import (
     _is_generated_path,
     _related_ir,
     _resolve_context_request,
+    _security_workset_review_units,
     _source_window,
     _source_segments,
 )
 from .assets import load_json, load_text
 from .checkpoint import candidate_from_dict, candidate_to_dict, unit_key
-from .coverage import obligation_identity, reconcile_obligations
+from .coverage import obligation_identity, reconcile_obligations, reconcile_workset_batches
 from .errors import AIStageError
 from .fingerprint import CandidateIndex
 from .graph import (
@@ -48,6 +49,14 @@ from .graph import (
 )
 from .models import Candidate
 from .redaction import redact
+from .worksets import (
+    SecuritySlice,
+    SecurityWorkset,
+    SecurityWorksetContractError,
+    SourceLocation,
+    security_worksets_from_graph,
+    security_worksets_from_regions,
+)
 
 
 def _stable_hash(value: Any) -> str:
@@ -78,9 +87,344 @@ def _coverage_observations(state: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _discovery_workset_units(
+    regions: list["DiscoveryRegion"],
+    *,
+    root: Path | None = None,
+    graph: StructuralGraph | None = None,
+    source_excludes: list[str] | None = None,
+    max_file_bytes: int | None = None,
+    indexed_worksets: list[SecurityWorkset] | None = None,
+) -> tuple[list["DiscoveryRegion"], dict[str, int]]:
+    """Convert source-window regions into bounded live discovery worksets.
+
+    The adapter is deliberately evidence-preserving: every batch maps back to
+    its exact source regions, and obligations are unioned only from those
+    regions. Worksets do not assert semantic relationships beyond their source
+    and syntax facts.
+    """
+    graph_units: list[DiscoveryRegion] = []
+    graph_stats = {
+        "graph_worksets_selected": 0,
+        "graph_worksets_deferred_batches": 0,
+        "graph_worksets_deferred_sources": 0,
+    }
+    if root is not None and graph is not None:
+        graph_units, regions, graph_stats = _graph_discovery_units(
+            root,
+            graph,
+            regions,
+            source_excludes=source_excludes or [],
+            max_file_bytes=max_file_bytes,
+            indexed_worksets=indexed_worksets,
+        )
+    graph_region_count = sum(
+        int(unit.security_ir_slice.get("source_region_count", 0))
+        for unit in graph_units
+    )
+    graph_incomplete_count = sum(
+        not unit.security_workset["workset_complete"] for unit in graph_units
+    )
+
+    if not regions:
+        for unit in graph_units:
+            _attach_surface_review_obligation(unit)
+        return graph_units, {
+            "regions": graph_region_count,
+            "regions_with_worksets": graph_region_count,
+            "unique_worksets": graph_stats["graph_worksets_selected"],
+            "review_batches": len(graph_units),
+            "incomplete_worksets": graph_incomplete_count,
+            **graph_stats,
+        }
+
+    source_by_window = {
+        (
+            item.path,
+            item.start_line,
+            item.end_line,
+            _region_surface_id(item),
+        ): item
+        for item in regions
+    }
+    payloads = [item.to_segment() for item in regions]
+    batches, stats = _security_workset_review_units(payloads)
+    units: list[DiscoveryRegion] = []
+    for batch in batches:
+        members = [
+            source_by_window[
+                (
+                    str(source_key["path"]),
+                    int(source_key["start_line"]),
+                    int(source_key["end_line"]),
+                    str(source_key["surface_id"]),
+                )
+            ]
+            for source_key in batch["_source_region_keys"]
+        ]
+        if not members:
+            raise AIResponseError("a discovery workset batch has no source regions")
+        serialized_workset = dict(batch["security_workset"])
+        units.append(_discovery_unit_from_batch(members, serialized_workset))
+    units = graph_units + units
+    for unit in units:
+        _attach_surface_review_obligation(unit)
+    return units, {
+        "regions": len(payloads) + graph_region_count,
+        "regions_with_worksets": len(payloads) + graph_region_count,
+        "unique_worksets": stats["unique_worksets"] + graph_stats["graph_worksets_selected"],
+        "review_batches": len(units),
+        "incomplete_worksets": stats["incomplete_worksets"] + graph_incomplete_count,
+        **graph_stats,
+    }
+
+
+def _attach_surface_review_obligation(unit: "DiscoveryRegion") -> None:
+    """Give each selected workset batch an explicit required review ledger entry."""
+    workset = unit.security_workset
+    if not workset:
+        raise AIResponseError("a discovery review unit has no security workset")
+    review = load_text("prompts/operations/vulnerability_discovery/surface_review.md")
+    question = json.dumps(
+        {
+            "surface_type": str(workset["surface_type"]),
+            "surface_id": str(workset["surface_id"]),
+            "review": review,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    canonical_id, importance = obligation_identity("surface_review", question)
+    obligation_id = f"obl-{canonical_id[:20]}"
+    unit.obligation_specs[obligation_id] = DiscoveryObligation(
+        obligation_id,
+        "surface_review",
+        question,
+        canonical_id=canonical_id,
+        importance=importance,
+    )
+    workset["obligation_ids"] = sorted(set(workset.get("obligation_ids", [])) | {obligation_id})
+
+
+def _discovery_unit_from_batch(
+    members: list["DiscoveryRegion"], serialized_workset: dict[str, Any]
+) -> "DiscoveryRegion":
+    representative = min(members, key=lambda item: (item.path, item.start_line, item.end_line))
+    slices = list(serialized_workset.get("slices", []))
+    source_hashes = sorted(
+        str(location.get("content_hash", ""))
+        for item in slices
+        for location in item.get("locations", [])
+        if isinstance(location, Mapping)
+    )
+    return DiscoveryRegion(
+        path=representative.path,
+        start_line=representative.start_line,
+        end_line=representative.end_line,
+        content="",
+        anchor_type=representative.anchor_type,
+        anchor_id=representative.anchor_id,
+        content_hash=_stable_hash(source_hashes),
+        security_ir_hash=_stable_hash(
+            [item.security_ir_hash for item in sorted(members, key=lambda value: value.region_id)]
+        ),
+        task_ids={value for item in members for value in item.task_ids},
+        query_ids={value for item in members for value in item.query_ids},
+        coverage_refs={value for item in members for value in item.coverage_refs},
+        obligations={value for item in members for value in item.obligations},
+        obligation_specs={
+            key: value for item in members for key, value in item.obligation_specs.items()
+        },
+        vulnerability_themes={value for item in members for value in item.vulnerability_themes},
+        security_ir_slice={
+            "workset_id": serialized_workset["workset_id"],
+            "evidence_hash": serialized_workset["evidence_hash"],
+            "source_region_count": len(members),
+        },
+        source_slices=slices,
+        security_workset=serialized_workset,
+        workset_id=str(serialized_workset["workset_id"]),
+    )
+
+
+def _graph_discovery_units(
+    root: Path,
+    graph: StructuralGraph,
+    regions: list["DiscoveryRegion"],
+    *,
+    source_excludes: list[str],
+    max_file_bytes: int | None,
+    indexed_worksets: list[SecurityWorkset] | None = None,
+) -> tuple[list["DiscoveryRegion"], list["DiscoveryRegion"], dict[str, int]]:
+    """Attach an exact route/registration anchor to indexed cross-file evidence."""
+    graph_worksets = indexed_worksets if indexed_worksets is not None else security_worksets_from_graph(root, graph)
+    routes_by_surface: dict[str, list[SecurityWorkset]] = {}
+    registrations_by_path: dict[str, list[SecurityWorkset]] = {}
+    for workset in graph_worksets:
+        if workset.surface_type == "http_route":
+            routes_by_surface.setdefault(workset.surface_id, []).append(workset)
+        elif workset.surface_type == "symbol_registration":
+            for path in {
+                location.path
+                for evidence in workset.slices
+                for location in evidence.locations
+                if location.symbol_id == workset.surface_id
+            }:
+                registrations_by_path.setdefault(path, []).append(workset)
+    selected: dict[tuple[str, str], tuple[SecurityWorkset, list[DiscoveryRegion]]] = {}
+    unmatched: list[DiscoveryRegion] = []
+    deferred_batches = 0
+    deferred_sources = 0
+    for region in regions:
+        possible = (
+            routes_by_surface.get(_region_surface_id(region), [])
+            if region.anchor_type == "route"
+            else registrations_by_path.get(region.path, [])
+        )
+        matches = [
+            workset for workset in possible
+            if _workset_primary_matches_region(workset, region)
+        ]
+        if len(matches) != 1:
+            unmatched.append(region)
+            continue
+        workset = matches[0]
+        if any(
+            _is_sensitive_path(Path(location.path))
+            or _is_generated_path(Path(location.path))
+            or not source_file_is_admitted(
+                root,
+                root / location.path,
+                exclude=source_excludes,
+                max_file_bytes=max_file_bytes,
+            )
+            for evidence in workset.slices
+            for location in evidence.locations
+        ):
+            deferred_sources += 1
+            unmatched.append(region)
+            continue
+        key = (workset.workset_id, workset.evidence_hash)
+        if key not in selected:
+            selected[key] = (workset, [])
+        selected[key][1].append(region)
+
+    units: list[DiscoveryRegion] = []
+    for workset, members in selected.values():
+        augmented = _preserve_region_evidence(workset, members)
+        try:
+            batches = augmented.batches()
+        except SecurityWorksetContractError:
+            batches = []
+        if len(batches) != 1:
+            deferred_batches += len(members)
+            unmatched.extend(members)
+            continue
+        batch = batches[0]
+        serialized = {
+            **batch,
+            "surface_type": augmented.surface_type,
+            "surface_id": augmented.surface_id,
+            "evidence_source": "tree_sitter_graph",
+            "semantic_relationships_validated": False,
+            "metadata": dict(augmented.metadata),
+        }
+        units.append(_discovery_unit_from_batch(members, serialized))
+    return units, unmatched, {
+        "graph_worksets_selected": len(units),
+        "graph_worksets_deferred_batches": deferred_batches,
+        "graph_worksets_deferred_sources": deferred_sources,
+    }
+
+
+def _preserve_region_evidence(
+    workset: SecurityWorkset, members: list["DiscoveryRegion"]
+) -> SecurityWorkset:
+    """Keep the whole discovered source region alongside indexed relationships."""
+    primary_slices: list[SecuritySlice] = []
+    for evidence in workset.slices:
+        locations = tuple(
+            SourceLocation(
+                path=location.path,
+                start_line=location.start_line,
+                end_line=location.end_line,
+                content_hash=location.content_hash,
+                excerpt=(
+                    ""
+                    if any(
+                        location.path == region.path
+                        and region.start_line <= location.start_line
+                        and location.end_line <= region.end_line
+                        for region in members
+                    )
+                    else location.excerpt
+                ),
+                symbol_id=location.symbol_id,
+            )
+            for location in evidence.locations
+        )
+        primary_slices.append(
+            SecuritySlice(
+                locations=locations,
+                facts=evidence.facts,
+                unresolved_edge_ids=evidence.unresolved_edge_ids,
+                omitted_fact_ids=evidence.omitted_fact_ids,
+            )
+        )
+    region_slices = [
+        evidence
+        for region_workset in security_worksets_from_regions(
+            [region.to_segment() for region in members]
+        )
+        for evidence in region_workset.slices
+    ]
+    slices = {evidence.slice_id: evidence for evidence in [*primary_slices, *region_slices]}
+    return SecurityWorkset(
+        surface_type=workset.surface_type,
+        surface_id=workset.surface_id,
+        slices=tuple(slices.values()),
+        obligation_ids=tuple(
+            sorted({key for region in members for key in region.obligation_specs})
+        ),
+        unresolved_edge_ids=workset.unresolved_edge_ids,
+        metadata={**workset.metadata, "discovered_region_count": len(members)},
+    )
+
+
+def _workset_primary_matches_region(
+    workset: SecurityWorkset, region: "DiscoveryRegion"
+) -> bool:
+    if workset.surface_type == "http_route":
+        if region.anchor_type != "route" or workset.surface_id != _region_surface_id(region):
+            return False
+    elif workset.surface_type != "symbol_registration" or region.anchor_type == "route":
+        return False
+    primary_locations = [
+        location
+        for evidence in workset.slices
+        for location in evidence.locations
+        if location.symbol_id == workset.surface_id
+    ]
+    return any(
+        location.path == region.path
+        and location.start_line <= region.end_line
+        and location.end_line >= region.start_line
+        for location in primary_locations
+    )
+
+
+def _region_surface_id(region: "DiscoveryRegion") -> str:
+    anchor_id = region.anchor_id.strip() or f"{region.start_line}:{region.end_line}"
+    surface_id = f"{region.path}::{anchor_id}"
+    if region.anchor_type == "line_range":
+        surface_id = f"{surface_id}::{region.start_line}-{region.end_line}"
+    return surface_id
+
+
 @dataclass(slots=True)
 class DiscoveryRegion:
-    """One structural source region reviewed at most once per semantic obligation set."""
+    """A source region or bounded workset batch used as a discovery review unit."""
 
     path: str
     start_line: int
@@ -97,9 +441,20 @@ class DiscoveryRegion:
     obligation_specs: dict[str, "DiscoveryObligation"] = field(default_factory=dict)
     vulnerability_themes: set[str] = field(default_factory=set)
     security_ir_slice: dict[str, Any] = field(default_factory=dict)
+    source_slices: list[dict[str, Any]] = field(default_factory=list)
+    security_workset: dict[str, Any] = field(default_factory=dict)
+    workset_id: str = ""
 
     @property
     def region_id(self) -> str:
+        if self.workset_id:
+            return _stable_hash(
+                {
+                    "workset_id": self.workset_id,
+                    "evidence_hash": self.security_workset.get("evidence_hash", ""),
+                    "batch_index": self.security_workset.get("batch_index", 0),
+                }
+            )[:24]
         return _stable_hash(
             {
                 "path": self.path,
@@ -116,8 +471,11 @@ class DiscoveryRegion:
         """Stable cache identity: source/IR + what security work is being asked."""
 
         return unit_key(
-            "discovery-v3",
+            "discovery-workset-v1" if self.workset_id else "discovery-v3",
             {
+                "workset_id": self.workset_id,
+                "workset_evidence_hash": self.security_workset.get("evidence_hash", ""),
+                "workset_batch_index": self.security_workset.get("batch_index", 0),
                 "path": self.path,
                 "anchor_type": self.anchor_type,
                 "anchor_id": self.anchor_id,
@@ -132,8 +490,25 @@ class DiscoveryRegion:
             },
         )
 
-    def to_segment(self) -> dict[str, Any]:
-        return {
+    def source_windows(self) -> list[dict[str, Any]]:
+        windows = [
+            {
+                "path": str(location.get("path", self.path)),
+                "start_line": int(location.get("start_line", self.start_line)),
+                "end_line": int(location.get("end_line", self.end_line)),
+            }
+            for source_slice in self.source_slices
+            for location in source_slice.get("locations", [])
+            if isinstance(location, Mapping)
+        ]
+        if not windows:
+            windows.append(
+                {"path": self.path, "start_line": self.start_line, "end_line": self.end_line}
+            )
+        return windows
+
+    def to_segment(self, *, include_source_content: bool = True) -> dict[str, Any]:
+        segment = {
             "region_id": self.region_id,
             "path": self.path,
             "start_line": self.start_line,
@@ -150,7 +525,13 @@ class DiscoveryRegion:
             "obligation_ids": sorted(self.obligation_specs),
             "vulnerability_themes": sorted(self.vulnerability_themes),
             "security_ir_slice": self.security_ir_slice,
+            "source_slices": self.source_slices,
+            "source_windows": self.source_windows(),
+            "security_workset": self.security_workset,
         }
+        if not include_source_content:
+            segment.pop("content", None)
+        return segment
 
 
 class ObligationStatus(StrEnum):
@@ -745,6 +1126,7 @@ def _search_discovery_regions(
     include_paths: set[str] | None = None,
     error_sink: Callable[[RipgrepQueryError], None] | None = None,
     stats: dict[str, int] | None = None,
+    indexed_worksets: list[SecurityWorkset] | None = None,
 ) -> list[DiscoveryRegion]:
     eligible = {
         path.relative_to(root).as_posix()
@@ -897,6 +1279,15 @@ def _search_discovery_regions(
             regions.append(fallback)
             fallback_added += 1
 
+    if graph is not None:
+        _add_uncovered_indexed_routes(root, graph, regions, plan, eligible, stats=stats)
+        worksets = security_worksets_from_graph(root, graph)
+        if indexed_worksets is not None:
+            indexed_worksets.extend(worksets)
+        _add_uncovered_indexed_registrations(
+            root, graph, worksets, regions, plan, eligible, stats=stats
+        )
+
     if stats is not None:
         stats["fallback_regions_requested"] = fallback_requested
         stats["fallback_regions_suppressed"] = fallback_suppressed
@@ -904,6 +1295,127 @@ def _search_discovery_regions(
         stats["regions"] = len(regions)
 
     return sorted(regions, key=lambda item: (item.path, item.start_line, item.end_line, item.anchor_id))
+
+
+def _add_uncovered_indexed_routes(
+    root: Path,
+    graph: StructuralGraph,
+    regions: list[DiscoveryRegion],
+    plan: HuntPlan,
+    eligible_paths: set[str],
+    *,
+    stats: dict[str, int] | None = None,
+) -> None:
+    """Make indexed route coverage independent of model-generated search terms."""
+    policy = load_json("runtime/security_worksets.json")
+    maximum_lines = int(policy["maximum_source_lines_per_slice"])
+    maximum_characters = int(policy["maximum_indexed_route_region_characters"])
+    if maximum_lines < 1 or maximum_characters < 1:
+        raise SecurityWorksetContractError("indexed route region limits must be positive")
+
+    indexed = 0
+    added = 0
+    source_lines: dict[str, list[str]] = {}
+    for route in sorted(graph.routes, key=lambda item: (item.path, item.line, item.name)):
+        if route.path not in eligible_paths:
+            continue
+        indexed += 1
+        if route.path not in source_lines:
+            try:
+                source_lines[route.path] = (root / route.path).read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+            except OSError as exc:
+                raise AIResponseError("an indexed route source could not be read") from exc
+        lines = source_lines[route.path]
+        end = min(len(lines), max(route.line, route.end_line or route.line))
+        if route.line < 1 or end < route.line:
+            raise AIResponseError("an indexed route has an invalid source range")
+        anchor_id = str(route.qualified_name or route.name)
+        covered = [
+            (region.start_line, region.end_line)
+            for region in regions
+            if region.path == route.path
+            and region.anchor_type == "route"
+            and region.anchor_id == anchor_id
+        ]
+        for uncovered_start, uncovered_end in _subtract_covered_ranges(route.line, end, covered):
+            cursor = uncovered_start
+            while cursor <= uncovered_end:
+                current_size = 0
+                chunk_end = cursor - 1
+                for line_number in range(cursor, min(uncovered_end, cursor + maximum_lines - 1) + 1):
+                    line_size = len(lines[line_number - 1]) + 1
+                    if current_size + line_size > maximum_characters:
+                        break
+                    current_size += line_size
+                    chunk_end = line_number
+                if chunk_end < cursor:
+                    raise SecurityWorksetContractError(
+                        "an indexed route source line exceeds the configured review budget"
+                    )
+                region = _region_from_range(
+                    root, graph, route.path, cursor, chunk_end, anchor=route
+                )
+                if region is None:
+                    raise AIResponseError("an indexed route could not be grounded to source")
+                _enrich_region_requirements(region, plan)
+                regions.append(region)
+                added += 1
+                cursor = chunk_end + 1
+    if stats is not None:
+        stats["indexed_routes_in_scope"] = indexed
+        stats["indexed_route_regions_added"] = added
+
+
+def _add_uncovered_indexed_registrations(
+    root: Path,
+    graph: StructuralGraph,
+    worksets: list[SecurityWorkset],
+    regions: list[DiscoveryRegion],
+    plan: HuntPlan,
+    eligible_paths: set[str],
+    *,
+    stats: dict[str, int] | None = None,
+) -> None:
+    """Review top-level symbol registrations missed by model-generated searches.
+
+    The index does not establish that a registration is a worker, callback, or
+    externally reachable entry point; that remains an AI review obligation.
+    """
+    indexed = 0
+    added = 0
+    for workset in worksets:
+        if workset.surface_type != "symbol_registration":
+            continue
+        primary_locations = {
+            (location.path, location.start_line, location.end_line)
+            for evidence in workset.slices
+            for location in evidence.locations
+            if location.symbol_id == workset.surface_id
+            and location.path in eligible_paths
+        }
+        if not primary_locations:
+            continue
+        indexed += 1
+        for path, start, end in sorted(primary_locations):
+            covered = [
+                (region.start_line, region.end_line)
+                for region in regions
+                if region.path == path and region.anchor_type != "route"
+            ]
+            for uncovered_start, uncovered_end in _subtract_covered_ranges(start, end, covered):
+                region = _region_from_range(
+                    root, graph, path, uncovered_start, uncovered_end
+                )
+                if region is None:
+                    raise AIResponseError("an indexed registration could not be grounded to source")
+                _enrich_region_requirements(region, plan)
+                regions.append(region)
+                added += 1
+    if stats is not None:
+        stats["indexed_registrations_in_scope"] = indexed
+        stats["indexed_registration_regions_added"] = added
 
 
 def _is_sensitive_path(path: Path) -> bool:
@@ -1218,6 +1730,7 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
         queries = self._create_search_plan(context, plan)
         search_errors: list[RipgrepQueryError] = []
         region_stats: dict[str, int] = {}
+        indexed_worksets: list[SecurityWorkset] = []
         regions = _search_discovery_regions(
             root,
             queries,
@@ -1228,11 +1741,34 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
             include_paths=set(context.analysis_scope_paths) or None,
             error_sink=search_errors.append,
             stats=region_stats,
+            indexed_worksets=indexed_worksets,
         )
         self._emit("discovery_regions_planned", **region_stats)
         self._record_search_query_errors("candidate_discovery", context, search_errors)
         if not regions:
             raise AIResponseError("AI ripgrep plan produced no reviewable context")
+
+        source_region_count = len(regions)
+        regions, workset_stats = _discovery_workset_units(
+            regions,
+            root=root,
+            graph=self.security_graph,
+            source_excludes=self.source_excludes,
+            max_file_bytes=self.max_file_bytes,
+            indexed_worksets=indexed_worksets,
+        )
+        region_stats.update(
+            {
+                "source_regions": source_region_count,
+                "unique_worksets": workset_stats.get("unique_worksets", 0),
+                "review_batches": workset_stats.get("review_batches", len(regions)),
+                "regions_with_worksets": workset_stats.get("regions_with_worksets", 0),
+                "incomplete_worksets": workset_stats.get("incomplete_worksets", 0),
+                "graph_worksets_selected": workset_stats.get("graph_worksets_selected", 0),
+                "graph_worksets_deferred_batches": workset_stats.get("graph_worksets_deferred_batches", 0),
+                "graph_worksets_deferred_sources": workset_stats.get("graph_worksets_deferred_sources", 0),
+            }
+        )
 
         candidate_index = CandidateIndex()
         prompt_manifest = load_json("prompts/manifest.json")
@@ -1379,7 +1915,13 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                     request = {
                         "repository_context": self._compact_context_for_discovery(context, region.path),
                         "hunt_plan": {"strategy": plan.strategy, "tasks": related_tasks},
-                        "source_segment": segment,
+                        "source_segment": {
+                            key: value
+                            for key, value in segment.items()
+                            if key not in {"content", "source_slices", "source_windows", "security_workset"}
+                        },
+                        "security_workset": region.security_workset,
+                        "source_windows": region.source_windows(),
                         "security_obligations": [
                             item.to_dict() for item in coverage_state.obligations.values()
                         ],
@@ -1413,7 +1955,10 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                             root,
                             item,
                             segment,
-                            allowed_source_windows=_source_windows_from_context(all_resolved_context),
+                            allowed_source_windows=(
+                                region.source_windows()
+                                + _source_windows_from_context(all_resolved_context)
+                            ),
                         )
                         if candidate is None:
                             candidate_id = str(item.get("candidate_id", ""))
@@ -1423,6 +1968,14 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                             continue
                         candidate_id = str(item["candidate_id"])
                         candidate.metadata["candidate_id"] = candidate_id
+                        candidate.metadata["discovery_workset_ref"] = {
+                            "workset_id": region.workset_id,
+                            "evidence_hash": region.security_workset.get("evidence_hash", ""),
+                            "batch_index": region.security_workset.get("batch_index", 0),
+                            "surface_type": region.security_workset.get("surface_type", region.anchor_type),
+                            "surface_id": region.security_workset.get("surface_id", region.anchor_id),
+                            "source_windows": region.source_windows(),
+                        }
                         if all_resolved_context:
                             candidate.metadata["discovery_context"] = list(all_resolved_context)
                         valid_candidate_ids.add(candidate_id)
@@ -1598,9 +2151,24 @@ class OptimizedPlaidNoxDeepHuntAgent(PlaidNoxDeepHuntAgent):
                 )
 
         telemetry["discovery_model_calls_per_unique_region"] = round(
+            telemetry["discovery_model_calls"] / max(1, source_region_count), 3
+        )
+        telemetry["discovery_model_calls_per_workset_batch"] = round(
             telemetry["discovery_model_calls"] / max(1, len(regions)), 3
         )
-        telemetry.update(reconcile_obligations(all_observations))
+        planned_batches = [
+            {
+                "region_id": region.region_id,
+                "security_workset": region.security_workset,
+                "obligations": [item.to_dict() for item in region.obligation_specs.values()],
+            }
+            for region in regions
+        ]
+        reconciled_observations, batch_metrics = reconcile_workset_batches(
+            all_observations, planned_batches
+        )
+        telemetry.update(batch_metrics)
+        telemetry.update(reconcile_obligations(reconciled_observations))
         self.discovery_metrics = dict(region_stats) | dict(telemetry)
         self.discovery_contract_failures = int(telemetry["discovery_contract_failures"])
         self.discovery_unresolved_obligations = int(telemetry["obligations_unresolved"])

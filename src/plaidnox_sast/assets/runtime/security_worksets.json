@@ -2,6 +2,11 @@
   "schema_version": 1,
   "maximum_slices_per_batch": 8,
   "maximum_batch_characters": 24000,
+  "maximum_source_lines_per_slice": 80,
+  "maximum_indexed_route_region_characters": 12000,
+  "maximum_repository_context_surfaces": 48,
+  "maximum_repository_context_locations_per_surface": 6,
+  "maximum_repository_context_primary_excerpt_characters": 500,
   "identity_fields": ["surface_type", "surface_id"],
   "content_version_field": "evidence_hash",
   "oversize_policy": "fail_with_explicit_evidence_split"

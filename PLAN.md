@@ -39,9 +39,10 @@ These rules are mandatory for every PlaidNox Code Scanning change.
 5. **Stable code identity.** A symbol identity cannot include its content hash.
    Identity is stable across edits; the content hash is a separate version
    property used for invalidation and caching.
-6. **Readable code intelligence.** Persist a deterministic source tree, symbols,
-   definitions, references, calls, entry points, controls, sources, and sinks.
-   Agents receive an AI-selected Security IR slice and readable tree before source.
+6. **Readable code intelligence.** Graphify is the target provider for
+   versioned structural code navigation. Models receive a bounded neighborhood
+   and exact source windows. PlaidNox retains investigation-scoped security
+   annotations and finding dependencies with source provenance.
 7. **No deterministic vulnerability verdicts.** Parsers, metadata scanners,
    SAIST imports, ripgrep discovery, and Tree-sitter Security IR produce
    candidates and context. Every
@@ -71,105 +72,58 @@ These rules are mandatory for every PlaidNox Code Scanning change.
 14. **Every stage is observable.** Stage failures have typed errors, scan and
     task identifiers, bounded retries, and redacted telemetry. Broad exception
     handling cannot silently downgrade a required review.
-15. **No Graphify dependency.** Code discovery and navigation use AI-planned
-    ripgrep, the readable source tree, Tree-sitter Security IR, and persisted
-    Context Fabric relationships. This rule applies to every PlaidNox project.
+15. **Graphify is navigation, not a verdict.** Integrate its structural
+    extractor through a source-policy-bound adapter. Do not call Graphify's
+    direct-provider semantic extraction on customer code. Keep the existing
+    Tree-sitter/AI-planned `rg` path as a tested fallback during migration;
+    no graph edge alone confirms or dismisses a vulnerability.
 
 ## Code Scanning architecture
 
-```text
-immutable source snapshot + codebase/revision + business/security context
-  -> safe source inventory and readable tree
-  -> Tree-sitter extracts a compact symbol and security relationship index
-  -> LLM creates repository-specific reconnaissance searches from observed structure
-  -> bounded search execution returns evidence without built-in security patterns
-  -> create or incrementally update Context Fabric
-  -> LLM reconnaissance and architecture model
-  -> LLM hunt-task plan with complete source/path ownership
-  -> knowledge action per task (stored -> broadened -> web)
-       -> reuse exact knowledge | retrieve broader knowledge | research current web
-  -> Context Compiler selects minimum complete evidence slice
-  -> structural DiscoveryRegions with explicit security obligations
-  -> one initial AI discovery review per region
-  -> per-obligation disposition
-       -> terminal | typed Context Broker request
-  -> delta-only continuation only when new evidence was acquired
-  -> canonical candidate/evidence merge by root + control + invariant + capability
-  -> CandidateEvidencePacket
-  -> PlaidNox Deep Hunt for every candidate
-       -> attacker-controlled source and reachable entry point
-       -> source-to-sink/control path
-       -> missing or bypassable control
-       -> adversarial falsification
-       -> safe reproduction reasoning
-       -> impact and remediation evidence
-  -> recursive root-cause/variant sweep to a fixed point
-  -> model-driven consolidation without losing fingerprints
-  -> verified findings + finding dependencies
-  -> policy decision and JSON/SARIF/Markdown report
-```
-
-The analysis model is index-first and workset-based. A deterministic index covers
-the admitted repository, while AI receives only bounded security slices; repository
-LOC must not directly determine model calls. `DiscoveryRegion` is an evidence
-retrieval structure, not the identity of security coverage. `SecurityWorkset`
-becomes the canonical review unit and is rooted in a security surface such as a
-route, job, identity boundary, state mutation, or external effect. One workset may
-reference source slices from several files, and slices retain exact immutable
-source provenance.
-
-The planned pipeline is:
+Graphify-backed, model-centric investigations are the accepted next runtime.
+The adapter, data, coverage, migration, and acceptance contracts are below in
+[Graphify-backed investigations](#graphify-backed-investigations-for-code-scanning).
 
 ```text
-immutable snapshot
-  -> complete admitted-file inventory + Tree-sitter Security IR
-  -> persistent facts: symbols, references, calls, routes, effects, controls
-  -> compositional SecuritySummary per stable symbol/content version
-  -> canonical SecurityWorksets over entrypoints, trust boundaries, and effects
-  -> bounded SecuritySlice (forward/backward evidence + unresolved edges)
-  -> deterministic candidate producers and AI-inferred analysis specifications
-  -> context-specific LLM reasoning only for unresolved semantic questions
-  -> root-equivalence clustering before independent PlaidNox Deep Hunt
-  -> verified findings + explicit execution health and coverage status
+immutable source snapshot + business/security context
+  -> source-policy-bound Graphify structural graph and incremental update
+  -> security surface inventory + AI Investigation planner
+  -> graph-first Context Broker and bounded exact source windows
+  -> LLM Hunt; typed graph/source request only for new evidence
+  -> grounded candidate clustering by root, effect, and capability
+  -> independent PlaidNox Deep Hunt and adversarial falsification
+  -> recursive variants, verified findings, coverage, and reports
 ```
 
-Security IR, external analyzers, and AI-inferred source/sink specifications may
-produce candidate paths; none can confirm or reject a vulnerability. Every
-reportable candidate still requires independent attacker-path review,
-falsification, grounding, and evidence validation by PlaidNox Deep Hunt.
-
-External code-indexer and analyzer integrations are evaluation candidates, not
-runtime dependencies yet. SCIP is a potential symbol/reference import format;
-Joern is a potential CPG adapter; OpenGrep is a potential candidate adapter.
-Each must pass language coverage, precision/recall, incremental cost, operational
-isolation, output normalization, and license review before adoption. No external
-rule corpus or implementation is copied into PlaidNox as part of this plan.
-
-DataDog SAIST can supply broad AI-native candidates through an adapter. It does
-not own the PlaidNox verdict and it does not replace the custom Deep Hunt agent.
-Tree-sitter Security IR and targeted semantic/dataflow adapters provide code
-relationships and context; they do not decide that a vulnerability exists.
+Graphify provides structural navigation and provenance, not security verdicts.
+PlaidNox creates security annotations only where an investigation needs them.
+The current Tree-sitter/`rg` workset and region pipeline remains operational
+until Graphify-backed investigations meet recall, grounding, scale, and resume
+gates. `rg` stays a bounded AI-directed fallback. Do not build a second general
+code graph or expand the region-wide obligation matrix as the target design.
+SCIP, Joern, CodeQL, and OpenGrep are deferred evidence adapters rather than
+required infrastructure. Secrets, dependency CVEs, and other product scans
+remain separate workstreams.
 
 ### Scale and coverage semantics
 
-Index coverage, security coverage, and execution health are separate dimensions.
+Index coverage, investigation coverage, and execution health are separate dimensions.
 `SUCCESSFUL` / `UNSUCCESSFUL` describe whether required scanner stages executed
-correctly. Coverage reports whether admitted files and required security surfaces
-were indexed and analyzed, including unsupported-language and unresolved-edge
-limitations. A parser's known inability to resolve a relationship is reported as
-a coverage limitation; a crashed required parser/model stage or corrupt index is
-an execution failure. A low finding count never implies successful coverage.
+correctly. Coverage reports admitted files, observed surfaces, planned and terminal
+investigations, unsupported languages, and unresolved graph/context edges.
+A known parser or graph limitation is a coverage gap; a crashed required stage
+is an execution failure. A low finding count never implies successful coverage.
 
 ## Durable Context Fabric
 
 The system persists expensive understanding rather than duplicating raw Git
 storage:
 
-1. **Code intelligence** — snapshots, file/blob hashes, stable symbols, content
-   hashes, definitions/references, calls, routes, data stores, and boundaries.
-2. **Security relationships** — attacker control, exposure, authentication,
-   authorization, tenancy, validators, sanitizers, dangerous operations,
-   sensitive data, and dependency reachability.
+1. **Code references** — snapshot identity, Graphify version and stable
+   PlaidNox node IDs, source hashes, locations, and exact evidence dependencies.
+2. **On-demand security annotations** — attacker control, exposure, guards,
+   trust boundaries, effects, and assumptions for investigated paths, each
+   scoped, source-grounded, and invalidatable.
 3. **Threat context** — versioned assets, actors, trust boundaries, data classes,
    security invariants, integrations, and business abuse paths with provenance.
 4. **Security memory** — explicit or confirmed reusable context scoped to a
@@ -180,9 +134,9 @@ storage:
    weakness research, and business-abuse techniques with retrieval history.
 
 A new source snapshot creates a generic `ContextOverlay`, independent of an SCM.
-Changed symbol content and relationship edges invalidate affected paths, controls,
-tasks, and findings. Unaffected context is reused. Once accepted as the current
-codebase state, the overlay is reconciled into a new immutable base.
+Changed source and graph edges invalidate dependent investigations, annotations,
+and findings. Unaffected context is reused only when its evidence versions still
+match. An accepted overlay is reconciled into a new immutable base.
 
 ## PostgreSQL and ORM boundary
 
@@ -244,13 +198,89 @@ Status: generic incremental core implemented; precision adapters deferred.
   `SecurityWorkset`, `SecuritySlice`, and per-symbol `SecuritySummary` models;
   `security_worksets_from_regions` adapts existing region evidence into
   surface-owned slices. External JSON schemas and `runtime/security_worksets.json`
-  define the data contract and batch budgets. The live discovery/verifier
-  orchestration still uses regions and is not switched over yet.
+  define the data contract and batch budgets. Optimized discovery now reviews
+  lossless bounded batches produced by this region adapter. Matching route and
+  registration worksets can now add Tree-sitter evidence from related files;
+  the task plan still owns coverage obligations.
+- **Tree-sitter workset planning partially connected to discovery:**
+  `security_worksets_from_graph` emits stable route-registration worksets and
+  includes uniquely resolved referenced definitions as bounded evidence slices.
+  It checks source versions and records syntactic call/reference observations;
+  it does not infer callback roles, middleware attachment, reachability, or
+  taint. It deliberately does not make every function a review workset.
+  `security_summaries_from_graph` builds content-hashed per-symbol summaries,
+  resolves only unique syntactic call targets, and records unresolved calls
+  rather than treating them as safe. Focused tests cover planning and stale
+  source rejection. Summaries are now persisted per immutable Context Fabric
+  snapshot in SQLite and the ORM-backed PostgreSQL store; repeated writes are
+  idempotent and conflicting data for the same snapshot is rejected. Existing
+  snapshot call edges continue to drive reverse-dependency invalidation. Summary
+  and dependency IDs now use the same stable symbol identity as persisted edges,
+  so reverse-dependency fanout can join them without path/name translation.
 - Keep `DiscoveryRegion` only as a source-window transport type in the target
   architecture; do not let region count define coverage identity.
-- Build worksets from indexed entrypoints, trust boundaries, state effects, and
-  external effects. Keep obligations scoped to canonical surfaces; do not repeat
+- **Partially implemented:** route worksets with uniquely referenced definitions
+  plus structural per-symbol summaries are derived from current Tree-sitter
+  facts. Generic top-level calls that reference uniquely indexed symbols also
+  produce `symbol_registration` worksets; their role and execution remain
+  explicitly unresolved. This can surface worker, event, and callback
+  registrations without embedding framework names or claiming they execute.
+  Route and registration slices now carry callable-signature observations,
+  while symbol summaries retain call-site text, uniquely resolved target IDs,
+  and explicit limitations. Input trust, call semantics, and side effects remain
+  unresolved; these are retrieval facts for later AI reasoning, not security
+  conclusions. Next extend indexed surfaces to explicit state/network/filesystem/
+  rendering effects using parser facts or AI-derived annotations with
+  provenance. Keep obligations scoped to canonical surfaces; do not repeat
   repository-wide questions per region.
+  Repository-context reconnaissance now receives a compact, area-balanced
+  inventory with exact primary source windows, related symbol IDs, unresolved
+  edges, and explicit omission counts. Incremental context includes only
+  surfaces intersecting changed/affected paths. Live discovery batches
+  region-derived worksets and adds graph-derived cross-file evidence for
+  unambiguous route/registration matches. Persisted summary reuse has not yet
+  been connected to that live planner. Deep Hunt
+  receives canonical candidates after discovery and retains its verification
+  gates.
+- **AI-derived annotation location grounding implemented:** repository-context
+  records for input surfaces, trust boundaries, entry points, sensitive effects,
+  authentication paths, and authorization decisions may carry exact source
+  locations. The runtime checks repository containment, indexed file identity,
+  source content hash, line bounds, and any supplied quote, then records per-
+  location provenance and aggregate grounding metrics. On incremental updates,
+  prior locations are carried forward only for the same record identity and
+  only while their indexed source version still matches. Grounding verifies
+  location provenance only; semantic claims remain unvalidated context and
+  never act as vulnerability verdicts or effective-control proof. Covered by
+  `tests/test_ai.py` annotation-grounding tests.
+- **Live workset-batched discovery implemented (first orchestration stage):**
+  optimized discovery adapts planned source regions into canonical structural
+  worksets; configured lossless batches become review units. Each request sends
+  bounded excerpts once and candidate grounding accepts only exact source
+  windows present in that batch or newly resolved Context Broker evidence.
+  An unambiguous route or top-level registration match adds Tree-sitter slices
+  from referenced definitions across files while preserving the full discovered
+  region. Excluded or sensitive sources and multi-batch graph worksets use the
+  region adapter with explicit deferral telemetry. Indexed relationships remain
+  syntax observations with unresolved edges, never security verdicts.
+  Checkpoints are scoped to workset evidence hash and batch index, and telemetry
+  separates source regions, unique worksets, and review batches. Coverage now
+  reconciles every planned multi-batch obligation before global sibling
+  reconciliation: a clean batch cannot hide an unresolved or missing batch,
+  and missing planned batch indices remain required coverage gaps. The existing
+  task plan still owns hunt-specific coverage. Every selected workset batch now
+  also has a required open-ended surface-review obligation owned by its stable
+  workset identity; multi-batch reconciliation requires all assigned batch
+  answers. Tree-sitter indexed HTTP routes in the admitted analysis scope now
+  seed exact bounded review regions even without an `rg` hit; already covered
+  route ranges are reused, and uncovered ranges are added without making
+  syntax-based verdicts. Generic top-level symbol registrations with indexed
+  references now also seed review regions without an `rg` hit. Their runtime
+  role remains unresolved until AI review, and the same workset inventory is
+  reused for context enrichment. Coverage of other surface classes and richer
+  workset-owned obligations remain follow-on work. Covered by
+  `tests/test_coverage.py`, `tests/test_optimized_discovery.py`,
+  `tests/test_worksets.py`, and the adapter tests in `tests/test_ai.py`.
 - **Contract batching implemented:** slice batches obey external count/serialized
   character budgets, preserve every slice, report remaining-slice counts, and
   fail explicitly when an individual slice cannot fit. Unresolved graph edges
@@ -266,35 +296,58 @@ taint/dataflow are optional precision layers. The current call-flow expansion is
 structural navigation, not taint proof; unresolved required flows remain explicit
 evidence gaps or incomplete coverage.
 
-### Scale architecture — accepted, first contract slice implemented
+### Graphify-backed investigations for Code Scanning
 
-The existing run path is still region-first. Implement the workset transition in
-small, measurable stages before replacing it:
+#### Decision and boundary
 
-1. **Implemented foundation:** stable `SecurityWorkset`, `SecuritySlice`, and
-   `SecuritySummary` contracts; region adapter; exact source provenance;
-   unresolved-edge state; redaction; and configured lossless batching. Tests are
-   in `tests/test_worksets.py`. Discovery/Deep Hunt orchestration remains on the
-   region path.
-2. Build route/job/trust-boundary/effect worksets from the existing Security IR.
-   Keep per-surface obligations local; model call counts should follow unique
-   worksets and unresolved semantics, not files/LOC.
-3. Add compositional symbol summaries and content-addressed persistence, then
-   dependency-fanout invalidation and immutable overlays.
-4. Benchmark SCIP and Joern as optional index adapters; benchmark OpenGrep as an
-   optional candidate adapter. Do not adopt any as a mandatory runtime dependency
-   until language coverage, precision/recall, incremental behavior, operations,
-   output, and licensing pass review.
-5. Add deterministic fake-gateway benchmarks at about 2k, 20k, and 100k LOC.
-   Record index duration, workset/slice counts, prompt bytes, fanout, cache reuse,
-   memory, and simulated model-call counts. Real target scans remain explicitly
-   requested acceptance tests, not routine tests.
-6. Report execution health separately from coverage limitations. Preserve
-   fail-closed behavior for failed required stages and Deep Hunt gates; unsupported
-   syntax or unresolved static edges should be surfaced as coverage data.
+Graphify becomes the repository-navigation provider for PlaidNox Code Scanning. PlaidNox remains the security reasoner and verifier. This is a migration target, not a claim that the current scanner already uses Graphify. The existing Tree-sitter, `rg`, region/obligation, Context Fabric, checkpoint, and Deep Hunt implementation stays operational until the replacement passes the same security and resume tests. SCM, SCA, secrets, DAST, and frontend work remain separate.
 
-Do not enable parallel model workers to hide workset/obligation fan-out. Establish
-recall, contract-validity, and cost baselines before adding concurrency.
+```text
+immutable source snapshot
+  -> admitted-file inventory and Graphify structural extraction/update
+  -> versioned graph with source-grounded, provenance-labelled nodes/edges
+  -> security-surface inventory and AI investigation planner
+  -> persistent investigation queue
+  -> graph-first Context Broker + bounded exact source windows
+  -> LLM Hunt with typed context requests and delta-only continuation
+  -> grounded candidate clustering by root, effect, capability, and evidence
+  -> independent PlaidNox Deep Hunt, falsification, and variant search
+  -> verified findings, coverage, execution health, and reports
+```
+
+Graphify answers what code exists and which relationships its extractor observed. Its `EXTRACTED`, `INFERRED`, and `AMBIGUOUS` labels remain visible. An extracted call edge is structural evidence, not proof of runtime reachability or a security property. Ambiguous or missing edges become explicit context gaps. PlaidNox's model assigns attacker influence, controls, invariants, sensitive effects, and capabilities for the investigated path. PlaidNox grounds each cited line and claimed relationship against the immutable snapshot before reporting a finding.
+
+#### Graphify adapter contract
+
+The adapter accepts only files admitted by PlaidNox's existing source policy: repository containment, symlink handling, exclusions, size limits, language inventory, and sensitive-file exclusions. It invokes Graphify's structural extractor without its direct-provider semantic extraction. Its cache lives outside the immutable source snapshot, and source hashes are checked before and after extraction. All generative calls in the scan remain behind PlaidNox's configured model boundary. The adapter is pinned to a tested Graphify version and emits a typed error on extraction failure; it cannot silently return an empty graph as a clean scan.
+
+It exposes `snapshot_id`, `extractor_version`, `file_hashes`, stable PlaidNox node IDs, exact source locations, edge kind/provenance, unresolved relationships, neighborhood/path queries, and changed/removed node and edge sets. Raw Graphify IDs are not durable identity: a local fixture showed symbol IDs include the extraction directory name. PlaidNox normalizes identity from repository-relative source identity and symbol semantics, keeps content hashes separate, and records ambiguity when a symbol cannot be matched across revisions. Evidence windows are rechecked against source hashes before model input or finding persistence.
+
+Incremental updates must produce invalidation fanout for changed callers, route attachments, controls, investigations, and finding dependencies. Unaffected investigations can reuse context only when every dependent source/edge version matches. PR/MR overlays remain owned by the separate SCM integration; the Code Scanning engine accepts a generic immutable snapshot and optional parent snapshot.
+
+#### Investigation contract
+
+`Investigation` replaces `DiscoveryRegion` as the planned security-review identity. A record contains a stable investigation ID, codebase/snapshot, target reference, reason, security questions, graph node and edge references with provenance, exact source windows, prior evidence, threat/business context references, unresolved relationships, evidence hash, status, and checkpoint reference. A source region becomes a transport for exact code, never the unit of scan completeness.
+
+A security-surface inventory covers observed external entry points, registered callbacks/jobs, identity boundaries, state changes, and external effects without declaring them safe or vulnerable. The AI planner groups related surfaces into investigations using architecture and business context, with no fixed CWE or framework allowlist. Every admitted surface is assigned an investigation or an explicit unsupported/omitted reason. A clean answer for one investigation cannot close another or an existing finding.
+
+The initial hunt receives a bounded graph neighborhood and the smallest complete source windows. A continuation requires a typed context request and new, material evidence from the broker; unchanged context never earns another model call. `rg` is a bounded, AI-directed fallback for graph gaps. The broker returns source snippets and relationship provenance together, so the model does not need an extra request merely to read a match. Checkpoints persist each completed investigation, context expansion, candidate review, and sweep, keyed by source/graph evidence and prompt contract versions.
+
+#### Verdicts and coverage
+
+The model can return `NO_CANDIDATE`, `CANDIDATE`, or `NEEDS_CONTEXT` for one investigation. The coordinator records `UNRESOLVED` when required evidence cannot be obtained and `FAILED` when an execution unit fails. `NO_CANDIDATE` is a bounded review result, not proof that surrounding code is safe. Candidate clustering preserves distinct attack branches and capabilities. Every reportable candidate still receives independent attacker-path verification, adversarial falsification, exact grounding, and recursive variant search.
+
+Report execution status separately from coverage: `SUCCESSFUL` or `UNSUCCESSFUL` describes required stage execution; coverage reports admitted files, observed surfaces, planned/terminal investigations, unsupported areas, and unresolved graph/context relationships. A parser limitation is a coverage gap; a crashed required stage is an execution failure. Verified findings survive either status. Merge policy remains a separate SCM concern.
+
+#### Immediate migration sequence
+
+1. **Adapter foundation implemented:** `graphify_adapter.py` calls Graphify's structural extractor on policy-admitted files, normalizes raw IDs, validates source paths/lines, preserves edge provenance, reports unindexed files, and compares immutable snapshots for added/changed/deleted files, nodes, and edges. `graphifyy==0.8.14` is a pinned optional dependency. Focused tests and a real local extractor smoke test pass. Duplicate-symbol identity, cross-file edge precision, cache reuse, and reverse-fanout tests remain before runtime adoption.
+2. **First graph-first Context Broker slice implemented:** `graph_context.py` resolves exact definitions, callers, callees, references, and one-hop neighborhoods with provenance and truncation telemetry. Source windows are bounded, redacted, and hash-checked. Add route attachments, readers/writers where Graphify actually represents them, path lookup, and AI-directed `rg` fallback without treating an empty graph lookup as proof of safety.
+3. Add the typed investigation model, persistence/migration, checkpoint identity, and surface-to-investigation coverage ledger. Do not delete the active region pipeline yet.
+4. Connect an AI planner and LLM Hunt prompt/schema to the investigation queue. Reuse existing LiteLLM routing, knowledge research, candidate evidence packets, Deep Hunt, dedupe, variant sweeps, and reporting.
+5. Run fake-gateway fixtures at small and large scale, then explicitly requested real scans. Gate the default switch on seeded-root recall, no lost findings, groundable evidence, zero silent omissions, restart behavior, prompt cost, and graph update correctness. Remove duplicate Tree-sitter workset/index layers only after parity.
+
+SCIP, Joern/CPG, CodeQL, OpenGrep, and whole-program dataflow are deferred optional evidence providers. Add one only when measured recall or precision shows a gap. Secrets and dependency CVEs remain separate product workstreams.
 
 Primary research references:
 - [Wiz Atlas architecture](https://www.wiz.io/blog/atlas-ai-vulnerability-researcher)
@@ -328,16 +381,15 @@ PostgreSQL database, retry without duplicates, and recover after interruption.
 
 ### Phase 4 — complete AI hunt and evidence lifecycle
 
-- Use obligation-owned structural discovery: one initial review per region,
-  typed dispositions for every obligation, Context Broker expansion as the
-  only continuation trigger, and no continuation without newly acquired
-  evidence. Normal regions receive at most one delta continuation; a second is
-  reserved for a trust-boundary region with a remaining sensitive effect.
+- Move to investigation-owned coverage with one bounded initial hunt, typed
+  graph/source requests, and continuation only after new material evidence.
+  Retain the region pipeline until equivalent coverage and recall are proven.
 - Merge equivalent root-cause evidence before Deep Hunt and compile a canonical
   evidence packet containing attacker origins, boundary, invariant, downstream
   trust branches, effects, gained capabilities, trace, and gaps.
-- Ensure the planner owns every eligible source segment and reachable attack
-  surface; incomplete coverage makes the scan incomplete.
+- Account for every admitted security surface with a planned investigation or
+  an explicit unsupported/omitted reason. Track unresolved evidence separately
+  from failed execution.
 - Route FAST/STANDARD/DEEP to actual LiteLLM model policies rather than metadata.
 - Expand secret redaction before every provider boundary.
 - Persist exact finding dependencies on symbols, paths, controls, memories,

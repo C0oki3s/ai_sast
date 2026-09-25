@@ -1,4 +1,8 @@
-from plaidnox_sast.coverage import obligation_identity, reconcile_obligations
+from plaidnox_sast.coverage import (
+    obligation_identity,
+    reconcile_obligations,
+    reconcile_workset_batches,
+)
 
 
 def _record(region: str, status: str, *, type_name: str = "security_invariant"):
@@ -58,3 +62,66 @@ def test_explicit_coverage_obligation_is_required():
     )
 
     assert importance == "REQUIRED"
+
+
+def _batch(region_id: str, obligation: dict, *, workset_id: str = "route-a") -> dict:
+    return {
+        "region_id": region_id,
+        "security_workset": {
+            "workset_id": workset_id,
+            "evidence_hash": "snapshot-a",
+            "batch_index": int(region_id.rsplit("-", 1)[-1]) if region_id.startswith("batch-") else 0,
+            "batch_count": 2,
+        },
+        "obligations": [obligation],
+    }
+
+
+def test_multibatch_clean_result_does_not_hide_unresolved_sibling():
+    clean = _record("batch-0", "NO_ISSUE")
+    unresolved = _record("batch-1", "UNRESOLVED")
+    batches = [_batch(item["region_id"], item["obligation"]) for item in (clean, unresolved)]
+
+    reduced, metrics = reconcile_workset_batches([clean, unresolved], batches)
+    result = reconcile_obligations(reduced)
+
+    assert metrics["workset_batch_obligations_unresolved"] == 1
+    assert result["canonical_required_unresolved"] == 1
+
+
+def test_missing_workset_batch_remains_required_even_with_sibling_clean_result():
+    clean = _record("batch-0", "NO_ISSUE")
+    missing = _record("batch-1", "NO_ISSUE")
+    other_workset = _record("other-region", "CANDIDATE_FOUND")
+    batches = [_batch(item["region_id"], item["obligation"]) for item in (clean, missing)]
+
+    reduced, metrics = reconcile_workset_batches([clean, other_workset], batches)
+    result = reconcile_obligations(reduced)
+
+    assert metrics["workset_batch_observations_missing"] == 1
+    assert result["canonical_required_unresolved"] == 1
+
+
+def test_multibatch_obligation_assigned_to_one_batch_only_can_complete():
+    first = _record("batch-0", "NO_ISSUE")
+    second = _record("batch-1", "CANDIDATE_FOUND")
+    second["obligation"]["question"] = '{"business_invariants":["tenant isolation"]}'
+    second["obligation"]["canonical_id"], second["obligation"]["importance"] = obligation_identity(
+        "security_invariant", second["obligation"]["question"], region_id="batch-1"
+    )
+    batches = [_batch(item["region_id"], item["obligation"]) for item in (first, second)]
+
+    reduced, metrics = reconcile_workset_batches([first, second], batches)
+    result = reconcile_obligations(reduced)
+
+    assert metrics["workset_batch_obligations_reconciled"] == 2
+    assert result["canonical_required_obligations"] == 2
+    assert result["canonical_required_unresolved"] == 0
+
+
+def test_missing_planned_batch_is_required_coverage_gap():
+    clean = _record("batch-0", "NO_ISSUE")
+    reduced, metrics = reconcile_workset_batches([clean], [_batch("batch-0", clean["obligation"])])
+
+    assert metrics["workset_batches_missing"] == 1
+    assert reconcile_obligations(reduced)["canonical_required_unresolved"] == 1

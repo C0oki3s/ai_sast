@@ -219,14 +219,25 @@ its end-to-end exit condition.
 Exit condition: met by unit/E2E fixtures; repeated real-repository acceptance
 evidence remains required before production release.
 
-## 2. ripgrep + Tree-sitter Code Intelligence
+## 2. Graphify-backed investigations — next implementation phase
 
-### Accepted next architecture: SecurityWorksets and SecuritySlices
+The accepted target is [Graphify-backed investigations](../PLAN.md#graphify-backed-investigations-for-code-scanning):
+Graphify supplies versioned structural navigation; the AI planner groups
+security surfaces into bounded investigations; PlaidNox Deep Hunt retains final
+verdict ownership. The structural adapter, snapshot-delta contract, and first
+graph-backed context queries are implemented in `graphify_adapter.py` and
+`graph_context.py`. Complete the graph fixture matrix and investigation ledger.
+Switch the default only after seeded-root recall,
+grounding, incremental invalidation, and checkpoint resume reach parity.
 
-The current runtime still analyzes region-owned obligations. The next architecture
-is index-first: index the entire admitted repository locally, then form canonical
-security worksets from routes/jobs, trust boundaries, state transitions, and
-external effects. `DiscoveryRegion` remains source-window transport only.
+The sections below describe the current Tree-sitter/`rg` runtime and its
+already implemented contracts. They are migration inputs, not the new target.
+
+### Current workset and source-slice implementation
+
+The current runtime analyzes region-owned obligations through bounded
+`SecurityWorkset` batches. During the migration, `DiscoveryRegion` remains
+source-window transport. `Investigation` becomes the new coverage identity.
 
 A workset is the coverage and review identity. Its bounded `SecuritySlice` may
 contain source and IR evidence from several files, exact source provenance,
@@ -239,13 +250,82 @@ The rollout is staged. **Stage 1 is implemented** in `plaidnox_sast.worksets`:
 versioned workset/slice/summary dataclasses, JSON Schemas, an adapter from
 current region payloads, explicit unresolved-edge and completeness fields,
 source/fact redaction, and lossless configured batching. Tests are in
-`tests/test_worksets.py`. This is a contract foundation only; discovery and
-Deep Hunt orchestration still run through the region path.
+`tests/test_worksets.py`. **Stage 2 is partially implemented:** the graph planner
+builds route-registration worksets with bounded source slices and unique
+referenced definitions, and creates compositional structural summaries with
+unique call resolution and explicit unresolved-call records. It intentionally
+does not make every function a review workset. This remains syntax evidence:
+it does not claim middleware roles, runtime reachability, taint, or exploitability.
+It also emits generic `symbol_registration` worksets for top-level calls that
+reference uniquely indexed symbols. These preserve exact call/source evidence
+while leaving the registration role and runtime execution unresolved; no
+framework-specific job catalogue is embedded. Route/registration slices expose
+callable-signature syntax as a boundary observation with trust and reachability
+left unresolved. Per-symbol summaries include call-site text and uniquely
+resolved symbol IDs, but do not claim data flow or side effects.
+Repository-context reconnaissance receives an area-balanced, bounded inventory
+with explicit omissions; incremental runs include only surfaces intersecting
+changed or affected paths.
+Live discovery adapts planned source regions into bounded workset batches. An
+unambiguous route or top-level registration match can add indexed definitions
+from related files while preserving the complete discovered region. If a graph
+workset needs multiple batches or contains an excluded or sensitive source,
+discovery uses the region adapter and records the deferral. The task plan still
+owns obligations; graph relationships remain syntax evidence with unresolved
+edges. Deep Hunt verifies candidates using its existing evidence packet contract.
 
-Next: (2) build worksets from currently indexed Tree-sitter facts; (3) persist summaries
-and dependency fanout for incremental invalidation; (4) evaluate SCIP and Joern
-adapters against the language/security regression corpus; (5) evaluate external
-candidate producers such as OpenGrep behind a normalized candidate interface.
+AI-derived repository-context annotations now accept optional exact source
+locations for input surfaces, trust boundaries, entry points, sensitive effects,
+authentication paths, and authorization decisions. Runtime grounding verifies
+repository containment, membership in the current Tree-sitter file index,
+content-hash agreement with the immutable snapshot, one-based line bounds, and
+an optional verbatim quote. Incremental carry-forward is limited to a matching
+record identity whose source location still verifies against the current
+snapshot. Per-location provenance and aggregate metrics make failures visible.
+This proves source-location identity only; it does not validate the model's
+semantic claim or treat annotations as security verdicts. Tests are in
+`tests/test_ai.py` (`test_repository_annotation_locations_*`).
+
+Live discovery now groups source regions by canonical structural surface into
+`SecurityWorkset` units. Configured lossless slice batches are the model review
+units, source excerpts are sent once within their slices, and candidate
+locations are grounded only against windows in that batch or newly resolved
+Context Broker evidence. Matching route/registration worksets add exact
+cross-file source windows without treating indexed references as confirmed
+runtime calls or security controls. Checkpoints are scoped to workset evidence hash and
+batch index; telemetry separates source regions, unique worksets, and review
+batches. Planned multi-batch obligations are now reconciled across all assigned
+batches before global coverage accounting. An unresolved answer, missing answer,
+or missing planned batch cannot be hidden by a clean sibling batch; telemetry
+records reconciled, unresolved, and missing batch work. Every selected workset
+batch now also receives a required open-ended surface-review obligation with a
+stable workset identity, so a clean answer from one batch cannot complete a
+multi-batch surface. The task plan retains hunt-specific obligations. Coverage
+of trust-boundary and sensitive-effect surfaces that produce no search-hit
+region, and richer workset-owned obligation generation, remain open. Tree-sitter
+indexed HTTP routes and top-level symbol registrations in admitted source scope
+now seed regions even when `rg` returns no hit; already covered source is reused.
+Registration roles, runtime reachability, and security semantics remain
+unresolved until AI review and Deep Hunt verification. The indexed workset
+inventory is built once per discovery pass and reused for context enrichment.
+Prompt and checkpoint versions were advanced for the expanded contract.
+
+**Stage 3 is partially implemented:** summaries are persisted per immutable
+base snapshot in the SQLite Context Fabric and ORM-backed PostgreSQL adapter,
+with idempotent writes and conflict detection. Existing snapshot call edges
+provide reverse-dependency fanout. Summary and dependency IDs share persisted
+stable symbol IDs, verified by tests that walk a caller from a changed callee.
+SQLite and PostgreSQL overlays store only changed summary records and deletion
+tombstones; effective readers merge parent snapshots with sparse deltas. The
+PostgreSQL schema adds a dedicated overlay-summary table and tenant-scoped ORM
+resolution. Tests cover changed callee fanout, updated caller relationships,
+line-only provenance shifts, and deleted symbols. Live scan orchestration still
+does not consume these summaries.
+
+Next: validate Graphify's structural extraction and stable PlaidNox IDs on the
+existing regression corpus. Preserve persisted summaries and overlays until
+Graphify-backed context retrieval and investigation invalidation are tested.
+SCIP, Joern, and OpenGrep remain optional future evidence adapters.
 No indexer, CPG engine, or deterministic scanner is a final verdict authority.
 All reportable candidates still require independent PlaidNox Deep Hunt
 verification and evidence validation. Third-party rule content is not imported.
@@ -256,8 +336,9 @@ are explicit coverage limitations; they do not claim the corresponding paths are
 safe.
 
 Scale acceptance uses synthetic, deterministic fixtures around 2k, 20k, and
-100k LOC with a fake model gateway. Record index time, surfaces/worksets/slices,
-prompt bytes, graph fanout, cache reuse, memory, and model-call counts. Gate on
+100k LOC with a fake model gateway. Record Graphify index/update time,
+surfaces, investigations, prompt bytes, fanout, cache reuse, memory, and model
+calls. Gate on
 correct known-vulnerability recall and contract validity before optimizing
 parallelism or adding optional external tools.
 

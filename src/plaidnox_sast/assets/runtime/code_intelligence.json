@@ -31,7 +31,8 @@
   ],
   "compact_context_omitted_fields": [
     "evidence",
-    "gaps"
+    "gaps",
+    "source_content_hash"
   ],
   "compact_repository_context_scalar_fields": [
     "schema_version",

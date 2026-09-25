@@ -11,6 +11,7 @@ from plaidnox_sast.persistence.adapters import (
     _derive_ids,
 )
 from plaidnox_sast.persistence.models import Base
+from plaidnox_sast.persistence.models import OverlaySymbolSummaryRecord
 from plaidnox_sast.persistence.repositories import (
     FindingEvidenceInput,
     stable_id,
@@ -30,12 +31,33 @@ def test_postgresql_context_adapter_preserves_overlay_memory_and_finding_context
     source = repository / "app.js"
     source.write_text(
         "function loadAccount(id) {\n  return database.find(id);\n}\n"
-        "function handleRequest(id) {\n  return loadAccount(id);\n}\n",
+        "function handleRequest(id) {\n  return loadAccount(id);\n}\n"
+        "function obsoleteHandler() {\n  return 'unused';\n}\n",
         encoding="utf-8",
     )
     factory = _session_factory()
     store = PostgresContextFabricStore(factory, "tenant-a")
-    base = store.create_base("owner/repo", "revision-a", repository, build_structural_graph(repository))
+    base_graph = build_structural_graph(repository)
+    base = store.create_base("owner/repo", "revision-a", repository, base_graph)
+    repeated = store.create_base("owner/repo", "revision-a", repository, base_graph)
+    assert repeated.reused is True
+    with unit_of_work(factory, "tenant-a") as repo:
+        summaries = repo.list_security_summaries(base.context_id)
+        assert summaries
+        assert {item["symbol_id"] for item in summaries} == {
+            item.symbol_id
+            for item in repo.list_symbols(base.context_id)
+            if item.kind != "route"
+        }
+        summary_by_name = {
+            item["facts"][0]["name"]: item for item in summaries
+        }
+        assert summary_by_name["loadAccount"]["symbol_id"] in summary_by_name[
+            "handleRequest"
+        ]["dependency_symbol_ids"]
+        assert summary_by_name["handleRequest"]["symbol_id"] in repo.reverse_dependencies(
+            base.context_id, [summary_by_name["loadAccount"]["symbol_id"]]
+        )
 
     source.write_text(
         "function loadAccount(id) {\n  const normalized = String(id);\n"
@@ -50,6 +72,61 @@ def test_postgresql_context_adapter_preserves_overlay_memory_and_finding_context
         ["app.js"],
         build_structural_graph(repository),
     )
+    with unit_of_work(factory, "tenant-a") as repo:
+        base_summaries = {
+            item["facts"][0]["name"]: item
+            for item in repo.list_security_summaries(base.context_id)
+        }
+        overlay_summaries = {
+            item["facts"][0]["name"]: item
+            for item in repo.list_effective_security_summaries(overlay.overlay_id)
+        }
+        assert (
+            base_summaries["loadAccount"]["content_hash"]
+            != overlay_summaries["loadAccount"]["content_hash"]
+        )
+        assert (
+            base_summaries["handleRequest"]["content_hash"]
+            == overlay_summaries["handleRequest"]["content_hash"]
+        )
+        assert overlay_summaries["handleRequest"]["symbol_id"] in repo.reverse_dependencies(
+            overlay.overlay_id, [overlay_summaries["loadAccount"]["symbol_id"]]
+        )
+        delta_rows = repo.session.query(OverlaySymbolSummaryRecord).filter_by(
+            snapshot_id=overlay.overlay_id
+        ).all()
+        assert len(delta_rows) == 3
+        assert {item.summary_state for item in delta_rows} == {"active", "deleted"}
+        assert {
+            item.symbol_id for item in delta_rows if item.summary_state == "active"
+        } <= {
+            overlay_summaries["loadAccount"]["symbol_id"],
+            overlay_summaries["handleRequest"]["symbol_id"],
+        }
+        assert repo.list_security_summaries(overlay.overlay_id) == []
+        assert next(item for item in delta_rows if item.summary_state == "deleted").symbol_id == next(
+            item["symbol_id"]
+            for item in repo.list_security_summaries(base.context_id)
+            if item["facts"][0]["name"] == "obsoleteHandler"
+        )
+        effective = repo.list_effective_security_summaries(overlay.overlay_id)
+        effective_by_name = {item["facts"][0]["name"]: item for item in effective}
+        assert "obsoleteHandler" not in effective_by_name
+        assert effective_by_name["loadAccount"]["content_hash"] == overlay_summaries[
+            "loadAccount"
+        ]["content_hash"]
+        assert effective_by_name["handleRequest"]["content_hash"] == base_summaries[
+            "handleRequest"
+        ]["content_hash"]
+    repeated_overlay = store.create_overlay(
+        base,
+        "revision-b",
+        repository,
+        ["app.js"],
+        build_structural_graph(repository),
+    )
+    assert repeated_overlay.overlay_id == overlay.overlay_id
+    assert store.effective_security_summaries(overlay.overlay_id) == effective
     store.add_memory(
         "owner/repo",
         "repository",

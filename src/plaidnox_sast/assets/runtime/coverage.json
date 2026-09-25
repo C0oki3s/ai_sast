@@ -4,6 +4,7 @@
     "security_invariant": "REQUIRED",
     "sensitive_effect": "REQUIRED",
     "task_objective": "REQUIRED",
+    "surface_review": "REQUIRED",
     "coverage": "SUPPORTING",
     "local_review": "SUPPORTING"
   },
@@ -28,6 +29,10 @@
     ],
     "task_objective": [
       "objectives"
+    ],
+    "surface_review": [
+      "surface_type",
+      "surface_id"
     ]
   },
   "resolved_statuses": [

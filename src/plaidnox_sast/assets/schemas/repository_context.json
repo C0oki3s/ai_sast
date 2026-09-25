@@ -189,6 +189,13 @@
               "type": "string",
               "maxLength": 800
             }
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
+            }
           }
         },
         "required": [
@@ -219,6 +226,13 @@
             "items": {
               "type": "string",
               "maxLength": 800
+            }
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
             }
           }
         },
@@ -356,6 +370,13 @@
               "maxLength": 1000
             },
             "maxItems": 100
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
+            }
           }
         },
         "required": [
@@ -410,6 +431,13 @@
               "maxLength": 1000
             },
             "maxItems": 100
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
+            }
           }
         },
         "required": [
@@ -468,6 +496,13 @@
               "maxLength": 1000
             },
             "maxItems": 100
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
+            }
           }
         },
         "required": [
@@ -522,6 +557,13 @@
               "maxLength": 1000
             },
             "maxItems": 100
+          },
+          "evidence_locations": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/$defs/source_location"
+            }
           }
         },
         "required": [
@@ -705,5 +747,35 @@
     "indirect_dispatch",
     "build_time_variants",
     "coverage_ledger"
-  ]
+  ],
+  "$defs": {
+    "source_location": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "quote": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "path",
+        "start_line",
+        "end_line"
+      ]
+    }
+  }
 }

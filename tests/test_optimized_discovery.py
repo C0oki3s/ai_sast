@@ -3,12 +3,14 @@ from types import SimpleNamespace
 import json
 
 from plaidnox_sast.ai import AIRepositoryContext, HuntPlan, HuntTask
+from plaidnox_sast.coverage import reconcile_obligations, reconcile_workset_batches
 from plaidnox_sast.graph import Reference, StructuralGraph, Symbol, build_structural_graph
 from plaidnox_sast.optimized_ai import (
     DiscoveryCoverageState,
     DiscoveryObligation,
     DiscoveryRegion,
     _canonical_queries,
+    _discovery_workset_units,
     _has_context_evidence,
     _enrich_region_requirements,
     _merge_discovery_regions,
@@ -55,6 +57,260 @@ def test_checkpoint_identity_uses_semantic_obligations_not_planner_ids():
         "prevent unsigned token acceptance",
     )
     assert region.checkpoint_key("v1") != first
+
+
+def test_optimized_workset_units_keep_exact_multi_slice_source_windows():
+    first = DiscoveryRegion(
+        path="routes/account.js",
+        start_line=10,
+        end_line=14,
+        content="app.get('/account', authCheck, handler);",
+        anchor_type="route",
+        anchor_id="GET /account",
+        content_hash="a" * 64,
+        security_ir_hash="route-ir",
+        obligations={"review route control"},
+        obligation_specs={
+            "route-control": DiscoveryObligation(
+                "route-control", "security_invariant", "Review route control"
+            )
+        },
+    )
+    second = DiscoveryRegion(
+        path="routes/account.js",
+        start_line=18,
+        end_line=24,
+        content="function authCheck(req) { return verify(req); }",
+        anchor_type="route",
+        anchor_id="GET /account",
+        content_hash="b" * 64,
+        security_ir_hash="middleware-ir",
+        obligations={"review identity gate"},
+        obligation_specs={
+            "identity-gate": DiscoveryObligation(
+                "identity-gate", "security_invariant", "Review identity gate"
+            )
+        },
+    )
+
+    units, metrics = _discovery_workset_units([first, second])
+
+    assert len(units) == 1
+    unit = units[0]
+    assert {"route-control", "identity-gate"} <= set(unit.obligation_specs)
+    surface_reviews = [
+        item for item in unit.obligation_specs.values() if item.obligation_type == "surface_review"
+    ]
+    assert len(surface_reviews) == 1
+    assert surface_reviews[0].importance == "REQUIRED"
+    assert surface_reviews[0].obligation_id in unit.security_workset["obligation_ids"]
+    assert {(item["path"], item["start_line"], item["end_line"]) for item in unit.source_windows()} == {
+        ("routes/account.js", 10, 14),
+        ("routes/account.js", 18, 24),
+    }
+    assert {location["path"] for item in unit.security_workset["slices"] for location in item["locations"]} == {"routes/account.js"}
+    assert metrics["unique_worksets"] == 1
+    assert metrics["review_batches"] == 1
+
+
+def test_workset_mapping_keeps_overlapping_structural_anchors_separate():
+    route = DiscoveryRegion(
+        path="app.js",
+        start_line=10,
+        end_line=20,
+        content="route content",
+        anchor_type="route",
+        anchor_id="GET /account",
+        content_hash="a" * 64,
+        security_ir_hash="route-ir",
+        obligation_specs={
+            "route-obligation": DiscoveryObligation(
+                "route-obligation", "security_invariant", "Review route"
+            )
+        },
+    )
+    function = DiscoveryRegion(
+        path="app.js",
+        start_line=10,
+        end_line=20,
+        content="function content",
+        anchor_type="symbol",
+        anchor_id="loadAccount",
+        content_hash="b" * 64,
+        security_ir_hash="function-ir",
+        obligation_specs={
+            "function-obligation": DiscoveryObligation(
+                "function-obligation", "security_invariant", "Review function"
+            )
+        },
+    )
+
+    units, _metrics = _discovery_workset_units([route, function])
+
+    assert len(units) == 2
+    assert {
+        frozenset(key for key, item in unit.obligation_specs.items() if item.obligation_type != "surface_review")
+        for unit in units
+    } == {
+        frozenset({"route-obligation"}),
+        frozenset({"function-obligation"}),
+    }
+    assert len({
+        item.canonical_id
+        for unit in units
+        for item in unit.obligation_specs.values()
+        if item.obligation_type == "surface_review"
+    }) == 2
+
+
+def test_required_surface_review_spans_every_lossless_workset_batch():
+    regions = [
+        DiscoveryRegion(
+            path="routes/batch.js",
+            start_line=index + 1,
+            end_line=index + 1,
+            content=f"evidence_{index}()",
+            anchor_type="route",
+            anchor_id="GET /batch",
+            content_hash=f"{index + 1:064x}",
+            security_ir_hash=f"ir-{index}",
+        )
+        for index in range(9)
+    ]
+    units, metrics = _discovery_workset_units(regions)
+
+    assert metrics["review_batches"] == 2
+    reviews = [
+        next(item for item in unit.obligation_specs.values() if item.obligation_type == "surface_review")
+        for unit in units
+    ]
+    assert reviews[0].canonical_id == reviews[1].canonical_id
+    assert all(item.importance == "REQUIRED" for item in reviews)
+    planned = [
+        {
+            "region_id": unit.region_id,
+            "security_workset": unit.security_workset,
+            "obligations": [item.to_dict() for item in unit.obligation_specs.values()],
+        }
+        for unit in units
+    ]
+    observations = [
+        {"region_id": unit.region_id, "obligation": review.to_dict(), "status": status}
+        for unit, review, status in zip(units, reviews, ("NO_ISSUE", "UNRESOLVED"), strict=True)
+    ]
+    reduced, batch_metrics = reconcile_workset_batches(observations, planned)
+
+    assert batch_metrics["workset_batch_obligations_unresolved"] == 1
+    assert reconcile_obligations(reduced)["canonical_required_unresolved"] == 1
+
+
+def test_graph_workset_supplies_cross_file_route_evidence(tmp_path: Path):
+    from plaidnox_sast.ai import _candidate_from_ai_item
+
+    (tmp_path / "app.js").write_text(
+        "const app = express();\napp.get('/account', check_auth);\nconst adjacent = true;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "middleware.py").write_text(
+        "def check_auth(request):\n    return request.user\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+    route = next(item for item in graph.routes if "GET /account" in item.name)
+    region = _region_from_range(
+        tmp_path, graph, route.path, 1, 3, anchor=route
+    )
+    assert region is not None
+    region.obligation_specs["identity"] = DiscoveryObligation(
+        "identity", "security_invariant", "Review the authenticated identity"
+    )
+
+    units, metrics = _discovery_workset_units(
+        [region], root=tmp_path, graph=graph
+    )
+
+    assert len(units) == 1
+    assert metrics["graph_worksets_selected"] == 1
+    assert units[0].security_workset["evidence_source"] == "tree_sitter_graph"
+    assert units[0].security_workset["workset_complete"] is False
+    assert region.obligation_specs.items() <= units[0].obligation_specs.items()
+    assert sum(item.obligation_type == "surface_review" for item in units[0].obligation_specs.values()) == 1
+    assert {window["path"] for window in units[0].source_windows()} == {
+        "app.js", "middleware.py"
+    }
+    excerpts = [
+        location["excerpt"]
+        for evidence in units[0].security_workset["slices"]
+        for location in evidence["locations"]
+    ]
+    assert sum("app.get('/account'" in excerpt for excerpt in excerpts) == 1
+    assert any("const adjacent = true" in excerpt for excerpt in excerpts)
+    hypothesis = {
+        "candidate_id": "identity-hypothesis",
+        "title": "Identity boundary may be crossed",
+        "vulnerability_class": "CWE-287",
+        "classification_references": [],
+        "business_impact": "An identity-bound operation may be affected.",
+        "severity": "high",
+        "confidence": 0.7,
+        "category": "authentication",
+        "path": "middleware.py",
+        "start_line": 1,
+        "end_line": 2,
+        "message": "The identity boundary needs independent verification.",
+        "attack_path": "input -> identity selection",
+        "evidence_basis": {
+            "origin": [], "propagation": [], "expected_boundary": [],
+            "sensitive_effect": [], "controls_checked": [], "missing_evidence": [],
+        },
+        "root_cause": {},
+        "root_equivalence": {},
+        "attacker_influence": "request input",
+        "security_control": "identity check",
+        "broken_invariant": "Identity must be verified before use.",
+        "sensitive_effect": "identity-bound operation",
+        "gained_capability": "select another identity",
+        "required_context": [],
+    }
+    assert _candidate_from_ai_item(
+        tmp_path,
+        hypothesis,
+        units[0].to_segment(),
+        allowed_source_windows=units[0].source_windows(),
+    ) is not None
+    (tmp_path / "unrelated.py").write_text("unsafe_call()\n", encoding="utf-8")
+    assert _candidate_from_ai_item(
+        tmp_path,
+        {**hypothesis, "path": "unrelated.py", "start_line": 1, "end_line": 1},
+        units[0].to_segment(),
+        allowed_source_windows=units[0].source_windows(),
+    ) is None
+
+
+def test_graph_workset_with_sensitive_related_source_uses_region_evidence(tmp_path: Path):
+    (tmp_path / "app.js").write_text(
+        "const app = express();\napp.get('/account', check_auth);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "credential_handler.py").write_text(
+        "def check_auth(request):\n    return request.user\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+    route = next(item for item in graph.routes if "GET /account" in item.name)
+    region = _region_from_range(
+        tmp_path, graph, route.path, route.line, route.end_line, anchor=route
+    )
+    assert region is not None
+
+    units, metrics = _discovery_workset_units(
+        [region], root=tmp_path, graph=graph
+    )
+
+    assert len(units) == 1
+    assert metrics["graph_worksets_selected"] == 0
+    assert metrics["graph_worksets_deferred_sources"] == 1
+    assert {window["path"] for window in units[0].source_windows()} == {"app.js"}
 
 
 def test_overlapping_regions_use_actual_merged_span_size(tmp_path: Path):
@@ -380,6 +636,137 @@ def test_lockfile_hits_never_become_discovery_regions(tmp_path: Path):
     assert {region.path for region in regions} == {"app.js"}
 
 
+def test_indexed_route_without_search_hit_still_gets_required_workset_review(tmp_path: Path):
+    from plaidnox_sast.optimized_ai import _search_discovery_regions
+
+    (tmp_path / "app.js").write_text(
+        "app.get('/first', first_handler); // first_marker\n"
+        "app.get('/second', second_handler);\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+    assert len(graph.routes) == 2
+    plan = HuntPlan("plan", "Review entry points", [])
+    stats: dict[str, int] = {}
+    queries = [{
+        "query_id": "first-only",
+        "search_terms": ["first_marker"],
+        "include_globs": ["*.js"],
+        "task_ids": [],
+    }]
+
+    regions = _search_discovery_regions(
+        tmp_path, queries, plan, graph, None, None, stats=stats
+    )
+    units, _ = _discovery_workset_units(regions, root=tmp_path, graph=graph)
+
+    assert stats["indexed_routes_in_scope"] == 2
+    assert stats["indexed_route_regions_added"] >= 1
+    assert {route.name for route in graph.routes} <= {
+        region.anchor_id.removeprefix("route:") for region in regions
+    }
+    assert any(
+        "GET /second" in unit.security_workset["surface_id"]
+        and any(item.obligation_type == "surface_review" and item.importance == "REQUIRED"
+                for item in unit.obligation_specs.values())
+        for unit in units
+    )
+
+
+def test_indexed_route_can_seed_discovery_when_search_returns_no_hits(tmp_path: Path):
+    from plaidnox_sast.optimized_ai import _search_discovery_regions
+
+    (tmp_path / "app.js").write_text("app.get('/health', handler);\n", encoding="utf-8")
+    graph = build_structural_graph(tmp_path)
+    stats: dict[str, int] = {}
+
+    regions = _search_discovery_regions(
+        tmp_path, [], HuntPlan("plan", "Review entry points", []), graph, None, None,
+        stats=stats,
+    )
+
+    assert len(regions) == 1
+    assert regions[0].anchor_type == "route"
+    assert stats["rg_hits_unique"] == 0
+    assert stats["indexed_route_regions_added"] == 1
+
+
+def test_indexed_route_seeding_respects_analysis_scope(tmp_path: Path):
+    from plaidnox_sast.optimized_ai import _search_discovery_regions
+
+    (tmp_path / "public.js").write_text("app.get('/public', handler);\n", encoding="utf-8")
+    (tmp_path / "private.js").write_text("app.get('/private', handler);\n", encoding="utf-8")
+    graph = build_structural_graph(tmp_path)
+    stats: dict[str, int] = {}
+
+    regions = _search_discovery_regions(
+        tmp_path, [], HuntPlan("plan", "Review entry points", []), graph, None, None,
+        include_paths={"public.js"}, stats=stats,
+    )
+
+    assert [region.path for region in regions] == ["public.js"]
+    assert stats["indexed_routes_in_scope"] == 1
+
+
+def test_indexed_registration_without_search_hit_gets_required_review(tmp_path: Path):
+    from plaidnox_sast.optimized_ai import _search_discovery_regions
+
+    (tmp_path / "worker.py").write_text(
+        "def process_message(payload):\n    return payload\n\n"
+        "queue.register('daily', process_message)\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+    worksets = []
+    stats: dict[str, int] = {}
+
+    regions = _search_discovery_regions(
+        tmp_path, [], HuntPlan("plan", "Review registered work", []), graph, None, None,
+        stats=stats, indexed_worksets=worksets,
+    )
+    units, metrics = _discovery_workset_units(
+        regions, root=tmp_path, graph=graph, indexed_worksets=worksets,
+    )
+
+    assert stats["rg_hits_unique"] == 0
+    assert stats["indexed_registration_regions_added"] == 1
+    assert metrics["graph_worksets_selected"] == 1
+    assert len(units) == 1
+    assert units[0].security_workset["surface_type"] == "symbol_registration"
+    assert units[0].security_workset["workset_complete"] is False
+    assert any(
+        item.obligation_type == "surface_review" and item.importance == "REQUIRED"
+        for item in units[0].obligation_specs.values()
+    )
+
+
+def test_indexed_registration_already_covered_by_search_is_not_added_twice(tmp_path: Path):
+    from plaidnox_sast.optimized_ai import _search_discovery_regions
+
+    (tmp_path / "worker.py").write_text(
+        "def process_message(payload):\n    return payload\n\n"
+        "queue.register('daily', process_message)\n",
+        encoding="utf-8",
+    )
+    graph = build_structural_graph(tmp_path)
+    stats: dict[str, int] = {}
+    queries = [{
+        "query_id": "registration",
+        "search_terms": ["queue.register"],
+        "include_globs": ["*.py"],
+        "task_ids": [],
+    }]
+
+    regions = _search_discovery_regions(
+        tmp_path, queries, HuntPlan("plan", "Review registered work", []),
+        graph, None, None, stats=stats,
+    )
+
+    assert stats["rg_hits_unique"] == 1
+    assert stats["indexed_registration_regions_added"] == 0
+    assert len(regions) == 1
+
+
 class _ObligationAgent:
     """Minimal mixin used with the production optimized agent below."""
 
@@ -476,6 +863,10 @@ def test_optimized_discovery_calls_each_terminal_region_once(tmp_path: Path):
     assert candidates == []
     assert failures == 0
     assert len(agent.requests) == agent.discovery_metrics["regions_planned"]
+    assert agent.requests[0]["security_workset"]["slices"]
+    assert "content" not in agent.requests[0]["source_segment"]
+    assert agent.requests[0]["security_workset"]["evidence_source"] == "tree_sitter_graph"
+    assert {window["start_line"] for window in agent.requests[0]["source_windows"]} == {1, 2}
     assert agent.discovery_metrics["continuations_executed"] == 0
     assert agent.discovery_metrics["discovery_model_calls_per_unique_region"] == 1.0
 

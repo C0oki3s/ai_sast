@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import Any
 
 from .assets import load_json
@@ -94,7 +95,9 @@ def reconcile_obligations(observations: list[dict[str, Any]]) -> dict[str, int]:
                 region_id=str(observation.get("region_id", "")),
             )
             importance = importance or derived_importance
-        groups[canonical_id].append(
+        coverage_scope = str(observation.get("coverage_scope", ""))
+        group_id = f"{canonical_id}:{coverage_scope}" if coverage_scope else canonical_id
+        groups[group_id].append(
             {
                 "status": str(observation.get("status", "UNRESOLVED")),
                 "importance": importance or policy["default_importance"],
@@ -127,4 +130,101 @@ def reconcile_obligations(observations: list[dict[str, Any]]) -> dict[str, int]:
         "canonical_required_unresolved": unresolved_required,
         "canonical_supporting_unresolved": unresolved_supporting,
         "obligations_reconciled_by_sibling": reconciled_by_sibling,
+    }
+
+
+def reconcile_workset_batches(
+    observations: list[dict[str, Any]],
+    planned_batches: list[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Reduce batch-local answers only after every planned workset batch is accounted for.
+
+    A clean answer from one batch cannot complete a required obligation assigned
+    to another batch. Multi-batch work is scoped to its workset so an unrelated
+    sibling region cannot hide an incomplete batch.
+    """
+
+    planned: dict[tuple[str, str, str], dict[str, Any]] = {}
+    region_keys: dict[str, tuple[str, str]] = {}
+    workset_indices: dict[tuple[str, str], set[int]] = defaultdict(set)
+    workset_counts: dict[tuple[str, str], int] = {}
+    for batch in planned_batches:
+        workset = batch.get("security_workset") or {}
+        if int(workset.get("batch_count", 1)) <= 1:
+            continue
+        region_id = str(batch["region_id"])
+        scope = (str(workset["workset_id"]), str(workset["evidence_hash"]))
+        region_keys[region_id] = scope
+        workset_indices[scope].add(int(workset["batch_index"]))
+        workset_counts[scope] = int(workset["batch_count"])
+        for obligation in batch.get("obligations", []):
+            canonical_id = str(obligation["canonical_id"])
+            key = (*scope, canonical_id)
+            entry = planned.setdefault(
+                key,
+                {"obligation": dict(obligation), "regions": set(), "statuses": {}},
+            )
+            entry["regions"].add(region_id)
+
+    passthrough: list[dict[str, Any]] = []
+    for observation in observations:
+        region_id = str(observation.get("region_id", ""))
+        scope = region_keys.get(region_id)
+        if scope is None:
+            passthrough.append(observation)
+            continue
+        canonical_id = str((observation.get("obligation") or {}).get("canonical_id", ""))
+        entry = planned.get((*scope, canonical_id))
+        if entry is not None:
+            entry["statuses"].setdefault(region_id, []).append(str(observation.get("status", "UNRESOLVED")))
+
+    unresolved = 0
+    missing = 0
+    for (workset_id, evidence_hash, _canonical_id), entry in planned.items():
+        statuses_by_region = entry["statuses"]
+        expected = entry["regions"]
+        missing += len(expected - statuses_by_region.keys())
+        all_statuses = [status for statuses in statuses_by_region.values() for status in statuses]
+        complete = expected == statuses_by_region.keys() and all(
+            len(statuses_by_region[region_id]) == 1
+            and statuses_by_region[region_id][0] in {"NO_ISSUE", "NOT_APPLICABLE", "CANDIDATE_FOUND"}
+            for region_id in expected
+        )
+        if not complete:
+            unresolved += 1
+        status = (
+            "UNRESOLVED" if not complete
+            else "CANDIDATE_FOUND" if "CANDIDATE_FOUND" in all_statuses
+            else "NO_ISSUE" if "NO_ISSUE" in all_statuses
+            else "NOT_APPLICABLE"
+        )
+        passthrough.append(
+            {
+                "region_id": workset_id,
+                "coverage_scope": f"{workset_id}:{evidence_hash}",
+                "obligation": entry["obligation"],
+                "status": status,
+            }
+        )
+    absent_batches = 0
+    for (workset_id, evidence_hash), indices in workset_indices.items():
+        absent = set(range(workset_counts[(workset_id, evidence_hash)])) - indices
+        absent_batches += len(absent)
+        if absent:
+            passthrough.append(
+                {
+                    "region_id": workset_id,
+                    "coverage_scope": f"{workset_id}:{evidence_hash}",
+                    "obligation": {
+                        "canonical_id": f"workset-batches:{workset_id}:{evidence_hash}",
+                        "importance": "REQUIRED",
+                    },
+                    "status": "UNRESOLVED",
+                }
+            )
+    return passthrough, {
+        "workset_batch_obligations_reconciled": len(planned),
+        "workset_batch_obligations_unresolved": unresolved,
+        "workset_batch_observations_missing": missing,
+        "workset_batches_missing": absent_batches,
     }

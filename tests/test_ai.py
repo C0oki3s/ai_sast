@@ -14,7 +14,9 @@ from plaidnox_sast.ai import (
     HuntTask,
     PlaidNoxDeepHuntAgent,
     _execute_recon_search_plan,
+    _ground_repository_annotations,
     _resolve_context_request,
+    _security_workset_review_units,
     _search_segments,
     load_env_file,
 )
@@ -160,6 +162,243 @@ def test_search_plan_treats_regex_metacharacters_as_literals_and_falls_back_to_f
     assert segments
     assert {item["path"] for item in segments} == {"app.js"}
     assert all(item["task_ids"] == ["task-1"] for item in segments)
+
+
+def test_repository_annotation_locations_are_source_version_grounded(sample_repo):
+    graph = build_structural_graph(sample_repo, False)
+    payload = {
+        "input_surfaces": [
+            {
+                "name": "Sign-in token",
+                "evidence_locations": [
+                    {
+                        "path": "app.js",
+                        "start_line": 4,
+                        "end_line": 4,
+                        "quote": 'app.post("/signin", async (req, res) => {',
+                    }
+                ],
+            }
+        ],
+        "trust_boundaries": [
+            {
+                "name": "Outside repository",
+                "evidence_locations": [
+                    {"path": "../outside.js", "start_line": 1, "end_line": 1}
+                ],
+            },
+            {
+                "name": "Wrong quote",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 4, "end_line": 4, "quote": "not source"}
+                ],
+            },
+        ],
+    }
+
+    summary = _ground_repository_annotations(payload, sample_repo, graph)
+
+    grounded = payload["input_surfaces"][0]
+    assert grounded["evidence_locations"][0]["grounding_status"] == "verified_source_location"
+    assert grounded["evidence_locations"][0]["source_content_hash"] == next(
+        item.content_hash for item in graph.files if item.path == "app.js"
+    )
+    assert grounded["annotation_provenance"] == {
+        "origin": "repository_context_model",
+        "location_grounding": "verified",
+        "semantic_claim_validation": "not_performed",
+    }
+    assert payload["trust_boundaries"][0]["evidence_locations"][0]["grounding_status"] == "path_outside_snapshot"
+    assert payload["trust_boundaries"][1]["evidence_locations"][0]["grounding_status"] == "quote_mismatch"
+    assert summary["records_with_verified_locations"] == 1
+    assert summary["records_without_verified_locations"] == 2
+    assert summary["semantic_claims_validated"] == 0
+
+
+def test_repository_annotation_locations_reject_stale_graph_version(sample_repo):
+    graph = build_structural_graph(sample_repo, False)
+    (sample_repo / "app.js").write_text("changed after indexing\n", encoding="utf-8")
+    payload = {
+        "entry_points": [
+            {
+                "entry_id": "signin",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 1, "end_line": 1}
+                ],
+            }
+        ],
+        "sensitive_effects": [
+            {
+                "effect_id": "effect-1",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 1, "end_line": 2}
+                ],
+            }
+        ],
+        "authorization_decisions": [
+            {
+                "name": "account owner check",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 0, "end_line": 1}
+                ],
+            }
+        ],
+    }
+
+    summary = _ground_repository_annotations(payload, sample_repo, graph)
+
+    assert payload["entry_points"][0]["evidence_locations"][0]["grounding_status"] == "source_version_mismatch"
+    assert payload["sensitive_effects"][0]["evidence_locations"][0]["grounding_status"] == "source_version_mismatch"
+    assert payload["authorization_decisions"][0]["evidence_locations"][0]["grounding_status"] == "source_version_mismatch"
+    assert summary["locations_verified"] == 0
+    assert summary["locations_unverified"] == 3
+
+
+def test_repository_annotation_location_rejects_invalid_line_bounds(sample_repo):
+    graph = build_structural_graph(sample_repo, False)
+    payload = {
+        "entry_points": [
+            {
+                "entry_id": "invalid-range",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 0, "end_line": 1}
+                ],
+            }
+        ]
+    }
+
+    _ground_repository_annotations(payload, sample_repo, graph)
+
+    assert payload["entry_points"][0]["evidence_locations"][0]["grounding_status"] == "invalid_line_range"
+
+
+def test_repository_annotation_locations_carry_forward_only_for_same_record_and_valid_source(sample_repo):
+    graph = build_structural_graph(sample_repo, False)
+    prior = {
+        "authentication_paths": [
+            {
+                "name": "JWT auth",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 4, "end_line": 4}
+                ],
+            }
+        ]
+    }
+    payload = {
+        "authentication_paths": [
+            {"name": "JWT auth"},
+            {"name": "Different auth"},
+        ]
+    }
+
+    summary = _ground_repository_annotations(payload, sample_repo, graph, prior)
+
+    assert payload["authentication_paths"][0]["evidence_locations"][0]["grounding_status"] == "verified_source_location"
+    assert payload["authentication_paths"][0]["evidence_locations"][0]["provenance"] == "carried_forward"
+    assert payload["authentication_paths"][1]["annotation_provenance"]["location_grounding"] == "none"
+    assert summary["locations_carried_forward"] == 1
+
+
+def test_repository_annotation_locations_do_not_carry_forward_after_source_change(sample_repo):
+    graph = build_structural_graph(sample_repo, False)
+    prior = {
+        "sensitive_effects": [
+            {
+                "effect_id": "token-write",
+                "evidence_locations": [
+                    {"path": "app.js", "start_line": 4, "end_line": 4}
+                ],
+            }
+        ]
+    }
+    (sample_repo / "app.js").write_text("changed source\n", encoding="utf-8")
+    payload = {"sensitive_effects": [{"effect_id": "token-write"}]}
+
+    summary = _ground_repository_annotations(payload, sample_repo, graph, prior)
+
+    assert "evidence_locations" not in payload["sensitive_effects"][0]
+    assert payload["sensitive_effects"][0]["annotation_provenance"]["location_grounding"] == "none"
+    assert summary["locations_carried_forward"] == 0
+
+
+def test_discovery_regions_group_into_surface_workset_review_units(sample_repo):
+    source_hash = next(
+        item.content_hash
+        for item in build_structural_graph(sample_repo, False).files
+        if item.path == "app.js"
+    )
+    segments = [
+        {
+            "path": "app.js",
+            "start_line": 4,
+            "end_line": 6,
+            "content": "reviewable source",
+            "content_hash": source_hash,
+            "anchor_type": "http_route",
+            "anchor_id": "POST /signin",
+            "security_ir_slice": {"symbols": ["signin"]},
+        },
+        {
+            "path": "app.js",
+            "start_line": 8,
+            "end_line": 9,
+            "content": "additional route source",
+            "content_hash": source_hash,
+            "anchor_type": "http_route",
+            "anchor_id": "POST /signin",
+            "security_ir_slice": {"symbols": ["signin-handler"]},
+        },
+    ]
+
+    units, stats = _security_workset_review_units(segments)
+
+    assert len(units) == 1
+    workset = units[0]["security_workset"]
+    assert workset["surface_type"] == "http_route"
+    assert workset["workset_id"]
+    assert workset["slice_count"] == 2
+    assert workset["evidence_source"] == "region_security_ir_adapter"
+    assert workset["semantic_relationships_validated"] is False
+    assert len(workset["slices"]) == 2
+    assert len(units[0]["allowed_source_windows"]) == 2
+    assert "content" not in units[0]
+    assert stats == {
+        "regions": 2,
+        "regions_with_worksets": 2,
+        "unique_worksets": 1,
+        "review_batches": 1,
+        "incomplete_worksets": 0,
+    }
+
+
+def test_discovery_workset_batches_preserve_all_slices_when_surface_exceeds_batch_limit():
+    content_hash = "a" * 64
+    segments = [
+        {
+            "path": "src/handler.py",
+            "start_line": index * 3 + 1,
+            "end_line": index * 3 + 1,
+            "content": f"handle_{index}()",
+            "content_hash": content_hash,
+            "anchor_type": "code_symbol",
+            "anchor_id": "shared_handler",
+            "task_ids": [f"task-{index}"],
+            "query_ids": [f"query-{index}"],
+        }
+        for index in range(9)
+    ]
+
+    units, stats = _security_workset_review_units(segments)
+
+    assert stats["unique_worksets"] == 1
+    assert stats["review_batches"] == 2
+    assert sum(len(unit["security_workset"]["slices"]) for unit in units) == 9
+    assert [unit["security_workset"]["batch_index"] for unit in units] == [0, 1]
+    assert units[0]["security_workset"]["remaining_slice_count"] == 1
+    assert units[1]["security_workset"]["remaining_slice_count"] == 0
+    assert sorted({task for unit in units for task in unit["task_ids"]}) == [
+        f"task-{index}" for index in range(9)
+    ]
 
 
 class FakeResponses:
@@ -854,6 +1093,12 @@ app.get("/users/:id", async (req, res) => {
     assert "ai_remediation" not in candidates[0].metadata
     assert client.responses.requests[0]["text"]["format"]["name"] == "plaidnox_recon_search_plan"
     assert client.responses.requests[1]["text"]["format"]["name"] == "plaidnox_repository_context"
+    recon_manifest = json.loads(client.responses.requests[1]["input"][1]["content"])
+    assert recon_manifest["security_surface_inventory"]["source"] == "tree_sitter_syntax_worksets"
+    assert recon_manifest["security_surface_inventory"]["included"] <= recon_manifest[
+        "security_surface_inventory"
+    ]["total"]
+    assert "security_surfaces" in recon_manifest["repository_context_coverage"]
     assert client.responses.requests[1]["max_output_tokens"] == load_json("runtime/agent.json")[
         "model_output_token_limit_by_operation"
     ]["repository_context"]
@@ -866,6 +1111,11 @@ app.get("/users/:id", async (req, res) => {
     assert "source_tree" not in compact_context
     assert "focus_path" not in compact_context
     assert discovery_payload["source_segment"]["path"] == "app.js"
+    assert discovery_payload["security_workset"]["surface_type"] == "http_route"
+    assert discovery_payload["security_workset"]["evidence_source"] == "region_security_ir_adapter"
+    assert discovery_payload["security_workset"]["semantic_relationships_validated"] is False
+    assert discovery_payload["security_workset"]["slices"]
+    assert len(discovery_payload["source_windows"]) == 1
     discovery_audit = agent.model_input_audit()[3]
     assert discovery_audit["operation"] == "vulnerability_discovery"
     assert discovery_audit["repository_wide_context"] is False
@@ -1860,7 +2110,6 @@ def test_balanced_area_sample_round_robins_instead_of_starving_later_areas():
 def test_build_repository_context_reports_sampling_truncation_by_area(sample_repo, monkeypatch):
     import plaidnox_sast.ai as ai_module
     from plaidnox_sast.assets import load_json as real_load_json
-    from plaidnox_sast.graph import Symbol
 
     def patched_load_json(name):
         data = real_load_json(name)
@@ -1893,12 +2142,19 @@ def test_build_repository_context_reports_sampling_truncation_by_area(sample_rep
         }
     )
     agent = PlaidNoxDeepHuntAgent(client)
+    for relative, route in (
+        ("area_a/one.js", "/a1"),
+        ("area_a/two.js", "/a2"),
+        ("area_b/one.js", "/b1"),
+    ):
+        path = sample_repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"const app = express();\napp.get('{route}', (req, res) => res.end());\n",
+            encoding="utf-8",
+        )
     graph = build_structural_graph(sample_repo, False)
-    graph.routes = [
-        Symbol(name="a1", path="area_a/one.js", line=1),
-        Symbol(name="a2", path="area_a/two.js", line=1),
-        Symbol(name="b1", path="area_b/one.js", line=1),
-    ]
+    graph.routes = [item for item in graph.routes if item.path.startswith(("area_a/", "area_b/"))]
 
     agent.build_repository_context(sample_repo, "org/repo", "abc123", graph)
 
@@ -1914,6 +2170,56 @@ def test_build_repository_context_reports_sampling_truncation_by_area(sample_rep
     assert coverage["included"] == 2
     assert coverage["truncated"] is True
     assert coverage["areas_with_omitted_context"] == ["area_a"]
+
+
+def test_security_surface_inventory_is_bounded_and_reports_omitted_areas(tmp_path, monkeypatch):
+    import plaidnox_sast.ai as ai_module
+    from plaidnox_sast.assets import load_json as real_load_json
+
+    for area, function in (("area_a", "process_a"), ("area_b", "process_b")):
+        directory = tmp_path / area
+        directory.mkdir()
+        (directory / "tasks.py").write_text(
+            f"def {function}(payload):\n    return payload\n\n"
+            f"queue.register('{area}', {function})\n",
+            encoding="utf-8",
+        )
+
+    def configured_load_json(name):
+        value = real_load_json(name)
+        if name == "runtime/security_worksets.json":
+            value = dict(value)
+            value["maximum_repository_context_surfaces"] = 1
+            value["maximum_repository_context_locations_per_surface"] = 2
+            value["maximum_repository_context_primary_excerpt_characters"] = 24
+        return value
+
+    monkeypatch.setattr(ai_module, "load_json", configured_load_json)
+    inventory = ai_module._security_surface_inventory(
+        tmp_path, ai_module.build_structural_graph(tmp_path)
+    )
+
+    assert inventory["source"] == "tree_sitter_syntax_worksets"
+    assert inventory["total"] == 2
+    assert inventory["included"] == 1
+    assert inventory["truncated"] is True
+    assert inventory["omitted_surface_count"] == 1
+    assert inventory["omitted_areas"] == ["area_b"]
+    surface = inventory["surfaces"][0]
+    assert surface["surface_type"] == "symbol_registration"
+    assert "queue.register" in surface["primary_excerpt"]
+    assert len(surface["primary_excerpt"]) <= 24
+    assert surface["primary_excerpt_truncated"] is True
+    assert surface["unresolved_edge_ids"]
+    assert any("reachability" in item for item in inventory["interpretation_limits"])
+    scoped_inventory = ai_module._security_surface_inventory(
+        tmp_path,
+        ai_module.build_structural_graph(tmp_path),
+        include_paths={"area_b/tasks.py"},
+    )
+    assert scoped_inventory["scope"] == "incremental_analysis_paths"
+    assert scoped_inventory["total"] == 1
+    assert scoped_inventory["outside_scope_surface_count"] == 1
 
 
 def test_candidate_from_ai_item_does_not_require_a_confirmed_field(sample_repo):
@@ -2427,10 +2733,29 @@ def test_repository_context_still_fails_typed_after_exhausting_shape_retries(sam
 def test_payload_puts_per_request_keys_after_stable_prefix() -> None:
     from plaidnox_sast.prompts import _payload_json
 
-    first = _payload_json({"source_segment": {"path": "a"}, "repository_context": {"x": 1}, "hunt_plan": {}, "new_context": []})
-    second = _payload_json({"new_context": [], "hunt_plan": {}, "repository_context": {"x": 1}, "source_segment": {"path": "b"}})
+    first = _payload_json({
+        "source_segment": {"path": "a"},
+        "repository_context": {"x": 1},
+        "hunt_plan": {},
+        "source_windows": [{"path": "a", "start_line": 1}],
+        "security_workset": {"evidence_hash": "a"},
+        "continuation_focus": "first",
+        "new_context": [],
+    })
+    second = _payload_json({
+        "new_context": [],
+        "continuation_focus": "second",
+        "security_workset": {"evidence_hash": "b"},
+        "source_windows": [{"path": "b", "start_line": 2}],
+        "hunt_plan": {},
+        "repository_context": {"x": 1},
+        "source_segment": {"path": "b"},
+    })
     prefix = first[: first.index('"source_segment"')]
     assert second.startswith(prefix)
+    assert first.index('"source_windows"') > first.index('"source_segment"')
+    assert first.index('"security_workset"') > first.index('"source_segment"')
+    assert first.index('"continuation_focus"') > first.index('"source_segment"')
     assert first.index('"new_context"') > first.index('"source_segment"')
 
 

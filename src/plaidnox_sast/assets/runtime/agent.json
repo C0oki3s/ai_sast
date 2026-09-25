@@ -109,6 +109,9 @@
   "knowledge_max_claims": 6,
   "prompt_cache_volatile_payload_keys": [
     "source_segment",
+    "source_windows",
+    "security_workset",
+    "continuation_focus",
     "new_context"
   ],
   "prompt_cache_key_prefix": "plaidnox-sast",
