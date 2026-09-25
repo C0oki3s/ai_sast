@@ -9,7 +9,13 @@ import pytest
 
 from plaidnox_sast.ai import AIResponseError, PlaidNoxDeepHuntAgent
 from plaidnox_sast.graph_context import GraphContextBroker
-from plaidnox_sast.graphify_adapter import normalize_extraction
+from plaidnox_sast.graphify_adapter import (
+    CodeEdge,
+    CodeGraphSnapshot,
+    CodeNode,
+    graph_edge_identity,
+    normalize_extraction,
+)
 from plaidnox_sast.investigations import build_investigation
 from plaidnox_sast.checkpoint import ScanCheckpoint
 
@@ -159,6 +165,138 @@ def test_graph_investigation_candidate_is_grounded_then_sent_as_hypothesis(tmp_p
     assert candidates[0].metadata["graph_investigation_id"] == investigation.investigation_id
     assert candidates[0].metadata["engine"] == "plaidnox-graphify-investigation"
     assert disposition["candidate_count"] == 1
+
+
+def test_seeded_verified_identity_override_survives_graphify_grounding(tmp_path: Path):
+    middleware_path = "middleware/ValidateToken.js"
+    route_path = "app.js"
+    middleware = (
+        "const payload = await verifier.verify(token);\n"
+        'if (req.headers["x-user-email"]) {\n'
+        '  payload["custom:email_db"] = req.headers["x-user-email"];\n'
+        "}\n"
+        "req.user = payload;\n"
+    )
+    route = (
+        'app.get("/dashboard", authCheck, async (req, res) => {\n'
+        '  const email = req.user["custom:email_db"];\n'
+        "  return User.findOne({ email });\n"
+        "});\n"
+    )
+    (tmp_path / "middleware").mkdir()
+    (tmp_path / middleware_path).write_text(middleware, encoding="utf-8")
+    (tmp_path / route_path).write_text(route, encoding="utf-8")
+    middleware_hash = hashlib.sha256(middleware.encode()).hexdigest()
+    route_hash = hashlib.sha256(route.encode()).hexdigest()
+    graph_snapshot = CodeGraphSnapshot(
+        source_hashes={middleware_path: middleware_hash, route_path: route_hash},
+        nodes=(
+            CodeNode("auth-middleware", middleware_path, 1, "authCheck", middleware_hash),
+            CodeNode("dashboard-route", route_path, 1, "GET /dashboard", route_hash),
+        ),
+        edges=(
+            CodeEdge(
+                "dashboard-route",
+                "auth-middleware",
+                "middleware",
+                "EXTRACTED",
+                route_path,
+                1,
+                route_hash,
+            ),
+        ),
+        unresolved_edges=0,
+        extractor_version="seeded-auth-fixture",
+    )
+    context_broker = GraphContextBroker(tmp_path, graph_snapshot)
+    graph_snapshot_id = graph_snapshot.snapshot_id
+    windows = tuple(
+        {
+            "path": window.path,
+            "start_line": window.start_line,
+            "end_line": window.end_line,
+            "content_hash": window.source_hash,
+            "excerpt": window.excerpt,
+            "redaction_state": "redacted",
+        }
+        for window in (
+            context_broker.source_window_around_node(
+                "auth-middleware", lines_before=2, lines_after=8
+            ),
+            context_broker.source_window_around_node(
+                "dashboard-route", lines_before=2, lines_after=8
+            ),
+        )
+    )
+    investigation = build_investigation(
+        stable_key="security-surface:verified-identity",
+        codebase_id="codebase-auth-seed",
+        snapshot_id="snapshot-auth-seed",
+        graph_snapshot_id=graph_snapshot_id,
+        target_ref={"node_ids": ["auth-middleware", "dashboard-route"]},
+        reason="Review the verified identity boundary and its protected consumer.",
+        security_questions=(
+            "Can request-controlled identity data override verified claims and affect a protected account lookup?",
+        ),
+        graph_refs=(
+            {"node_id": "auth-middleware", "provenance": "EXTRACTED", "snapshot_id": graph_snapshot_id},
+            {"node_id": "dashboard-route", "provenance": "EXTRACTED", "snapshot_id": graph_snapshot_id},
+            {
+                "edge_id": graph_edge_identity(graph_snapshot.edges[0]),
+                "relation": "middleware",
+                "provenance": "EXTRACTED",
+                "snapshot_id": graph_snapshot_id,
+            },
+        ),
+        source_windows=windows,
+        context_dependencies=(),
+    )
+    candidate = _candidate(middleware_path, 2, 4)
+    candidate.update(
+        {
+            "root_cause": {
+                "symbol": "authCheck",
+                "security_control": "verified Cognito identity",
+                "broken_invariant": "Request-controlled identity must not replace a cryptographically verified principal.",
+                "capability": "Select another user's account through a protected route.",
+            },
+            "root_equivalence": {
+                "control_family_id": "AUTHENTICATED_IDENTITY_INTEGRITY",
+                "invariant_family_id": "UNVERIFIED_IDENTITY_MUST_NOT_REPLACE_VERIFIED_PRINCIPAL",
+                "effect_family_id": "CROSS_ACCOUNT_RECORD_ACCESS",
+                "capability_family_id": "CROSS_USER_IDENTITY_SELECTION",
+            },
+            "attacker_influence": "The x-user-email request header controls the claim assignment.",
+            "security_control": "Cognito verifier.verify(token) establishes the authenticated identity.",
+            "broken_invariant": "Unverified request data must not replace the verified account identity.",
+            "sensitive_effect": "The dashboard queries User by the overwritten identity claim.",
+            "gained_capability": "An authenticated caller can select another user's account record.",
+            "path": middleware_path,
+            "start_line": 2,
+            "end_line": 4,
+        }
+    )
+    response = _answer(investigation)
+    response["candidates"] = [candidate]
+    response["obligation_results"][0].update(
+        status="CANDIDATE_FOUND", candidate_ids=["candidate-1"]
+    )
+    agent, _ = _agent(response)
+
+    findings, disposition = agent.hunt_graph_investigation(
+        tmp_path, investigation, context_broker=context_broker
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.evidence.path == middleware_path
+    assert finding.evidence.start_line == 2
+    assert finding.evidence.end_line == 4
+    assert finding.metadata["graph_snapshot_id"] == graph_snapshot_id
+    assert finding.metadata["graph_refs"] == list(investigation.graph_refs)
+    assert "verified account identity" in finding.metadata["broken_invariant"]
+    assert "another user's account" in finding.metadata["gained_capability"]
+    assert disposition["unresolved_count"] == 0
 
 
 def test_graph_investigation_rejects_candidate_outside_its_windows(tmp_path: Path):
