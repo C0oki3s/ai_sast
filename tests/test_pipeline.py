@@ -89,6 +89,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             self.graph_plan_calls = 0
             self.graph_hunt_calls = 0
             self.review_calls = 0
+            self.return_no_candidate = False
 
         def build_repository_context(self, root, repository, commit, graph, business_context=""):
             return GraphContext()
@@ -131,6 +132,13 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             from plaidnox_sast.models import Candidate, Evidence, Severity
 
             self.graph_hunt_calls += 1
+            if self.return_no_candidate:
+                return [], {
+                    "investigation_id": investigation.investigation_id,
+                    "obligation_results": [{"status": "NO_ISSUE"}],
+                    "candidate_count": 0,
+                    "unresolved_count": 0,
+                }
             candidate = Candidate(
                 rule_id="plaidnox.ai.graph-investigation",
                 title="Graph investigation hypothesis",
@@ -200,6 +208,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert stored[0].state == "candidate"
 
     source.write_text("app.get('/accounts', listAccounts); // changed\n", encoding="utf-8")
+    agent.return_no_candidate = True
     rerun = pipeline.scan_snapshot(
         tmp_path,
         "local/account-service",
@@ -214,6 +223,36 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         "invalidated_prior_investigation_count"
     ] == 1
     assert agent.graph_plan_calls == 2
+    assert agent.graph_hunt_calls == 2
+    with unit_of_work(factory, "default") as repository:
+        rerun_investigations = repository.list_investigations(rerun.scan_id)
+        rerun_scan = repository.get_scan(rerun.scan_id)
+        eligible = repository.list_reusable_no_candidate_investigations(
+            rerun_investigations[0].codebase_id,
+            rerun_scan.workflow_version,
+        )
+    assert rerun_investigations[0].state == "no_candidate"
+    assert rerun_scan is not None and rerun_scan.scan_status == "SUCCESSFUL"
+    assert rerun_investigations[0].investigation_id in {
+        item.investigation_id for item in eligible
+    }
+
+    unchanged = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
+        graphify_investigations=True,
+    )
+    assert unchanged.repository_context["graphify_shadow_planning"][
+        "reusable_no_candidate_group_count"
+    ] == 1
+    assert unchanged.repository_context["graphify_shadow_planning"]["groups"][0][
+        "planning_status"
+    ] == "reused_no_candidate"
+    assert unchanged.metrics["graphify_hunt_no_candidate_reused"] == 1
+    assert unchanged.metrics["graphify_hunt_results"][0]["status"] == "reused_no_candidate"
+    assert agent.graph_plan_calls == 2
+    assert agent.graph_hunt_calls == 2
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):

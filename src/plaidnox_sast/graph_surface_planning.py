@@ -54,6 +54,7 @@ class GraphSurfacePlanningResult:
     reused_groups: int = 0
     persisted_groups: int = 0
     reused_group_ids: tuple[str, ...] = ()
+    reusable_no_candidate_group_ids: tuple[str, ...] = ()
 
     @property
     def mapping_gap_count(self) -> int:
@@ -78,6 +79,14 @@ class InvestigationOrmStore:
     def list_for_codebase(self, codebase_id: str) -> list[InvestigationValue]:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.list_investigations_for_codebase(codebase_id)
+
+    def list_reusable_no_candidates(
+        self, codebase_id: str, workflow_version: str
+    ) -> list[InvestigationValue]:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.list_reusable_no_candidate_investigations(
+                codebase_id, workflow_version
+            )
 
     def save(self, scan_id: str, investigation: Investigation) -> InvestigationValue:
         with unit_of_work(self.factory, self.tenant_id) as repository:
@@ -181,6 +190,7 @@ class GraphSurfacePlanningCoordinator:
         graph_snapshot: CodeGraphSnapshot,
         storage_snapshot_id: str | None = None,
         invalidated_prior_investigation_ids: frozenset[str] = frozenset(),
+        reusable_no_candidate_ids: frozenset[str] = frozenset(),
     ) -> GraphSurfacePlanningResult:
         inventory = map_repository_surfaces_to_graph(repository_context, graph_snapshot)
         grouping = group_connected_graph_targets(inventory, graph_snapshot)
@@ -188,10 +198,12 @@ class GraphSurfacePlanningCoordinator:
         gaps: list[GraphSurfacePlanningGap] = []
         reused_groups = 0
         reused_group_ids: list[str] = []
+        reusable_no_candidate_group_ids: list[str] = []
         persisted_groups = 0
         durable_snapshot_id = storage_snapshot_id or graph_snapshot.snapshot_id
         existing_by_stable_key: dict[str, InvestigationValue] = {}
         prior_by_stable_key: dict[str, InvestigationValue] = {}
+        reusable_no_candidate_by_stable_key: dict[str, InvestigationValue] = {}
         if self.persistence is not None:
             if not scan_id:
                 raise ValueError(
@@ -205,7 +217,13 @@ class GraphSurfacePlanningCoordinator:
                         "multiple stored investigation versions share one surface group and snapshot"
                     )
                 existing_by_stable_key[existing.stable_key] = existing
-            for prior in self.persistence.list_for_codebase(codebase_id):
+            prior_values = self.persistence.list_for_codebase(codebase_id)
+            for prior in prior_values:
+                if prior.investigation_id in reusable_no_candidate_ids:
+                    reusable_no_candidate_by_stable_key.setdefault(
+                        prior.stable_key, prior
+                    )
+            for prior in prior_values:
                 if prior.scan_id == scan_id or prior.stable_key in prior_by_stable_key:
                     continue
                 prior_by_stable_key[prior.stable_key] = prior
@@ -257,7 +275,9 @@ class GraphSurfacePlanningCoordinator:
                         investigation.investigation_id,
                     )
                 continue
-            prior = prior_by_stable_key.get(group.group_id)
+            prior = reusable_no_candidate_by_stable_key.get(
+                group.group_id
+            ) or prior_by_stable_key.get(group.group_id)
             if prior is not None:
                 prior_investigation = _restore_investigation(prior)
                 expected_context_hash = planning_context_hash(
@@ -294,6 +314,8 @@ class GraphSurfacePlanningCoordinator:
                     investigations.append(investigation)
                     reused_groups += 1
                     reused_group_ids.append(group.group_id)
+                    if prior_investigation.investigation_id in reusable_no_candidate_ids:
+                        reusable_no_candidate_group_ids.append(group.group_id)
                     continue
             if self.persistence is not None:
                 assert scan_id is not None
@@ -319,6 +341,8 @@ class GraphSurfacePlanningCoordinator:
                     "planner returned an investigation for a different graph surface group"
                 )
             investigation = bind_storage_snapshot(investigation, durable_snapshot_id)
+            if investigation.investigation_id in reusable_no_candidate_ids:
+                reusable_no_candidate_group_ids.append(group.group_id)
             if self.persistence is not None:
                 assert scan_id is not None
                 self.persistence.save(scan_id, investigation)
@@ -345,6 +369,7 @@ class GraphSurfacePlanningCoordinator:
             reused_groups=reused_groups,
             persisted_groups=persisted_groups,
             reused_group_ids=tuple(reused_group_ids),
+            reusable_no_candidate_group_ids=tuple(reusable_no_candidate_group_ids),
         )
 
 

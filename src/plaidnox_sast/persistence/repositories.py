@@ -1899,6 +1899,29 @@ class CodeScanningRepository:
             if existing.investigation_data != value.payload():
                 raise PersistenceConflictError("investigation evidence identity has conflicting content")
             return _investigation_value(existing)
+        shared_identity = self.session.scalar(
+            select(InvestigationRecord).where(
+                InvestigationRecord.investigation_id == value.investigation_id,
+                InvestigationRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if shared_identity is not None:
+            stored_payload = dict(shared_identity.investigation_data)
+            incoming_payload = value.payload()
+            for lifecycle_field in ("state", "revision", "checkpoint_ref"):
+                stored_payload.pop(lifecycle_field, None)
+                incoming_payload.pop(lifecycle_field, None)
+            if (
+                shared_identity.codebase_id != value.codebase_id
+                or shared_identity.snapshot_id != value.snapshot_id
+                or shared_identity.stable_key != value.stable_key
+                or shared_identity.evidence_hash != value.evidence_hash
+                or stored_payload != incoming_payload
+            ):
+                raise PersistenceConflictError(
+                    "investigation identity conflicts with an immutable prior record"
+                )
+            return _investigation_value(shared_identity)
         record = InvestigationRecord(
             investigation_id=value.investigation_id,
             tenant_id=self.tenant_id,
@@ -1990,6 +2013,25 @@ class CodeScanningRepository:
                 InvestigationRecord.created_at.desc(),
                 InvestigationRecord.investigation_id,
             )
+        ).all()
+        return [_investigation_value(row) for row in rows]
+
+    def list_reusable_no_candidate_investigations(
+        self, codebase_id: str, workflow_version: str
+    ) -> list[InvestigationValue]:
+        """Load terminal negative investigations from successful, same-workflow scans."""
+        rows = self.session.scalars(
+            select(InvestigationRecord)
+            .join(ScanRunRecord, ScanRunRecord.scan_id == InvestigationRecord.scan_id)
+            .where(
+                InvestigationRecord.tenant_id == self.tenant_id,
+                InvestigationRecord.codebase_id == codebase_id,
+                InvestigationRecord.state == "no_candidate",
+                ScanRunRecord.tenant_id == self.tenant_id,
+                ScanRunRecord.workflow_version == workflow_version,
+                ScanRunRecord.scan_status == "SUCCESSFUL",
+            )
+            .order_by(InvestigationRecord.created_at.desc())
         ).all()
         return [_investigation_value(row) for row in rows]
 
@@ -2132,7 +2174,13 @@ class CodeScanningRepository:
                 GraphifySnapshotRecord.tenant_id == self.tenant_id,
                 GraphifySnapshotRecord.codebase_id == codebase_id,
             )
-            .order_by(ScanRunRecord.created_at.desc(), GraphifySnapshotRecord.created_at.desc())
+            .order_by(
+                func.coalesce(
+                    ScanRunRecord.finished_at, ScanRunRecord.created_at
+                ).desc(),
+                GraphifySnapshotRecord.created_at.desc(),
+                ScanRunRecord.scan_id.desc(),
+            )
         )
         if excluding_scan_id is not None:
             query = query.where(GraphifySnapshotRecord.scan_id != excluding_scan_id)

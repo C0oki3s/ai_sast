@@ -584,7 +584,18 @@ class SastPipeline:
                         else None
                     )
                     invalidated_prior_investigation_ids: frozenset[str] = frozenset()
+                    reusable_no_candidate_ids: frozenset[str] = frozenset()
                     if graph_persistence is not None:
+                        intelligence_config = load_json("runtime/code_intelligence.json")
+                        if intelligence_config.get(
+                            "reuse_compatible_no_candidate_investigations", False
+                        ):
+                            reusable_no_candidate_ids = frozenset(
+                                item.investigation_id
+                                for item in graph_persistence.list_reusable_no_candidates(
+                                    codebase_id, workflow_version
+                                )
+                            )
                         graph_snapshot_store = GraphifySnapshotOrmStore(
                             self.session_factory, self.tenant_id
                         )
@@ -731,6 +742,7 @@ class SastPipeline:
                         graph_snapshot=graph_snapshot,
                         storage_snapshot_id=snapshot_id,
                         invalidated_prior_investigation_ids=invalidated_prior_investigation_ids,
+                        reusable_no_candidate_ids=reusable_no_candidate_ids,
                     )
                     if graphify_investigations:
                         graph_hunter = getattr(deep_hunt_agent, "hunt_graph_investigation", None)
@@ -738,12 +750,54 @@ class SastPipeline:
                             raise AIConfigurationError(
                                 "Deep Hunt agent does not provide Graphify investigation execution"
                             )
+                        active_investigation_ids = (
+                            {
+                                item.investigation_id
+                                for item in graph_persistence.list_for_scan(scan_id)
+                            }
+                            if graph_persistence is not None
+                            else set()
+                        )
                         for investigation in graph_result.investigations:
+                            if (
+                                investigation.stable_key
+                                in graph_result.reusable_no_candidate_group_ids
+                            ):
+                                graph_checkpoint_ref = _stable_id(
+                                    "graphify-no-candidate-reuse",
+                                    investigation.investigation_id,
+                                    investigation.evidence_hash,
+                                )
+                                if (
+                                    graph_persistence is not None
+                                    and investigation.investigation_id
+                                    in active_investigation_ids
+                                ):
+                                    graph_persistence.transition_investigation(
+                                        scan_id,
+                                        investigation.investigation_id,
+                                        "skipped",
+                                        graph_checkpoint_ref,
+                                    )
+                                graphify_hunt_results.append(
+                                    {
+                                        "investigation_id": investigation.investigation_id,
+                                        "status": "reused_no_candidate",
+                                        "source": "compatible_successful_scan",
+                                        "candidate_count": 0,
+                                        "unresolved_count": 0,
+                                    }
+                                )
+                                continue
                             graph_checkpoint_ref = _stable_id(
                                 "graphify-hunt", investigation.investigation_id, investigation.evidence_hash
                             )
                             try:
-                                if graph_persistence is not None:
+                                if (
+                                    graph_persistence is not None
+                                    and investigation.investigation_id
+                                    in active_investigation_ids
+                                ):
                                     graph_persistence.transition_investigation(
                                         scan_id, investigation.investigation_id, "running", graph_checkpoint_ref
                                     )
@@ -754,7 +808,11 @@ class SastPipeline:
                                     if disposition["unresolved_count"]
                                     else "candidate" if discovered else "no_candidate"
                                 )
-                                if graph_persistence is not None:
+                                if (
+                                    graph_persistence is not None
+                                    and investigation.investigation_id
+                                    in active_investigation_ids
+                                ):
                                     graph_persistence.transition_investigation(
                                         scan_id, investigation.investigation_id, final_state, graph_checkpoint_ref
                                     )
@@ -762,7 +820,11 @@ class SastPipeline:
                                 graphify_hunt_results.append(disposition)
                             except Exception as exc:  # noqa: BLE001
                                 graphify_hunt_failures += 1
-                                if graph_persistence is not None:
+                                if (
+                                    graph_persistence is not None
+                                    and investigation.investigation_id
+                                    in active_investigation_ids
+                                ):
                                     try:
                                         graph_persistence.transition_investigation(
                                             scan_id, investigation.investigation_id, "failed", graph_checkpoint_ref
@@ -806,6 +868,9 @@ class SastPipeline:
                     }
                     reused_group_ids = set(graph_result.reused_group_ids)
                     reused_group_ids.update(graphify_checkpoint_reused_groups)
+                    reusable_no_candidate_groups = set(
+                        graph_result.reusable_no_candidate_group_ids
+                    )
                     targets_for_report = [
                         {
                             "surface_key": target.surface_key,
@@ -823,7 +888,11 @@ class SastPipeline:
                         if planning_gap is not None:
                             planning_status = "gap"
                         elif group.group_id in reused_group_ids:
-                            planning_status = "reused"
+                            planning_status = (
+                                "reused_no_candidate"
+                                if group.group_id in reusable_no_candidate_groups
+                                else "reused"
+                            )
                         elif investigation is not None:
                             planning_status = "planned"
                         else:
@@ -850,6 +919,9 @@ class SastPipeline:
                         "changed_node_count": graphify_changed_node_count,
                         "changed_edge_count": graphify_changed_edge_count,
                         "invalidated_prior_investigation_count": graphify_invalidated_investigation_count,
+                        "reusable_no_candidate_group_count": len(
+                            graph_result.reusable_no_candidate_group_ids
+                        ),
                         "surface_count": graphify_surface_count,
                         "investigation_count": graphify_investigation_count,
                         "mapping_gap_count": graphify_mapping_gaps,
@@ -1189,6 +1261,10 @@ class SastPipeline:
                 "graphify_investigations_enabled": graphify_investigations,
                 "graphify_hunt_failures": graphify_hunt_failures,
                 "graphify_hunt_candidates": len(graphify_candidates),
+                "graphify_hunt_no_candidate_reused": sum(
+                    item.get("status") == "reused_no_candidate"
+                    for item in graphify_hunt_results
+                ),
                 "graphify_hunt_unresolved_obligations": sum(
                     int(item.get("unresolved_count", 0)) for item in graphify_hunt_results
                 ),

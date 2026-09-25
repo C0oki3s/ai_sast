@@ -569,3 +569,62 @@ def test_coordinator_plans_100k_loc_repository_in_bounded_graph_groups(
     assert max(model_payload_sizes) <= limits.maximum_input_characters
     assert all(size < 20_000 for size in model_payload_sizes)
     assert sum(model_payload_sizes) < source_characters
+
+
+def test_coordinator_reuses_terminal_no_candidate_for_identical_snapshot(tmp_path: Path):
+    from plaidnox_sast.assets import load_json
+
+    snapshot = _snapshot(tmp_path, connected=True)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    workflow_version = str(load_json("prompts/manifest.json")["version"])
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-a", "example/account", "Account")
+        repository.add_snapshot("snapshot-a", "codebase-a", "revision-a", "tree-a", "context-v1")
+        repository.start_scan("scan-a", "codebase-a", "snapshot-a", "deep", workflow_version)
+
+    broker = GraphContextBroker(tmp_path, snapshot)
+    repository_context = _context(snapshot)
+    planner = GraphInvestigationPlanner(
+        lambda _payload: {
+            "reason": "Review account identity selection.",
+            "security_questions": ["Can another principal select this account?"],
+            "supporting_node_ids": [],
+            "supporting_edge_keys": [],
+            "coverage_notes": [],
+        }
+    )
+    store = InvestigationOrmStore(factory, "tenant-a")
+    first = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot, broker=broker, repository_context=repository_context, **arguments
+        ),
+        persistence=store,
+    ).plan(
+        codebase_id="codebase-a", scan_id="scan-a", repository_context=repository_context,
+        graph_snapshot=snapshot, storage_snapshot_id="snapshot-a",
+    )
+    prior = first.investigations[0]
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.transition_investigation(prior.investigation_id, "running", expected_revision=1)
+        repository.transition_investigation(prior.investigation_id, "no_candidate", expected_revision=2)
+        repository.finish_scan("scan-a", coverage_complete=True, scan_status="SUCCESSFUL")
+        repository.start_scan("scan-b", "codebase-a", "snapshot-a", "deep", workflow_version)
+
+    reusable_ids = frozenset(
+        item.investigation_id
+        for item in store.list_reusable_no_candidates("codebase-a", workflow_version)
+    )
+    assert prior.investigation_id in reusable_ids
+    second = GraphSurfacePlanningCoordinator(
+        lambda **_arguments: pytest.fail("compatible investigation should not be replanned"),
+        persistence=store,
+    ).plan(
+        codebase_id="codebase-a", scan_id="scan-b", repository_context=repository_context,
+        graph_snapshot=snapshot, storage_snapshot_id="snapshot-a",
+        reusable_no_candidate_ids=reusable_ids,
+    )
+    assert second.reusable_no_candidate_group_ids == (prior.stable_key,)
+    assert second.investigations[0].investigation_id == prior.investigation_id
+    assert store.list_for_scan("scan-b") == []

@@ -15,6 +15,7 @@
   "maximum_recon_evidence_characters": 240000,
   "maximum_reverse_dependency_depth": 12,
   "maximum_reverse_dependency_nodes": 20000,
+  "reuse_compatible_no_candidate_investigations": true,
   "maximum_context_packet_slices": 24,
   "maximum_flow_depth": 6,
   "maximum_flow_edges": 80,
