@@ -990,8 +990,13 @@ class CodeScanningRepository:
         codebase_id: str,
         workflow_version: str,
         context_scope_hash: str,
+        require_graph_dependencies: bool = False,
     ) -> list[ScanFindingValue]:
-        """Read prior report snapshots only for a successful identical analysis context."""
+        """Read prior successful report snapshots with compatible analysis scope.
+
+        Cross-snapshot callers require the explicit current graph-dependency contract;
+        older findings remain eligible only for exact-snapshot reuse.
+        """
         scan = self.session.scalar(
             select(ScanRunRecord).where(
                 ScanRunRecord.scan_id == scan_id,
@@ -1004,7 +1009,7 @@ class CodeScanningRepository:
         if scan is None or scan.scan_parameters.get("context_scope_hash") != context_scope_hash:
             return []
         rows = self.session.execute(
-            select(ScanFindingRecord, FindingRecord.state)
+            select(ScanFindingRecord, FindingRecord.state, FindingRecord.validation)
             .join(FindingRecord, FindingRecord.finding_id == ScanFindingRecord.finding_id)
             .where(
                 ScanFindingRecord.scan_id == scan_id,
@@ -1018,7 +1023,12 @@ class CodeScanningRepository:
         ).all()
         return [
             _scan_finding_value(record)
-            for record, _state in rows
+            for record, state, validation in rows
+            if state in {"validated", "open", "in_progress"}
+            and (
+                not require_graph_dependencies
+                or _has_complete_graph_finding_dependencies(validation)
+            )
             if isinstance(record.report_data, dict)
             and record.report_data.get("schema_version") == 1
             and isinstance(record.report_data.get("taint_path"), list)
@@ -2956,6 +2966,14 @@ def _scan_finding_value(record: ScanFindingRecord) -> ScanFindingValue:
         owasp_category=record.owasp_category,
         report_schema_version=record.report_schema_version,
         report_data=record.report_data,
+    )
+
+
+def _has_complete_graph_finding_dependencies(validation: Any) -> bool:
+    return (
+        isinstance(validation, dict)
+        and validation.get("graph_dependency_version") == 1
+        and validation.get("graph_dependencies_complete") is True
     )
 
 

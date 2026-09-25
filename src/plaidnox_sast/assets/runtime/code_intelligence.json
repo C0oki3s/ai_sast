@@ -17,6 +17,7 @@
   "maximum_reverse_dependency_nodes": 20000,
   "reuse_compatible_no_candidate_investigations": true,
   "reuse_unchanged_verified_findings": true,
+  "reuse_verified_findings_across_graph_deltas": true,
   "maximum_context_packet_slices": 24,
   "maximum_flow_depth": 6,
   "maximum_flow_edges": 80,

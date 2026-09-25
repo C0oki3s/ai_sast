@@ -49,9 +49,16 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
 
     def current_graph_snapshot(*_args, **_kwargs):
         source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        source_hashes = {"app.js": source_hash}
+        nodes = [CodeNode("handler", "app.js", 1, "listAccounts", source_hash)]
+        unrelated = tmp_path / "unrelated.js"
+        if unrelated.exists():
+            unrelated_hash = hashlib.sha256(unrelated.read_bytes()).hexdigest()
+            source_hashes["unrelated.js"] = unrelated_hash
+            nodes.append(CodeNode("unrelated", "unrelated.js", 1, "formatDate", unrelated_hash))
         return CodeGraphSnapshot(
-            source_hashes={"app.js": source_hash},
-            nodes=(CodeNode("handler", "app.js", 1, "listAccounts", source_hash),),
+            source_hashes=source_hashes,
+            nodes=tuple(nodes),
             edges=(),
             unresolved_edges=0,
             extractor_version="test",
@@ -212,6 +219,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             dependency_type="graph_investigation",
         )
         graph_dependencies = repository.get_finding(linked_findings[0]).dependencies
+        stored_finding = repository.get_finding(linked_findings[0])
     assert len(stored) == 1
     assert stored[0].state == "candidate"
     assert linked_findings
@@ -220,6 +228,8 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         "graph_node_neighborhood",
         "source_file",
     }
+    assert stored_finding.validation["graph_dependency_version"] == 1
+    assert stored_finding.validation["graph_dependencies_complete"] is True
 
     agent.return_no_candidate = True
     unchanged_findings = pipeline.scan_snapshot(
@@ -230,6 +240,21 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     )
     assert unchanged_findings.metrics["graphify_verified_findings_carried_forward"] == 1
     assert len(unchanged_findings.findings) == 1
+
+    # An unrelated graph addition changes the immutable graph snapshot but not
+    # the finding's recorded route, code, or graph neighborhood. The verified
+    # finding can be reused only because its complete dependency contract exists.
+    (tmp_path / "unrelated.js").write_text(
+        "function formatDate(value) { return value; }\n", encoding="utf-8"
+    )
+    delta_findings = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
+        graphify_investigations=True,
+    )
+    assert delta_findings.metrics["graphify_verified_findings_carried_forward"] == 1
+    assert len(delta_findings.findings) == 1
     assert unchanged_findings.findings[0].metadata["carried_forward"] is True
     with unit_of_work(factory, "default") as repository:
         carried_report = repository.scan_findings(unchanged_findings.scan_id)
@@ -245,15 +270,15 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     )
     assert rerun.repository_context["graphify_shadow_planning"][
         "previous_graph_snapshot_id"
-    ] == result.repository_context["graphify_shadow_planning"]["graph_snapshot_id"]
+    ] == delta_findings.repository_context["graphify_shadow_planning"]["graph_snapshot_id"]
     assert rerun.repository_context["graphify_shadow_planning"]["changed_file_count"] == 1
     assert rerun.metrics["graphify_verified_findings_carried_forward"] == 0
     assert rerun.repository_context["graphify_shadow_planning"][
         "invalidated_prior_investigation_count"
     ] == 1
     assert rerun.metrics["graphify_findings_flagged_for_revalidation"] == 1
-    assert agent.graph_plan_calls == 2
-    assert agent.graph_hunt_calls == 3
+    assert agent.graph_plan_calls == 3
+    assert agent.graph_hunt_calls == 4
     with unit_of_work(factory, "default") as repository:
         rerun_investigations = repository.list_investigations(rerun.scan_id)
         rerun_scan = repository.get_scan(rerun.scan_id)
@@ -281,8 +306,8 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     ] == "reused_no_candidate"
     assert unchanged.metrics["graphify_hunt_no_candidate_reused"] == 1
     assert unchanged.metrics["graphify_hunt_results"][0]["status"] == "reused_no_candidate"
-    assert agent.graph_plan_calls == 2
-    assert agent.graph_hunt_calls == 3
+    assert agent.graph_plan_calls == 3
+    assert agent.graph_hunt_calls == 4
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):

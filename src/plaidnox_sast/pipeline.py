@@ -803,25 +803,6 @@ class SastPipeline:
                             graph_delta = graph_snapshot.difference(
                                 previous_graph.graph_snapshot
                             )
-                            if (
-                                graphify_investigations
-                                and load_json("runtime/code_intelligence.json").get(
-                                    "reuse_unchanged_verified_findings", False
-                                )
-                                and graph_snapshot.snapshot_id
-                                == previous_graph.graph_snapshot.snapshot_id
-                            ):
-                                with unit_of_work(
-                                    self.session_factory, self.tenant_id
-                                ) as repository:
-                                    graphify_prior_scan_findings = (
-                                        repository.reusable_scan_findings(
-                                            previous_graph.scan_id,
-                                            codebase_id=codebase_id,
-                                            workflow_version=workflow_version,
-                                            context_scope_hash=context_scope_hash,
-                                        )
-                                    )
                             previous_investigations = graph_persistence.list_for_snapshot(
                                 codebase_id, previous_graph.snapshot_id
                             )
@@ -875,6 +856,40 @@ class SastPipeline:
                                     graphify_invalidated_finding_ids
                                 )
                             )
+                            code_intelligence = load_json("runtime/code_intelligence.json")
+                            same_graph_snapshot = bool(
+                                previous_graph is not None
+                                and graph_snapshot.snapshot_id
+                                == previous_graph.graph_snapshot.snapshot_id
+                            )
+                            graph_delta_reuse_enabled = bool(
+                                code_intelligence.get(
+                                    "reuse_verified_findings_across_graph_deltas", False
+                                )
+                            )
+                            if (
+                                graphify_investigations
+                                and previous_graph is not None
+                                and code_intelligence.get(
+                                    "reuse_unchanged_verified_findings", False
+                                )
+                                and (
+                                    same_graph_snapshot
+                                    or graph_delta_reuse_enabled
+                                )
+                            ):
+                                with unit_of_work(
+                                    self.session_factory, self.tenant_id
+                                ) as repository:
+                                    graphify_prior_scan_findings = (
+                                        repository.reusable_scan_findings(
+                                            previous_graph.scan_id,
+                                            codebase_id=codebase_id,
+                                            workflow_version=workflow_version,
+                                            context_scope_hash=context_scope_hash,
+                                            require_graph_dependencies=not same_graph_snapshot,
+                                        )
+                                    )
 
                     def plan_graph_group(**arguments):
                         nonlocal graphify_checkpoint_reused, graphify_checkpoint_saved
@@ -1717,12 +1732,26 @@ class SastPipeline:
                             persisted_ir[1] if persisted_ir is not None else [],
                             graph_snapshot=graph_snapshot,
                         )
+                        dependency_types = {item.dependency_type for item in dependencies}
+                        graph_dependencies_complete = bool(
+                            graph_snapshot is not None
+                            and finding.metadata.get("engine")
+                            == "plaidnox-graphify-investigation"
+                            and finding.metadata.get("graph_investigation_id")
+                            and "graph_investigation" in dependency_types
+                            and "graph_node" in dependency_types
+                            and "graph_node_neighborhood" in dependency_types
+                            and "source_file" in dependency_types
+                            and "graph_dependency_unresolved" not in dependency_types
+                        )
                         validation_data = {
                             "deep_hunt": finding.metadata.get("deep_hunt", {}),
                             "classification_references": finding.metadata.get("classification_references", []),
                             "evidence_packet": finding.metadata.get("evidence_packet", {}),
                             "route_depth": finding.metadata.get("route_depth", ""),
                             "route_task_class": finding.metadata.get("route_task_class", ""),
+                            "graph_dependency_version": 1 if graph_dependencies_complete else 0,
+                            "graph_dependencies_complete": graph_dependencies_complete,
                         }
                         if not finding.metadata.get("carried_forward"):
                             repository.save_finding(
