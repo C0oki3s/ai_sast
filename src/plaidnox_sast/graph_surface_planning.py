@@ -16,7 +16,10 @@ from .graph_targets import (
     group_connected_graph_targets,
     map_repository_surfaces_to_graph,
 )
-from .graphify_adapter import CodeGraphSnapshot, investigation_graph_mismatches
+from .graphify_adapter import (
+    CodeGraphSnapshot,
+    investigation_graph_mismatches,
+)
 from .investigations import (
     Investigation,
     bind_storage_snapshot,
@@ -25,6 +28,7 @@ from .investigations import (
     rebase_investigation,
 )
 from .persistence.repositories import (
+    GraphifySnapshotValue,
     InvestigationValue,
     PersistenceConflictError,
     SurfacePlanningValue,
@@ -121,6 +125,26 @@ class InvestigationOrmStore:
             )
 
 
+class GraphifySnapshotOrmStore:
+    """Persist Graphify's structural snapshot through Code Scanning's ORM."""
+
+    def __init__(self, factory: sessionmaker[Session], tenant_id: str) -> None:
+        self.factory = factory
+        self.tenant_id = tenant_id
+
+    def save(self, scan_id: str, snapshot_id: str, graph_snapshot: CodeGraphSnapshot) -> GraphifySnapshotValue:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.save_graphify_snapshot(scan_id, snapshot_id, graph_snapshot)
+
+    def latest(
+        self, codebase_id: str, *, excluding_scan_id: str | None = None
+    ) -> GraphifySnapshotValue | None:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.latest_graphify_snapshot(
+                codebase_id, excluding_scan_id=excluding_scan_id
+            )
+
+
 class GraphSurfacePlanningCoordinator:
     """Map and batch eligible surfaces before making bounded AI planner calls.
 
@@ -156,6 +180,7 @@ class GraphSurfacePlanningCoordinator:
         repository_context: Mapping[str, Any],
         graph_snapshot: CodeGraphSnapshot,
         storage_snapshot_id: str | None = None,
+        invalidated_prior_investigation_ids: frozenset[str] = frozenset(),
     ) -> GraphSurfacePlanningResult:
         inventory = map_repository_surfaces_to_graph(repository_context, graph_snapshot)
         grouping = group_connected_graph_targets(inventory, graph_snapshot)
@@ -245,6 +270,8 @@ class GraphSurfacePlanningCoordinator:
                 )
                 if (
                     prior_investigation.codebase_id == codebase_id
+                    and prior_investigation.investigation_id
+                    not in invalidated_prior_investigation_ids
                     and not mismatches
                     and _targets_match(prior_investigation, group.node_ids)
                 ):

@@ -28,6 +28,9 @@ from .models import (
     FindingDependencyRecord,
     FindingEvidenceRecord,
     FindingRecord,
+    GraphifyEdgeRecord,
+    GraphifyNodeRecord,
+    GraphifySnapshotRecord,
     HuntPlanRecord,
     HuntTaskRecord,
     InvestigationRecord,
@@ -285,6 +288,16 @@ class SurfacePlanningValue:
     state: str
     revision: int
     planning_data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class GraphifySnapshotValue:
+    graphify_record_id: str
+    tenant_id: str
+    codebase_id: str
+    scan_id: str
+    snapshot_id: str
+    graph_snapshot: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -1979,6 +1992,152 @@ class CodeScanningRepository:
             )
         ).all()
         return [_investigation_value(row) for row in rows]
+
+    def save_graphify_snapshot(
+        self, scan_id: str, snapshot_id: str, graph_snapshot: Any
+    ) -> GraphifySnapshotValue:
+        """Persist one immutable Graphify graph, rejecting conflicting scan retries."""
+        from ..graphify_adapter import CodeGraphSnapshot, graph_edge_identity
+
+        if not isinstance(graph_snapshot, CodeGraphSnapshot):
+            raise TypeError("graph_snapshot must be a CodeGraphSnapshot")
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None or scan.snapshot_id != snapshot_id:
+            raise PersistenceConflictError("Graphify snapshot is outside the tenant scan scope")
+        existing = self.session.scalar(
+            select(GraphifySnapshotRecord).where(
+                GraphifySnapshotRecord.scan_id == scan_id,
+                GraphifySnapshotRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if existing is not None:
+            value = self.get_graphify_snapshot(existing.graphify_record_id)
+            if value is None or value.graph_snapshot != graph_snapshot:
+                raise PersistenceConflictError("Graphify snapshot changed during scan resume")
+            return value
+
+        graphify_record_id = stable_id(
+            "graphify", scan_id, graph_snapshot.snapshot_id
+        )
+        record = GraphifySnapshotRecord(
+            graphify_record_id=graphify_record_id,
+            tenant_id=self.tenant_id,
+            codebase_id=scan.codebase_id,
+            scan_id=scan_id,
+            snapshot_id=snapshot_id,
+            graph_snapshot_id=graph_snapshot.snapshot_id,
+            extractor_version=graph_snapshot.extractor_version,
+            source_hashes=dict(graph_snapshot.source_hashes),
+            unresolved_edges=graph_snapshot.unresolved_edges,
+            unindexed_files=list(graph_snapshot.unindexed_files),
+        )
+        self.session.add(record)
+        self.session.add_all(
+            GraphifyNodeRecord(
+                graphify_record_id=graphify_record_id,
+                node_id=node.id,
+                path=node.path,
+                line=node.line,
+                label=node.label,
+                source_hash=node.source_hash,
+            )
+            for node in graph_snapshot.nodes
+        )
+        self.session.add_all(
+            GraphifyEdgeRecord(
+                graphify_record_id=graphify_record_id,
+                edge_id=graph_edge_identity(edge),
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                relation=edge.relation,
+                provenance=edge.provenance,
+                path=edge.path,
+                line=edge.line,
+                source_hash=edge.source_hash,
+            )
+            for edge in graph_snapshot.edges
+        )
+        self.session.flush()
+        value = self.get_graphify_snapshot(graphify_record_id)
+        if value is None:
+            raise PersistenceConflictError("saved Graphify snapshot could not be read back")
+        return value
+
+    def get_graphify_snapshot(self, graphify_record_id: str) -> GraphifySnapshotValue | None:
+        from ..graphify_adapter import CodeEdge, CodeGraphSnapshot, CodeNode
+
+        record = self.session.scalar(
+            select(GraphifySnapshotRecord).where(
+                GraphifySnapshotRecord.graphify_record_id == graphify_record_id,
+                GraphifySnapshotRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            return None
+        nodes = self.session.scalars(
+            select(GraphifyNodeRecord)
+            .where(GraphifyNodeRecord.graphify_record_id == graphify_record_id)
+            .order_by(GraphifyNodeRecord.node_id)
+        ).all()
+        edges = self.session.scalars(
+            select(GraphifyEdgeRecord)
+            .where(GraphifyEdgeRecord.graphify_record_id == graphify_record_id)
+            .order_by(GraphifyEdgeRecord.edge_id)
+        ).all()
+        graph_snapshot = CodeGraphSnapshot(
+            source_hashes=dict(record.source_hashes),
+            nodes=tuple(
+                CodeNode(row.node_id, row.path, row.line, row.label, row.source_hash)
+                for row in nodes
+            ),
+            edges=tuple(
+                CodeEdge(
+                    row.source_id,
+                    row.target_id,
+                    row.relation,
+                    row.provenance,
+                    row.path,
+                    row.line,
+                    row.source_hash,
+                )
+                for row in edges
+            ),
+            unresolved_edges=record.unresolved_edges,
+            unindexed_files=tuple(record.unindexed_files),
+            extractor_version=record.extractor_version,
+        )
+        if graph_snapshot.snapshot_id != record.graph_snapshot_id:
+            raise PersistenceConflictError("persisted Graphify snapshot identity is inconsistent")
+        return GraphifySnapshotValue(
+            graphify_record_id=record.graphify_record_id,
+            tenant_id=record.tenant_id,
+            codebase_id=record.codebase_id,
+            scan_id=record.scan_id,
+            snapshot_id=record.snapshot_id,
+            graph_snapshot=graph_snapshot,
+        )
+
+    def latest_graphify_snapshot(
+        self, codebase_id: str, *, excluding_scan_id: str | None = None
+    ) -> GraphifySnapshotValue | None:
+        query = (
+            select(GraphifySnapshotRecord)
+            .join(ScanRunRecord, ScanRunRecord.scan_id == GraphifySnapshotRecord.scan_id)
+            .where(
+                GraphifySnapshotRecord.tenant_id == self.tenant_id,
+                GraphifySnapshotRecord.codebase_id == codebase_id,
+            )
+            .order_by(ScanRunRecord.created_at.desc(), GraphifySnapshotRecord.created_at.desc())
+        )
+        if excluding_scan_id is not None:
+            query = query.where(GraphifySnapshotRecord.scan_id != excluding_scan_id)
+        record = self.session.scalars(query.limit(1)).first()
+        return self.get_graphify_snapshot(record.graphify_record_id) if record else None
 
     def save_surface_planning(
         self, scan_id: str, snapshot_id: str, planning_data: dict[str, Any]

@@ -32,8 +32,12 @@ from .fingerprint import (
 from .graph import build_structural_graph
 from .graph import source_file_is_admitted
 from .graph_context import GraphContextBroker
-from .graph_surface_planning import GraphSurfacePlanningCoordinator, InvestigationOrmStore
-from .graphify_adapter import extract_structural_graph
+from .graph_surface_planning import (
+    GraphSurfacePlanningCoordinator,
+    GraphifySnapshotOrmStore,
+    InvestigationOrmStore,
+)
+from .graphify_adapter import affected_investigation_ids, extract_structural_graph
 from .investigations import investigation_from_payload, validate_investigation
 from .routers import CandidateRouter
 from .models import (
@@ -457,6 +461,11 @@ class SastPipeline:
         graphify_checkpoint_reused = 0
         graphify_checkpoint_saved = 0
         graphify_checkpoint_reused_groups: set[str] = set()
+        graphify_previous_snapshot_id = ""
+        graphify_changed_file_count = 0
+        graphify_changed_node_count = 0
+        graphify_changed_edge_count = 0
+        graphify_invalidated_investigation_count = 0
         context_builder = getattr(deep_hunt_agent, "build_repository_context", None)
         planner = getattr(deep_hunt_agent, "plan_tasks", None)
         discovery = getattr(deep_hunt_agent, "discover_candidates", None)
@@ -574,6 +583,48 @@ class SastPipeline:
                         if self.session_factory is not None and persistence_indexed
                         else None
                     )
+                    invalidated_prior_investigation_ids: frozenset[str] = frozenset()
+                    if graph_persistence is not None:
+                        graph_snapshot_store = GraphifySnapshotOrmStore(
+                            self.session_factory, self.tenant_id
+                        )
+                        previous_graph = graph_snapshot_store.latest(
+                            codebase_id, excluding_scan_id=scan_id
+                        )
+                        if previous_graph is not None:
+                            graphify_previous_snapshot_id = (
+                                previous_graph.graph_snapshot.snapshot_id
+                            )
+                            graph_delta = graph_snapshot.difference(
+                                previous_graph.graph_snapshot
+                            )
+                            previous_investigations = graph_persistence.list_for_scan(
+                                previous_graph.scan_id
+                            )
+                            invalidated_prior_investigation_ids = frozenset(
+                                affected_investigation_ids(
+                                    previous_investigations,
+                                    graph_delta,
+                                    snapshot=graph_snapshot,
+                                )
+                            )
+                            graphify_changed_file_count = len(
+                                graph_delta.added_files
+                                + graph_delta.changed_files
+                                + graph_delta.removed_files
+                            )
+                            graphify_changed_node_count = len(
+                                graph_delta.added_node_ids
+                                + graph_delta.changed_node_ids
+                                + graph_delta.removed_node_ids
+                            )
+                            graphify_changed_edge_count = len(
+                                graph_delta.added_edges + graph_delta.removed_edges
+                            )
+                            graphify_invalidated_investigation_count = len(
+                                invalidated_prior_investigation_ids
+                            )
+                        graph_snapshot_store.save(scan_id, snapshot_id, graph_snapshot)
 
                     def plan_graph_group(**arguments):
                         nonlocal graphify_checkpoint_reused, graphify_checkpoint_saved
@@ -679,6 +730,7 @@ class SastPipeline:
                         repository_context=repository_context,
                         graph_snapshot=graph_snapshot,
                         storage_snapshot_id=snapshot_id,
+                        invalidated_prior_investigation_ids=invalidated_prior_investigation_ids,
                     )
                     if graphify_investigations:
                         graph_hunter = getattr(deep_hunt_agent, "hunt_graph_investigation", None)
@@ -791,8 +843,13 @@ class SastPipeline:
                     repository_context["graphify_shadow_planning"] = {
                         "status": "complete",
                         "graph_snapshot_id": graphify_snapshot_id,
+                        "previous_graph_snapshot_id": graphify_previous_snapshot_id,
                         "node_count": graphify_node_count,
                         "edge_count": graphify_edge_count,
+                        "changed_file_count": graphify_changed_file_count,
+                        "changed_node_count": graphify_changed_node_count,
+                        "changed_edge_count": graphify_changed_edge_count,
+                        "invalidated_prior_investigation_count": graphify_invalidated_investigation_count,
                         "surface_count": graphify_surface_count,
                         "investigation_count": graphify_investigation_count,
                         "mapping_gap_count": graphify_mapping_gaps,

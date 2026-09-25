@@ -188,7 +188,7 @@ def affected_investigation_ids(
     affected: list[str] = []
 
     for value in investigations:
-        payload = value.payload() if callable(getattr(value, "payload", None)) else value
+        payload = _investigation_payload(value)
         if not isinstance(payload, Mapping):
             continue
         investigation_id = payload.get("investigation_id")
@@ -240,7 +240,7 @@ def affected_investigation_ids(
         # A bounded traversal cannot prove unaffected status beyond its frontier.
         # Conservatively invalidate all valid investigation identities.
         for value in investigations:
-            payload = value.payload() if callable(getattr(value, "payload", None)) else value
+            payload = _investigation_payload(value)
             if isinstance(payload, Mapping):
                 investigation_id = payload.get("investigation_id")
                 if isinstance(investigation_id, str) and investigation_id:
@@ -307,7 +307,7 @@ def investigation_graph_mismatches(
     deliberately invalidated: their bounded prompt edges cannot prove that no
     new relationship was added outside the selected slice.
     """
-    payload = investigation.payload() if callable(getattr(investigation, "payload", None)) else investigation
+    payload = _investigation_payload(investigation)
     if not isinstance(payload, Mapping):
         return ("invalid_investigation_payload",)
 
@@ -366,6 +366,13 @@ def investigation_graph_mismatches(
             mismatches.add("source_window_changed")
 
     return tuple(sorted(mismatches))
+
+
+def _investigation_payload(value: Any) -> Any:
+    payload_method = getattr(value, "payload", None)
+    if callable(payload_method):
+        return payload_method()
+    return getattr(value, "investigation_data", value)
 
 
 def _edge_sort_key(edge: CodeEdge) -> tuple[str, str, str, str, int]:

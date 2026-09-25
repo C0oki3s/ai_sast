@@ -15,3 +15,4 @@ def test_postgresql_migration_plan_is_ordered_unique_and_checksummed() -> None:
     assert "0007_scan_finding_reports" in {item.version for item in migrations}
     assert "0008_graph_surface_planning" in {item.version for item in migrations}
     assert "0009_investigation_reuse_index" in {item.version for item in migrations}
+    assert "0010_graphify_snapshots" in {item.version for item in migrations}

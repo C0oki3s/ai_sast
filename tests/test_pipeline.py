@@ -46,21 +46,25 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
 
     source = tmp_path / "app.js"
     source.write_text("app.get('/accounts', listAccounts);\n", encoding="utf-8")
-    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
-    graph_snapshot = CodeGraphSnapshot(
-        source_hashes={"app.js": source_hash},
-        nodes=(CodeNode("handler", "app.js", 1, "listAccounts", source_hash),),
-        edges=(),
-        unresolved_edges=0,
-        extractor_version="test",
-    )
+
+    def current_graph_snapshot(*_args, **_kwargs):
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        return CodeGraphSnapshot(
+            source_hashes={"app.js": source_hash},
+            nodes=(CodeNode("handler", "app.js", 1, "listAccounts", source_hash),),
+            edges=(),
+            unresolved_edges=0,
+            extractor_version="test",
+        )
+
     monkeypatch.setattr(
         "plaidnox_sast.pipeline.extract_structural_graph",
-        lambda *_args, **_kwargs: graph_snapshot,
+        current_graph_snapshot,
     )
 
     class GraphContext(FakeRepositoryContext):
         def to_dict(self):
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
             return {
                 **super().to_dict(),
                 "entry_points": [
@@ -194,6 +198,22 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         stored = repository.list_investigations(result.scan_id)
     assert len(stored) == 1
     assert stored[0].state == "candidate"
+
+    source.write_text("app.get('/accounts', listAccounts); // changed\n", encoding="utf-8")
+    rerun = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
+        graphify_investigations=True,
+    )
+    assert rerun.repository_context["graphify_shadow_planning"][
+        "previous_graph_snapshot_id"
+    ] == result.repository_context["graphify_shadow_planning"]["graph_snapshot_id"]
+    assert rerun.repository_context["graphify_shadow_planning"]["changed_file_count"] == 1
+    assert rerun.repository_context["graphify_shadow_planning"][
+        "invalidated_prior_investigation_count"
+    ] == 1
+    assert agent.graph_plan_calls == 2
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):

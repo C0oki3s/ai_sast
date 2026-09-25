@@ -576,6 +576,89 @@ class SurfacePlanningRecord(TimestampMixin, Base):
     planning_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
+class GraphifySnapshotRecord(TimestampMixin, Base):
+    """Persist structural graph identity and source inventory per scan snapshot."""
+
+    __tablename__ = "code_scanning_graphify_snapshots"
+    __table_args__ = (
+        UniqueConstraint("scan_id", name="uq_code_scanning_graphify_scan"),
+        Index(
+            "ix_code_scanning_graphify_codebase_time",
+            "tenant_id",
+            "codebase_id",
+            "created_at",
+        ),
+    )
+
+    graphify_record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    codebase_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    graph_snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_hashes: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    unresolved_edges: Mapped[int] = mapped_column(Integer, nullable=False)
+    unindexed_files: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+
+
+class GraphifyNodeRecord(Base):
+    __tablename__ = "code_scanning_graphify_nodes"
+    __table_args__ = (
+        Index("ix_code_scanning_graphify_node_path", "graphify_record_id", "path", "line"),
+        CheckConstraint("line > 0", name="ck_code_scanning_graphify_node_line"),
+    )
+
+    graphify_record_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_graphify_snapshots.graphify_record_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    line: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class GraphifyEdgeRecord(Base):
+    __tablename__ = "code_scanning_graphify_edges"
+    __table_args__ = (
+        Index(
+            "ix_code_scanning_graphify_edge_source",
+            "graphify_record_id",
+            "source_id",
+        ),
+        Index(
+            "ix_code_scanning_graphify_edge_target",
+            "graphify_record_id",
+            "target_id",
+        ),
+        CheckConstraint("line > 0", name="ck_code_scanning_graphify_edge_line"),
+    )
+
+    graphify_record_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_graphify_snapshots.graphify_record_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    edge_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    relation: Mapped[str] = mapped_column(String(128), nullable=False)
+    provenance: Mapped[str] = mapped_column(String(64), nullable=False)
+    path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    line: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class KnowledgeUsageRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_knowledge_usage"
     __table_args__ = (Index("ix_code_scanning_knowledge_usage_task", "scan_id", "task_id"),)
