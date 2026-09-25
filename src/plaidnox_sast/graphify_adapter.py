@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import tempfile
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -390,6 +392,36 @@ def _stable_id(path: str, label: str, occurrence: int) -> str:
     return f"graph-node-{hashlib.sha256(identity).hexdigest()[:24]}"
 
 
+def _graphify_stable_id(path: str, raw_id: str, root_name: str) -> str | None:
+    """Normalize Graphify's structural ID when it includes the extraction root.
+
+    Graphify builds some IDs from absolute paths, which makes its raw IDs vary
+    with the temporary extraction directory. Removing only that known prefix
+    preserves the remaining structural identity (including parent symbols for
+    methods) across line shifts and extraction roots. Unknown ID formats use
+    the conservative source-order fallback in ``normalize_extraction``.
+    """
+    def normalize(value: str) -> str:
+        value = unicodedata.normalize("NFKC", value)
+        return re.sub(r"_+", "_", re.sub(r"[^\w]+", "_", value, flags=re.UNICODE)).strip("_").casefold()
+
+    if not re.fullmatch(r"[\w]+", raw_id, flags=re.UNICODE):
+        return None
+    prefix = normalize(root_name)
+    candidate = normalize(raw_id)
+    if not candidate or not re.fullmatch(r"[\w]+", candidate, flags=re.UNICODE):
+        return None
+    semantic_id = (
+        candidate[len(prefix) + 1 :]
+        if prefix and candidate.startswith(f"{prefix}_")
+        else candidate
+    )
+    if not semantic_id:
+        return None
+    identity = f"{path}\0graphify\0{semantic_id}".encode("utf-8")
+    return f"graph-node-{hashlib.sha256(identity).hexdigest()[:24]}"
+
+
 def _relative_path(value: object, root: Path, admitted: set[str]) -> str:
     if not isinstance(value, str) or not value:
         raise GraphifyAdapterError("Graphify returned an invalid source path")
@@ -444,7 +476,11 @@ def normalize_extraction(
         key = (path, label)
         occurrence = occurrence_counts[key]
         occurrence_counts[key] += 1
-        stable_id = _stable_id(path, label, occurrence)
+        stable_id = _graphify_stable_id(path, raw_id, root.name) or _stable_id(
+            path, label, occurrence
+        )
+        if any(node.id == stable_id for node in nodes):
+            raise GraphifyAdapterError("Graphify node identity is ambiguous after normalization")
         raw_to_stable[raw_id] = stable_id
         nodes.append(CodeNode(stable_id, path, line, label, hashes[path]))
 
@@ -472,9 +508,10 @@ def normalize_extraction(
 
     indexed_paths = {node.path for node in nodes}
     try:
-        extractor_version = version("graphifyy")
+        package_version = version("graphifyy")
     except PackageNotFoundError:
-        extractor_version = "unavailable"
+        package_version = "unavailable"
+    extractor_version = f"graphifyy-{package_version}+plaidnox-id-v2"
     return CodeGraphSnapshot(
         hashes,
         tuple(nodes),

@@ -87,6 +87,57 @@ def test_graphify_symbol_identity_survives_a_line_shift(tmp_path: Path) -> None:
     assert before.nodes[1].source_hash != after.nodes[1].source_hash
 
 
+def test_graphify_structural_ids_survive_root_changes_and_duplicate_method_insertion(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("graphify.extract")
+    first_root = tmp_path / "checkout-one"
+    second_root = tmp_path / "checkout-two"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_source = first_root / "sample.py"
+    second_source = second_root / "sample.py"
+    original = (
+        "class Account:\n"
+        "    def run(self):\n"
+        "        return 1\n\n"
+        "class Invoice:\n"
+        "    def run(self):\n"
+        "        return 2\n"
+    )
+    first_source.write_text(original)
+    second_source.write_text(original)
+
+    first = extract_structural_graph(first_root)
+    second = extract_structural_graph(second_root)
+
+    assert first.snapshot_id == second.snapshot_id
+    assert first.extractor_version.endswith("+plaidnox-id-v2")
+    assert {node.id for node in first.nodes} == {node.id for node in second.nodes}
+
+    second_source.write_text(
+        "class Audit:\n"
+        "    def run(self):\n"
+        "        return 0\n\n"
+        + original
+    )
+    updated = extract_structural_graph(second_root)
+
+    def methods_by_class(snapshot):
+        by_id = {node.id: node for node in snapshot.nodes}
+        return {
+            by_id[edge.source_id].label: by_id[edge.target_id].id
+            for edge in snapshot.edges
+            if edge.relation == "method"
+        }
+
+    assert methods_by_class(first) == {
+        "Account": methods_by_class(updated)["Account"],
+        "Invoice": methods_by_class(updated)["Invoice"],
+    }
+    assert {node.id for node in first.nodes} <= {node.id for node in updated.nodes}
+
+
 def test_graphify_source_provenance_rejects_excluded_and_out_of_bounds_evidence(tmp_path: Path) -> None:
     file = tmp_path / "app.py"
     file.write_text("def foo():\n    pass\n")
