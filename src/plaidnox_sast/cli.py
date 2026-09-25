@@ -73,6 +73,14 @@ def _parser() -> argparse.ArgumentParser:
             "the established discovery and finding pipeline remains authoritative"
         ),
     )
+    local.add_argument(
+        "--graphify-investigations",
+        action="store_true",
+        help=(
+            "execute Graphify-planned investigations through AI discovery and the existing "
+            "independent Deep Hunt verifier; also enables Graphify planning"
+        ),
+    )
     local.add_argument("--enforce", action="store_true")
     local.add_argument(
         "--propose-patches",
@@ -335,6 +343,7 @@ def _run_scan_local(args: argparse.Namespace) -> int:
             deep_hunt_agent=deep_hunt_agent,
             propose_patches=args.propose_patches,
             graphify_shadow_planning=args.graphify_shadow_planning,
+            graphify_investigations=args.graphify_investigations,
         )
         telemetry.record_result(result)
     _record_context_base(context_store, result, args.path)

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -310,6 +311,7 @@ class SastPipeline:
         deep_hunt_agent: PlaidNoxDeepHuntAgent | None = None,
         propose_patches: bool = False,
         graphify_shadow_planning: bool = False,
+        graphify_investigations: bool = False,
     ) -> ScanResult:
         """Run the complete deep-hunt workflow against an immutable source snapshot."""
 
@@ -427,6 +429,9 @@ class SastPipeline:
         context = None
         plan = None
         ai_discovery_candidates = []
+        graphify_candidates = []
+        graphify_hunt_results: list[dict[str, Any]] = []
+        graphify_hunt_failures = 0
         ai_context_failures = 0
         ai_planning_failures = 0
         ai_discovery_failures = 0
@@ -543,7 +548,7 @@ class SastPipeline:
         try:
             context = context_builder(root, codebase, revision, graph, config.business_context)
             repository_context = context.to_dict()
-            if graphify_shadow_planning:
+            if graphify_shadow_planning or graphify_investigations:
                 graphify_shadow_status = "running"
                 try:
                     graph_cache = (
@@ -675,6 +680,49 @@ class SastPipeline:
                         graph_snapshot=graph_snapshot,
                         storage_snapshot_id=snapshot_id,
                     )
+                    if graphify_investigations:
+                        graph_hunter = getattr(deep_hunt_agent, "hunt_graph_investigation", None)
+                        if not callable(graph_hunter):
+                            raise AIConfigurationError(
+                                "Deep Hunt agent does not provide Graphify investigation execution"
+                            )
+                        for investigation in graph_result.investigations:
+                            graph_checkpoint_ref = _stable_id(
+                                "graphify-hunt", investigation.investigation_id, investigation.evidence_hash
+                            )
+                            try:
+                                if graph_persistence is not None:
+                                    graph_persistence.transition_investigation(
+                                        scan_id, investigation.investigation_id, "running", graph_checkpoint_ref
+                                    )
+                                discovered, disposition = graph_hunter(root, investigation)
+                                graphify_candidates.extend(discovered)
+                                final_state = (
+                                    "unresolved"
+                                    if disposition["unresolved_count"]
+                                    else "candidate" if discovered else "no_candidate"
+                                )
+                                if graph_persistence is not None:
+                                    graph_persistence.transition_investigation(
+                                        scan_id, investigation.investigation_id, final_state, graph_checkpoint_ref
+                                    )
+                                disposition["status"] = final_state
+                                graphify_hunt_results.append(disposition)
+                            except Exception as exc:  # noqa: BLE001
+                                graphify_hunt_failures += 1
+                                if graph_persistence is not None:
+                                    try:
+                                        graph_persistence.transition_investigation(
+                                            scan_id, investigation.investigation_id, "failed", graph_checkpoint_ref
+                                        )
+                                    except Exception:
+                                        pass
+                                graphify_hunt_results.append({
+                                    "investigation_id": investigation.investigation_id,
+                                    "status": "failed",
+                                    "error_type": type(exc).__name__,
+                                    "error": redact_sensitive_values(str(exc))[:240],
+                                })
                     if graph_persistence is not None and scan_id:
                         persisted_by_group = {
                             item.stable_key: item for item in graph_result.investigations
@@ -781,10 +829,18 @@ class SastPipeline:
                             0, len(graph_result.investigations) - coverage_item_limit
                         ),
                         "coverage_item_limit": coverage_item_limit,
+                        "execution_enabled": graphify_investigations,
+                        "executed_investigations": len(graphify_hunt_results),
+                        "execution_failures": graphify_hunt_failures,
+                        "candidate_count": len(graphify_candidates),
+                        "hunt_results": graphify_hunt_results[:coverage_item_limit],
+                        "hunt_results_omitted": max(0, len(graphify_hunt_results) - coverage_item_limit),
                     }
                     graphify_shadow_status = "complete"
                 except Exception as exc:  # noqa: BLE001
                     graphify_shadow_status = "failed"
+                    if graphify_investigations:
+                        graphify_hunt_failures += 1
                     graphify_shadow_error_type = type(exc).__name__
                     graphify_shadow_error = redact_sensitive_values(str(exc))[:240]
                     repository_context["graphify_shadow_planning"] = {
@@ -795,6 +851,7 @@ class SastPipeline:
             plan = planner(context, config.security_context)
             repository_context["hunt_plan"] = plan.to_dict()
             ai_discovery_candidates, ai_discovery_failures = discovery(root, context, plan)
+            ai_discovery_candidates.extend(graphify_candidates)
             ai_discovery_error_types = list(getattr(deep_hunt_agent, "discovery_error_types", []))
             ai_discovery_errors = list(getattr(deep_hunt_agent, "discovery_errors", []))
             ai_discovery_unexpected_failures = int(getattr(deep_hunt_agent, "discovery_unexpected_failures", 0))
@@ -814,6 +871,7 @@ class SastPipeline:
                 "error": ai_context_error_type,
                 "message": ai_context_error,
             }
+            ai_discovery_candidates.extend(graphify_candidates)
             if callable(planner):
                 ai_planning_failures += 1
 
@@ -1019,6 +1077,11 @@ class SastPipeline:
             or ai_capability_chain_failures
             or ai_consolidation_failures
             or ai_search_query_failures
+            or graphify_hunt_failures
+            or (
+                graphify_investigations
+                and sum(int(item.get("unresolved_count", 0)) for item in graphify_hunt_results) > 0
+            )
         )
         if ai_scan_incomplete and policy.decision is PolicyDecision.PASS:
             # Coverage failures must never be reported as a clean scan, so a would-be
@@ -1066,6 +1129,13 @@ class SastPipeline:
                 "ai_context_error": ai_context_error,
                 "ai_context_unexpected_failures": ai_context_unexpected_failures,
                 "graphify_shadow_status": graphify_shadow_status,
+                "graphify_investigations_enabled": graphify_investigations,
+                "graphify_hunt_failures": graphify_hunt_failures,
+                "graphify_hunt_candidates": len(graphify_candidates),
+                "graphify_hunt_unresolved_obligations": sum(
+                    int(item.get("unresolved_count", 0)) for item in graphify_hunt_results
+                ),
+                "graphify_hunt_results": graphify_hunt_results,
                 "graphify_shadow_error_type": graphify_shadow_error_type,
                 "graphify_shadow_error": graphify_shadow_error,
                 "graphify_snapshot_id": graphify_snapshot_id,

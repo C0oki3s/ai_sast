@@ -98,6 +98,22 @@ class InvestigationOrmStore:
                 scan_id, snapshot_id, group_id, status, investigation_id
             )
 
+    def transition_investigation(
+        self, scan_id: str, investigation_id: str, state: str, checkpoint_ref: str | None = None
+    ) -> InvestigationValue:
+        """Persist an investigation lifecycle transition with revision checking."""
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            values = repository.list_investigations(scan_id)
+            current = next((item for item in values if item.investigation_id == investigation_id), None)
+            if current is None:
+                raise PersistenceConflictError("investigation is absent from the active scan")
+            return repository.transition_investigation(
+                investigation_id,
+                state,
+                expected_revision=current.revision,
+                checkpoint_ref=checkpoint_ref,
+            )
+
 
 class GraphSurfacePlanningCoordinator:
     """Map and batch eligible surfaces before making bounded AI planner calls.

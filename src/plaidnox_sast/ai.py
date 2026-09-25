@@ -1204,6 +1204,121 @@ class PlaidNoxDeepHuntAgent:
         )
         return investigation
 
+    def hunt_graph_investigation(
+        self, root: Path, investigation: Investigation
+    ) -> tuple[list[Candidate], dict[str, Any]]:
+        """Review one immutable Graphify investigation and return grounded hypotheses.
+
+        Graphify relationships only scope retrieval; every candidate is subsequently
+        sent through the ordinary independent Deep Hunt verifier.
+        """
+        from .investigations import validate_investigation
+
+        validate_investigation(investigation)
+        source_windows: list[dict[str, Any]] = []
+        for window in investigation.source_windows:
+            relative = Path(str(window["path"]))
+            target = (root / relative).resolve()
+            if root.resolve() not in target.parents or not target.is_file():
+                raise AIResponseError("Graphify investigation source window is outside the repository")
+            try:
+                source = target.read_bytes()
+            except OSError as exc:
+                raise AIResponseError("Graphify investigation source window is unavailable") from exc
+            if hashlib.sha256(source).hexdigest() != str(window["content_hash"]):
+                raise AIResponseError("Graphify investigation source window is stale")
+            lines = source.decode("utf-8", errors="replace").splitlines()
+            start, end = int(window["start_line"]), int(window["end_line"])
+            if start < 1 or end < start or end > len(lines):
+                raise AIResponseError("Graphify investigation source window has invalid line bounds")
+            source_windows.append({
+                "path": str(window["path"]),
+                "start_line": start,
+                "end_line": end,
+                "content_hash": str(window["content_hash"]),
+                "excerpt": str(window["excerpt"]),
+                "redaction_state": str(window["redaction_state"]),
+            })
+
+        if not investigation.security_questions:
+            raise AIResponseError("Graphify investigation has no security questions")
+        obligation_ids = [f"{investigation.investigation_id}:q{index:03d}" for index, _ in enumerate(investigation.security_questions, 1)]
+        payload = {
+            "investigation": investigation.payload(),
+            "obligations": [
+                {"obligation_id": obligation_id, "question": question}
+                for obligation_id, question in zip(obligation_ids, investigation.security_questions, strict=True)
+            ],
+            "source_windows": source_windows,
+        }
+        response = self._structured_response(
+            "plaidnox_graph_investigation_hunt",
+            load_json("schemas/vulnerability_discovery.json"),
+            "graph_investigation_hunt",
+            payload,
+            model_tier=ModelTier.STANDARD,
+        )
+        try:
+            result = dict(response_json(response))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AIResponseError(f"Graphify investigation response was not valid structured JSON: {_schema_failure(exc)}") from exc
+
+        obligations = result.get("obligation_results", [])
+        observed_ids = [str(item.get("obligation_id", "")) for item in obligations if isinstance(item, dict)]
+        if len(observed_ids) != len(obligation_ids) or set(observed_ids) != set(obligation_ids):
+            raise AIResponseError("Graphify investigation response did not disposition each security question exactly once")
+        candidate_items = result.get("candidates", [])
+        candidates: list[Candidate] = []
+        for item in candidate_items:
+            if not isinstance(item, dict):
+                raise AIResponseError("Graphify investigation candidate was malformed")
+            segment = {
+                "path": "",
+                "start_line": 0,
+                "end_line": 0,
+            }
+            candidate = _candidate_from_ai_item(
+                root,
+                item,
+                segment,
+                allowed_source_windows=source_windows,
+            )
+            if candidate is None:
+                raise AIResponseError("Graphify investigation candidate was not grounded in its source windows")
+            candidate.metadata.update({
+                "engine": "plaidnox-graphify-investigation",
+                "graph_investigation_id": investigation.investigation_id,
+                "graph_snapshot_id": investigation.graph_snapshot_id,
+                "graph_refs": list(investigation.graph_refs),
+            })
+            candidates.append(candidate)
+
+        candidates_by_id = {str(item.get("candidate_id", "")) for item in candidate_items}
+        if len(candidates_by_id) != len(candidate_items) or "" in candidates_by_id:
+            raise AIResponseError("Graphify investigation candidates must have unique non-empty IDs")
+        linked_candidate_ids: set[str] = set()
+        for item in obligations:
+            if not isinstance(item, dict):
+                raise AIResponseError("Graphify investigation obligation result was malformed")
+            status = item.get("status")
+            linked = set(item.get("candidate_ids", []))
+            if status == "CANDIDATE_FOUND":
+                if not linked or not linked <= candidates_by_id:
+                    raise AIResponseError("Graphify investigation disposition referenced an unknown or missing candidate")
+                linked_candidate_ids.update(linked)
+            elif linked:
+                raise AIResponseError("Only CANDIDATE_FOUND dispositions may reference candidates")
+            if status != "NEEDS_CONTEXT" and item.get("context_requests"):
+                raise AIResponseError("Only NEEDS_CONTEXT dispositions may request repository context")
+        if linked_candidate_ids != candidates_by_id:
+            raise AIResponseError("Every Graphify candidate must be linked to a CANDIDATE_FOUND disposition")
+        return candidates, {
+            "investigation_id": investigation.investigation_id,
+            "obligation_results": obligations,
+            "candidate_count": len(candidates),
+            "unresolved_count": sum(item.get("status") in {"NEEDS_CONTEXT", "UNRESOLVED"} for item in obligations),
+        }
+
     def discover_candidates(
         self,
         root: Path,

@@ -229,10 +229,26 @@ graph-backed context queries are implemented in `graphify_adapter.py` and
 `graph_context.py`. The versioned Investigation contract, tenant-scoped ORM
 ledger, PostgreSQL migration, and first AI planner slice are implemented. The
 planner receives one bounded Graphify neighborhood and cannot preserve model-
-invented graph references. Full surface enumeration/batching, scan-runtime
-ledger/checkpoint integration, and Deep Hunt invocation remain. Switch the
-default only after seeded-root recall,
-grounding, incremental invalidation, and checkpoint resume reach parity.
+invented graph references. Surface enumeration/batching, scan-runtime
+checkpointing, and opt-in investigation execution are implemented. Each
+investigation is checked against current file hashes, reviewed through an
+external prompt/schema contract, and candidate locations are grounded only to
+its immutable source windows. Accepted hypotheses enter the existing
+independent Deep Hunt verifier; Graphify itself never supplies a finding
+verdict. Investigation execution remains opt-in with
+`--graphify-investigations`; shadow planning alone remains non-authoritative.
+When PostgreSQL persistence is configured, investigation lifecycle transitions
+are compare-and-swap persisted (`planned → running → candidate/no_candidate/
+unresolved/failed`). Structured discovery responses use the existing LiteLLM
+response checkpoint, so completed calls replay without provider calls. The
+current graph investigation discovery is one request per investigation; typed
+Graphify context expansion and durable replay of the final disposition are the
+next follow-on. An unresolved question or failed execution remains visible in
+coverage and makes an opt-in Graphify investigation run incomplete. Tests are
+in `tests/test_graph_investigation_hunt.py`, `tests/test_graph_planner.py`,
+`tests/test_graph_surface_planning.py`, and `tests/test_pipeline.py`. Switch the
+default only after seeded-root recall, grounding, incremental invalidation, and
+checkpoint resume reach parity.
 
 The sections below describe the current Tree-sitter/`rg` runtime and its
 already implemented contracts. They are migration inputs, not the new target.

@@ -14,6 +14,7 @@ OPERATIONS = (
     "repository_context",
     "hunt_plan",
     "graph_investigation_planning",
+    "graph_investigation_hunt",
     "search_query_plan",
     "vulnerability_discovery",
     "security_review",
@@ -32,6 +33,7 @@ SCHEMA_FILES = {
     "security_review": "deep_hunt_review",
     "metadata_exposure_review": "deep_hunt_review",
     "graph_investigation_planning": "graph_investigation_plan",
+    "graph_investigation_hunt": "vulnerability_discovery",
 }
 DYNAMIC_SCHEMA = {
     "type": "object",
