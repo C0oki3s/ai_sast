@@ -1,0 +1,11 @@
+{
+  "transitions": {
+    "planned": ["running", "skipped"],
+    "running": ["candidate", "no_candidate", "unresolved", "failed"],
+    "candidate": [],
+    "no_candidate": [],
+    "unresolved": ["running"],
+    "failed": ["running"],
+    "skipped": []
+  }
+}

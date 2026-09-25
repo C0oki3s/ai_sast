@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..assets import load_json
 from ..graph import StructuralGraph, Symbol, stable_symbol_id, stable_symbol_keys
+from ..investigations import Investigation, validate_investigation
 from ..redaction import redact_payload
 from .models import (
     ArtifactRecord,
@@ -29,6 +30,7 @@ from .models import (
     FindingRecord,
     HuntPlanRecord,
     HuntTaskRecord,
+    InvestigationRecord,
     KnowledgeUsageRecord,
     OverlaySymbolSummaryRecord,
     RepositoryContextRecord,
@@ -238,6 +240,21 @@ class HuntTaskValue:
     attempt_count: int
     lease_owner: str | None
     lease_expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationValue:
+    investigation_id: str
+    scan_id: str
+    codebase_id: str
+    snapshot_id: str
+    stable_key: str
+    evidence_hash: str
+    investigation_data: dict[str, Any]
+    state: str
+    checkpoint_ref: str | None
+    revision: int
+    attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1668,6 +1685,104 @@ class CodeScanningRepository:
         )
         return [_hunt_task_value(row) for row in rows]
 
+    def save_investigation(self, scan_id: str, value: Investigation) -> InvestigationValue:
+        """Persist an immutable investigation identity/evidence version idempotently."""
+        if not isinstance(value, Investigation):
+            raise TypeError("value must be an Investigation")
+        validate_investigation(value)
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None or scan.codebase_id != value.codebase_id or scan.snapshot_id != value.snapshot_id:
+            raise PersistenceConflictError("investigation scan/snapshot is outside the tenant scope")
+        identity = select(InvestigationRecord).where(
+            InvestigationRecord.tenant_id == self.tenant_id,
+            InvestigationRecord.scan_id == scan_id,
+            InvestigationRecord.stable_key == value.stable_key,
+            InvestigationRecord.evidence_hash == value.evidence_hash,
+        )
+        existing = self.session.scalar(identity)
+        if existing is not None:
+            if existing.investigation_data != value.payload():
+                raise PersistenceConflictError("investigation evidence identity has conflicting content")
+            return _investigation_value(existing)
+        record = InvestigationRecord(
+            investigation_id=value.investigation_id,
+            tenant_id=self.tenant_id,
+            scan_id=scan_id,
+            codebase_id=value.codebase_id,
+            snapshot_id=value.snapshot_id,
+            stable_key=value.stable_key,
+            evidence_hash=value.evidence_hash,
+            investigation_data=value.payload(),
+            state=value.state,
+            checkpoint_ref=value.checkpoint_ref,
+            revision=value.revision,
+            attempt_count=0,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return _investigation_value(record)
+
+    def transition_investigation(
+        self,
+        investigation_id: str,
+        new_state: str,
+        *,
+        expected_revision: int,
+        checkpoint_ref: str | None = None,
+    ) -> InvestigationValue:
+        """Compare-and-swap lifecycle update; transitions are configured as runtime data."""
+        record = self.session.scalar(
+            select(InvestigationRecord).where(
+                InvestigationRecord.investigation_id == investigation_id,
+                InvestigationRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            raise PersistenceConflictError("investigation does not exist in the tenant scope")
+        if record.revision != expected_revision:
+            raise PersistenceConflictError("investigation revision changed during update")
+        transitions = load_json("runtime/investigation_states.json")["transitions"]
+        if new_state not in transitions.get(record.state, []):
+            raise PersistenceConflictError(f"invalid investigation transition: {record.state} -> {new_state}")
+        next_revision = record.revision + 1
+        next_checkpoint = checkpoint_ref if checkpoint_ref is not None else record.checkpoint_ref
+        data = dict(record.investigation_data)
+        data.update(state=new_state, revision=next_revision, checkpoint_ref=next_checkpoint)
+        result = self.session.execute(
+            update(InvestigationRecord)
+            .where(
+                InvestigationRecord.investigation_id == investigation_id,
+                InvestigationRecord.tenant_id == self.tenant_id,
+                InvestigationRecord.revision == expected_revision,
+                InvestigationRecord.state == record.state,
+            )
+            .values(
+                state=new_state,
+                revision=next_revision,
+                attempt_count=InvestigationRecord.attempt_count + int(new_state == "running"),
+                checkpoint_ref=next_checkpoint,
+                investigation_data=data,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise PersistenceConflictError("investigation revision changed during update")
+        self.session.expire(record)
+        return _investigation_value(record)
+
+    def list_investigations(self, scan_id: str) -> list[InvestigationValue]:
+        rows = self.session.scalars(
+            select(InvestigationRecord)
+            .where(InvestigationRecord.tenant_id == self.tenant_id, InvestigationRecord.scan_id == scan_id)
+            .order_by(InvestigationRecord.created_at, InvestigationRecord.investigation_id)
+        ).all()
+        return [_investigation_value(row) for row in rows]
+
     def lease_next_task(
         self,
         plan_id: str,
@@ -2237,4 +2352,20 @@ def _hunt_task_value(record: HuntTaskRecord) -> HuntTaskValue:
         record.attempt_count,
         record.lease_owner,
         record.lease_expires_at,
+    )
+
+
+def _investigation_value(record: InvestigationRecord) -> InvestigationValue:
+    return InvestigationValue(
+        investigation_id=record.investigation_id,
+        scan_id=record.scan_id,
+        codebase_id=record.codebase_id,
+        snapshot_id=record.snapshot_id,
+        stable_key=record.stable_key,
+        evidence_hash=record.evidence_hash,
+        investigation_data=dict(record.investigation_data),
+        state=record.state,
+        checkpoint_ref=record.checkpoint_ref,
+        revision=record.revision,
+        attempt_count=record.attempt_count,
     )

@@ -11,3 +11,4 @@ def test_postgresql_migration_plan_is_ordered_unique_and_checksummed() -> None:
     assert all(item.checksum == hashlib.sha256(item.sql.encode("utf-8")).hexdigest() for item in migrations)
     assert migrations[0].version == "0001_code_scanning_core"
     assert "0005_sparse_overlay_summaries" in {item.version for item in migrations}
+    assert "0006_investigations" in {item.version for item in migrations}

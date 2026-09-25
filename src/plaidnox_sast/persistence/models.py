@@ -423,6 +423,36 @@ class HuntTaskRecord(TimestampMixin, Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class InvestigationRecord(TimestampMixin, Base):
+    """Durable graph-backed investigation work with immutable evidence identity."""
+
+    __tablename__ = "code_scanning_investigations"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "stable_key", "evidence_hash", name="uq_code_scanning_investigation_evidence"),
+        Index("ix_code_scanning_investigation_queue", "tenant_id", "scan_id", "state", "created_at"),
+        CheckConstraint("revision > 0 AND attempt_count >= 0", name="ck_code_scanning_investigation_counters"),
+    )
+
+    investigation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+    )
+    codebase_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False
+    )
+    stable_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    investigation_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    checkpoint_ref: Mapped[str | None] = mapped_column(String(512))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class KnowledgeUsageRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_knowledge_usage"
     __table_args__ = (Index("ix_code_scanning_knowledge_usage_task", "scan_id", "task_id"),)

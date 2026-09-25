@@ -6,6 +6,7 @@
     "migrations/postgresql/0002_incremental_repository_context.sql",
     "migrations/postgresql/0003_production_controls.sql",
     "migrations/postgresql/0004_symbol_summaries.sql",
-    "migrations/postgresql/0005_sparse_overlay_summaries.sql"
+    "migrations/postgresql/0005_sparse_overlay_summaries.sql",
+    "migrations/postgresql/0006_investigations.sql"
   ]
 }
