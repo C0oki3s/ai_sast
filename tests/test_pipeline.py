@@ -96,10 +96,15 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             self.graph_plan_calls = 0
             self.graph_hunt_calls = 0
             self.review_calls = 0
+            self.fail_first_review = True
             self.return_no_candidate = False
+            self.checkpoint = None
 
         def build_repository_context(self, root, repository, commit, graph, business_context=""):
             return GraphContext()
+
+        def configure_checkpoint(self, checkpoint):
+            self.checkpoint = checkpoint
 
         def plan_graph_investigation(
             self,
@@ -136,44 +141,85 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
             return [], 0
 
         def hunt_graph_investigation(self, root, investigation, context_broker):
+            from plaidnox_sast.checkpoint import (
+                candidate_from_dict,
+                candidate_to_dict,
+                unit_key,
+            )
             from plaidnox_sast.models import Candidate, Evidence, Severity
 
+            checkpoint_key = unit_key(
+                "graphify_investigation_hunt_v1",
+                investigation.investigation_id,
+                investigation.evidence_hash,
+                investigation.graph_snapshot_id,
+            )
+            if self.checkpoint is not None:
+                saved = self.checkpoint.get("graphify_investigation_hunt", checkpoint_key)
+                if saved is not None:
+                    replayed = dict(saved["disposition"])
+                    replayed["checkpoint_reused"] = True
+                    return [candidate_from_dict(item) for item in saved["candidates"]], replayed
             self.graph_hunt_calls += 1
             if self.return_no_candidate:
-                return [], {
+                candidates, disposition = [], {
                     "investigation_id": investigation.investigation_id,
                     "obligation_results": [{"status": "NO_ISSUE"}],
                     "candidate_count": 0,
                     "unresolved_count": 0,
                 }
-            candidate = Candidate(
-                rule_id="plaidnox.ai.graph-investigation",
-                title="Graph investigation hypothesis",
-                vulnerability_class="Object authorization failure",
-                severity=Severity.HIGH,
-                confidence=0.82,
-                message="The account handler may accept an unowned account selector.",
-                evidence=Evidence(
-                    "app.js", 1, 1, "app.get('/accounts', listAccounts);",
-                    "listAccounts", "authorization", ["account-route"],
-                ),
-                metadata={
-                    "category": "authorization",
-                    "engine": "plaidnox-graphify-investigation",
-                    "graph_investigation_id": investigation.investigation_id,
-                    "graph_snapshot_id": investigation.graph_snapshot_id,
-                    "graph_refs": list(investigation.graph_refs),
-                },
-            )
-            return [candidate], {
-                "investigation_id": investigation.investigation_id,
-                "obligation_results": [{"status": "CANDIDATE_FOUND"}],
-                "candidate_count": 1,
-                "unresolved_count": 0,
-            }
+            else:
+                candidate = Candidate(
+                    rule_id="plaidnox.ai.graph-investigation",
+                    title="Graph investigation hypothesis",
+                    vulnerability_class="Object authorization failure",
+                    severity=Severity.HIGH,
+                    confidence=0.82,
+                    message="The account handler may accept an unowned account selector.",
+                    evidence=Evidence(
+                        "app.js",
+                        1,
+                        1,
+                        "app.get('/accounts', listAccounts);",
+                        "listAccounts",
+                        "authorization",
+                        ["account-route"],
+                    ),
+                    metadata={
+                        "category": "authorization",
+                        "engine": "plaidnox-graphify-investigation",
+                        "graph_investigation_id": investigation.investigation_id,
+                        "graph_snapshot_id": investigation.graph_snapshot_id,
+                        "graph_refs": list(investigation.graph_refs),
+                    },
+                )
+                candidates = [candidate]
+                disposition = {
+                    "investigation_id": investigation.investigation_id,
+                    "obligation_results": [{"status": "CANDIDATE_FOUND"}],
+                    "candidate_count": 1,
+                    "unresolved_count": 0,
+                }
+            if self.checkpoint is not None:
+                self.checkpoint.put(
+                    "graphify_investigation_hunt",
+                    checkpoint_key,
+                    {
+                        "investigation_id": investigation.investigation_id,
+                        "evidence_hash": investigation.evidence_hash,
+                        "candidates": [candidate_to_dict(item) for item in candidates],
+                        "disposition": disposition,
+                    },
+                )
+            return candidates, disposition
 
         def review(self, *args, **kwargs):
             self.review_calls += 1
+            if self.fail_first_review:
+                from plaidnox_sast.errors import AIStageError
+
+                self.fail_first_review = False
+                raise AIStageError("fixture interruption before verification completed")
             return super().review(*args, **kwargs)
 
     agent = GraphPlanningAI()
@@ -205,14 +251,35 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert result.metrics["graphify_hunt_candidates"] == 1
     assert result.metrics["graphify_hunt_failures"] == 0
     assert result.metrics["graphify_hunt_results"][0]["status"] == "candidate"
-    assert len(result.findings) == 1
+    assert len(result.findings) == 0
     assert agent.graph_hunt_calls >= 1
     assert agent.review_calls == 1
-    assert result.metrics["ai_reviews"] == 1
+    assert result.metrics["ai_review_failures"] == 1
+    assert result.scan_status == "UNSUCCESSFUL"
     assert agent.graph_plan_calls == 1
     assert result.metrics["graphify_checkpoint_saved"] == 1
+    failed_scan_result = result
+
+    # The completed Graphify hunt unit is checkpointed before verification. A
+    # retry replays its grounded candidate, avoids another hunt call, and retries
+    # the failed verifier unit.
+    agent.fail_first_review = False
+    resumed_result = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
+        graphify_investigations=True,
+    )
+    assert len(resumed_result.findings) == 1
+    assert resumed_result.scan_status == "SUCCESSFUL"
+    assert resumed_result.metrics["graphify_hunt_checkpoint_reused"] == 1
+    assert agent.graph_hunt_calls == 1
+    assert agent.review_calls == 2
+    result = resumed_result
     with unit_of_work(factory, "default") as repository:
         stored = repository.list_investigations(result.scan_id)
+        if not stored:
+            stored = repository.list_investigations(failed_scan_result.scan_id)
         linked_findings = repository.findings_by_dependency_keys(
             stored[0].codebase_id,
             [stored[0].investigation_id],
@@ -238,7 +305,8 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         deep_hunt_agent=agent,
         graphify_investigations=True,
     )
-    assert unchanged_findings.metrics["graphify_verified_findings_carried_forward"] == 1
+    assert unchanged_findings.metrics["graphify_verified_findings_carried_forward"] == 0
+    assert unchanged_findings.metrics["graphify_hunt_checkpoint_reused"] == 1
     assert len(unchanged_findings.findings) == 1
 
     # An unrelated graph addition changes the immutable graph snapshot but not
@@ -264,7 +332,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
         "graph_node_neighborhood",
         "source_file",
     } <= set(delta_findings.metrics["graphify_finding_reuse_dependency_types"])
-    assert unchanged_findings.findings[0].metadata["carried_forward"] is True
+    assert unchanged_findings.findings[0].metadata.get("carried_forward") is not True
     with unit_of_work(factory, "default") as repository:
         carried_report = repository.scan_findings(unchanged_findings.scan_id)
     assert len(carried_report) == 1
@@ -287,7 +355,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     ] == 1
     assert rerun.metrics["graphify_findings_flagged_for_revalidation"] == 1
     assert agent.graph_plan_calls == 3
-    assert agent.graph_hunt_calls == 4
+    assert agent.graph_hunt_calls == 3
     with unit_of_work(factory, "default") as repository:
         rerun_investigations = repository.list_investigations(rerun.scan_id)
         rerun_scan = repository.get_scan(rerun.scan_id)
@@ -316,7 +384,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert unchanged.metrics["graphify_hunt_no_candidate_reused"] == 1
     assert unchanged.metrics["graphify_hunt_results"][0]["status"] == "reused_no_candidate"
     assert agent.graph_plan_calls == 3
-    assert agent.graph_hunt_calls == 4
+    assert agent.graph_hunt_calls == 3
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):
