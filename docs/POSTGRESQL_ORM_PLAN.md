@@ -34,6 +34,7 @@ codebase
             -> hunt plan -> hunt task
             -> model invocation -> prompt-cache metric
             -> finding -> evidence
+            -> scan-scoped report snapshot (classification, taint path, and run result)
                        -> exact context dependencies
 
 security memory  -> scoped to tenant/codebase
@@ -54,12 +55,14 @@ Stable identity and version are separate:
    one transaction. A duplicate `(codebase_id, revision)` is reused.
 2. **Task lease:** atomically claim a planned/retryable task with owner and lease
    expiry. Expired leases are reclaimable; completed tasks are immutable.
-3. **Finding verification:** persist candidate evidence, verdict, exact context
-   dependencies, and model invocation in one transaction.
+3. **Finding verification:** persist the current canonical finding and its exact
+   symbol dependencies; keep the redacted evidence attached to the finding.
 4. **Knowledge update:** upsert by content hash, preserve source provenance, and
    append usage rather than overwriting audit history.
-5. **Scan finalization:** a scan completes only when required tasks reach a
-   terminal state and coverage validation passes.
+5. **Scan finalization:** atomically persist every verified finding's versioned
+   report snapshot, classification references, taint-path evidence, scan
+   parameters, findings summary, and binary scan status with the terminal scan
+   record. Each invocation has a distinct scan ID so reruns preserve history.
 
 ## Tenant isolation
 

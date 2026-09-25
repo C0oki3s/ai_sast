@@ -31,6 +31,7 @@ def test_pipeline_scans_a_non_git_source_snapshot(tmp_path):
     )
 
     assert result.revision.startswith("snapshot-")
+    assert result.scan_id
     assert result.metrics["target_code_executed"] is False
     assert result.findings
 
@@ -107,7 +108,15 @@ class FakeContextualAI(FakeAIValidator):
                 severity=Severity.HIGH,
                 confidence=0.84,
                 message="A request parameter selects an object without an ownership constraint.",
-                evidence=Evidence("app.js", 1, 1, "const app = express();", "GET /", "authorization", ["request", "object"]),
+                evidence=Evidence(
+                    "app.js",
+                    1,
+                    1,
+                    "const app = express();",
+                    "GET /",
+                    "authorization",
+                    ["request", "object"],
+                ),
                 metadata={
                     "category": "authorization",
                     "engine": "plaidnox-litellm-discovery",
@@ -133,7 +142,13 @@ class FakeManyHighSeverityCandidatesAI(FakeContextualAI):
                     confidence=confidence,
                     message="A request parameter selects an object without an ownership constraint.",
                     evidence=Evidence(
-                        f"app{index}.js", 1, 1, "const app = express();", "GET /", f"authorization{index}", ["request", "object"]
+                        f"app{index}.js",
+                        1,
+                        1,
+                        "const app = express();",
+                        "GET /",
+                        f"authorization{index}",
+                        ["request", "object"],
                     ),
                     metadata={
                         "category": "authorization",
@@ -178,7 +193,9 @@ class FakeInvalidSearchQueryAI(FakeAIValidator):
         return [], 0
 
 
-def test_pipeline_marks_invalid_ai_search_query_as_incomplete_without_crashing(sample_repo) -> None:
+def test_pipeline_marks_invalid_ai_search_query_as_incomplete_without_crashing(
+    sample_repo,
+) -> None:
     result = SastPipeline().scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -212,7 +229,10 @@ class FakeVariantAI(FakeContextualAI):
                 confidence=0.77,
                 message="A sibling route exposes account data without an ownership condition.",
                 evidence=Evidence("app.js", 2, 2, "const express = require('express');"),
-                metadata={"category": "authorization", "variant_of": finding.fingerprint},
+                metadata={
+                    "category": "authorization",
+                    "variant_of": finding.fingerprint,
+                },
             )
         ], 0
 
@@ -222,7 +242,14 @@ class FakeCapabilityChainAI(FakeContextualAI):
         from plaidnox_sast.ai import AIReview
 
         gained_capability = "SERVER_SIDE_REQUEST" if not candidate.metadata.get("capability_pivot_of") else ""
-        return AIReview(True, 0.9, "supported", "source -> sink", "escape output", gained_capability=gained_capability)
+        return AIReview(
+            True,
+            0.9,
+            "supported",
+            "source -> sink",
+            "escape output",
+            gained_capability=gained_capability,
+        )
 
     def chain_capability_pivots(self, root, context, plan, verified):
         capable = [
@@ -243,8 +270,11 @@ class FakeCapabilityChainAI(FakeContextualAI):
                 severity=Severity.HIGH,
                 confidence=0.8,
                 message="The capability gained from the verified root reaches a token-minting boundary.",
-                evidence=Evidence("app.js", 3, 3, "app.post(\"/signin\", async (req, res) => {"),
-                metadata={"category": "identity", "capability_pivot_of": [finding.fingerprint]},
+                evidence=Evidence("app.js", 3, 3, 'app.post("/signin", async (req, res) => {'),
+                metadata={
+                    "category": "identity",
+                    "capability_pivot_of": [finding.fingerprint],
+                },
             )
         ], 0
 
@@ -375,7 +405,9 @@ def test_pipeline_keeps_ai_repository_context_and_discovered_candidates(sample_r
     assert discovered[0].validator == "plaidnox-deep-hunt"
 
 
-def test_pipeline_marks_the_scan_incomplete_when_contextual_ai_discovery_fails(sample_repo):
+def test_pipeline_marks_the_scan_incomplete_when_contextual_ai_discovery_fails(
+    sample_repo,
+):
     result = SastPipeline().scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -424,7 +456,9 @@ def test_pipeline_deep_hunts_root_cause_variants_before_reporting(sample_repo):
     assert result.metrics["ai_variant_unexpected_failures"] == 0
 
 
-def test_pipeline_chains_a_gained_capability_into_a_new_independently_verified_finding(sample_repo):
+def test_pipeline_chains_a_gained_capability_into_a_new_independently_verified_finding(
+    sample_repo,
+):
     result = SastPipeline().scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -481,7 +515,9 @@ def test_pipeline_preserves_findings_and_records_failed_ai_consolidation(sample_
     assert result.metrics["ai_consolidation_unexpected_failure"] is True
 
 
-def test_pipeline_does_not_flag_a_recognized_consolidation_error_as_unexpected(sample_repo):
+def test_pipeline_does_not_flag_a_recognized_consolidation_error_as_unexpected(
+    sample_repo,
+):
     result = SastPipeline().scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -540,7 +576,9 @@ def _sqlite_session_factory():
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def test_pipeline_persists_codebase_snapshot_security_ir_and_findings_when_session_factory_is_configured(sample_repo):
+def test_pipeline_persists_codebase_snapshot_security_ir_and_findings_when_session_factory_is_configured(
+    sample_repo,
+):
     factory = _sqlite_session_factory()
 
     result = SastPipeline(session_factory=factory, tenant_id="tenant-a").scan_snapshot(
@@ -561,6 +599,13 @@ def test_pipeline_persists_codebase_snapshot_security_ir_and_findings_when_sessi
     with unit_of_work(factory, "tenant-a") as repository:
         assert repository.get_codebase(codebase_id) is not None
         assert repository.get_snapshot(snapshot_id) is not None
+        persisted_scan = repository.get_scan(result.scan_id)
+        assert persisted_scan is not None
+        assert persisted_scan.scan_status == result.scan_status.value
+        assert persisted_scan.scan_parameters["revision"] == result.revision
+        assert persisted_scan.result_summary["finding_count"] == len(result.findings)
+        scan_findings = repository.scan_findings(result.scan_id)
+        assert len(scan_findings) == len(result.findings)
         for finding in result.findings:
             finding_id = _stable_id("finding", codebase_id, finding.fingerprint)
             stored = repository.get_finding(finding_id)
@@ -569,9 +614,40 @@ def test_pipeline_persists_codebase_snapshot_security_ir_and_findings_when_sessi
             assert stored.title == finding.title
             assert stored.dependencies
             assert all(item.dependency_type == "symbol" for item in stored.dependencies)
+        report = scan_findings[0].report_data
+        assert report["schema_version"] == 1
+        assert report["scan_id"] == result.scan_id
+        assert report["affected_file"]
+        assert report["taint_path"]
+        assert report["taint_path"][0]["code"]
 
 
-def test_pipeline_does_not_touch_the_database_when_session_factory_is_not_configured(sample_repo):
+def test_repeated_run_persists_separate_scan_and_finding_snapshots(sample_repo):
+    factory = _sqlite_session_factory()
+    pipeline = SastPipeline(session_factory=factory, tenant_id="tenant-a")
+    first = pipeline.scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        revision="same-revision",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+    second = pipeline.scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        revision="same-revision",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+
+    assert first.scan_id != second.scan_id
+    assert first.findings and second.findings
+    with unit_of_work(factory, "tenant-a") as repository:
+        assert len(repository.scan_findings(first.scan_id)) == len(first.findings)
+        assert len(repository.scan_findings(second.scan_id)) == len(second.findings)
+
+
+def test_pipeline_does_not_touch_the_database_when_session_factory_is_not_configured(
+    sample_repo,
+):
     result = SastPipeline().scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -604,7 +680,9 @@ def test_pipeline_tolerates_a_persistence_failure_without_failing_the_scan(sampl
     assert result.metrics["ai_scan_incomplete"] is False
 
 
-def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_on_rescan(sample_repo):
+def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_on_rescan(
+    sample_repo,
+):
     """End-to-end mutation test for the Phase 2 exit condition: editing the code a
     finding depends on flags that finding for revalidation on the next scan, while
     a second, untouched finding elsewhere in the codebase is left alone."""
@@ -656,7 +734,10 @@ def test_pipeline_records_model_usage_for_the_tenant_cost_quota(sample_repo):
     reservation = budget.reserve("deep", 10, 10)
     budget.complete(
         reservation,
-        SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=3), _hidden_params={"response_cost": 0.2}),
+        SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=12, output_tokens=3),
+            _hidden_params={"response_cost": 0.2},
+        ),
     )
     agent.model_budget = budget
     pipeline = SastPipeline(session_factory=factory, tenant_id="tenant-a")
@@ -696,7 +777,9 @@ class FakeMergedDiscoveryAI(FakeContextualAI):
         return candidates, failures
 
 
-def test_pipeline_merges_candidates_before_starting_independent_verification(sample_repo):
+def test_pipeline_merges_candidates_before_starting_independent_verification(
+    sample_repo,
+):
     agent = FakeMergedDiscoveryAI()
     result = SastPipeline().scan_snapshot(sample_repo, "plaidnox/test-fixture", deep_hunt_agent=agent)
 

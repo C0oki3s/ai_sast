@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from plaidnox_sast.assets import load_json, load_text
+from plaidnox_sast.redaction import redact
 from plaidnox_sast.persistence.database import (
     DatabaseConfigurationError,
     DatabaseSettings,
@@ -35,6 +36,24 @@ def test_postgresql_configuration_is_external_and_password_is_redacted():
     assert "***" in settings.redacted_url
 
 
+def test_finding_storage_redaction_covers_credentials_tokens_and_private_keys():
+    source = (
+        'DATABASE_PASSWORD = "fixture-db-password"\n'
+        "TOKEN='eyJabcdefgh.ijklmnop.qrstuvwx'\n"
+        "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n"
+        "-----BEGIN PRIVATE KEY-----\nprivate-key-fixture\n-----END PRIVATE KEY-----"
+    )
+    safe = redact(source)
+
+    for secret in (
+        "fixture-db-password",
+        "eyJabcdefgh.ijklmnop.qrstuvwx",
+        "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+        "private-key-fixture",
+    ):
+        assert secret not in safe
+
+
 def test_production_database_rejects_non_postgresql_driver():
     with pytest.raises(DatabaseConfigurationError, match="Unsupported production database driver"):
         DatabaseSettings.from_environment({"PLAIDNOX_DATABASE_URL": "sqlite:///context.sqlite"})
@@ -53,9 +72,7 @@ def test_production_database_requires_tls() -> None:
 def test_production_database_accepts_verified_tls_mode() -> None:
     settings = DatabaseSettings.from_environment(
         {
-            "PLAIDNOX_DATABASE_URL": (
-                "postgresql+psycopg://scanner:secret@db/code_scanning?sslmode=verify-full"
-            ),
+            "PLAIDNOX_DATABASE_URL": ("postgresql+psycopg://scanner:secret@db/code_scanning?sslmode=verify-full"),
             "PLAIDNOX_PRODUCTION_MODE": "true",
         }
     )
@@ -191,7 +208,14 @@ def test_hunt_task_leasing_is_concurrency_safe_and_completion_is_idempotent(tmp_
         plan = repository.create_hunt_plan("plan-1", scan.scan_id, "recon", "context-hash-1", "workflow-v1")
         repository.create_hunt_tasks(
             plan.plan_id,
-            [HuntTaskInput("task-key-1", "Inspect auth", "Find auth bypass", {"paths": ["app.js"]})],
+            [
+                HuntTaskInput(
+                    "task-key-1",
+                    "Inspect auth",
+                    "Find auth bypass",
+                    {"paths": ["app.js"]},
+                )
+            ],
         )
 
     leased = []
@@ -256,8 +280,24 @@ def test_finding_round_trips_through_postgresql_shaped_schema():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
 
     evidence = [
-        FindingEvidenceInput("source", "app.js", 5, 5, "const identity = jwt.decode(req.body.token)", "ev-hash-1", "tree_sitter"),
-        FindingEvidenceInput("sink", "app.js", 6, 6, "res.cookie(\"idToken\", req.body.token)", "ev-hash-2", "tree_sitter"),
+        FindingEvidenceInput(
+            "source",
+            "app.js",
+            5,
+            5,
+            "const identity = jwt.decode(req.body.token)",
+            "ev-hash-1",
+            "tree_sitter",
+        ),
+        FindingEvidenceInput(
+            "sink",
+            "app.js",
+            6,
+            6,
+            'res.cookie("idToken", req.body.token)',
+            "ev-hash-2",
+            "tree_sitter",
+        ),
     ]
     dependencies = [FindingDependencyInput("symbol", "app.js:handleSignin:0", "dep-hash-1")]
 
@@ -352,7 +392,10 @@ def test_a_changed_callee_flags_its_own_and_its_callers_findings_but_leaves_unre
         content_hash="hash-unrelated-1",
         content="function formatDate(value) { return value; }",
     )
-    source_files = [SourceFileInput("app.js", "javascript", "file-hash-1", 128), SourceFileInput("util.js", "javascript", "file-hash-2", 64)]
+    source_files = [
+        SourceFileInput("app.js", "javascript", "file-hash-1", 128),
+        SourceFileInput("util.js", "javascript", "file-hash-2", 64),
+    ]
     edge = EdgeInput(caller.stable_key, callee.stable_key, "calls", "tree_sitter")
 
     with unit_of_work(factory, "tenant-a") as repository:
@@ -427,7 +470,12 @@ def test_a_changed_callee_flags_its_own_and_its_callers_findings_but_leaves_unre
     )
     with unit_of_work(factory, "tenant-a") as repository:
         snapshot_2 = repository.add_snapshot("snapshot-2", "codebase-1", "revision-2", "tree-hash-2", "context-v1")
-        repository.save_security_ir(snapshot_2.snapshot_id, source_files, [caller, mutated_callee, unrelated], [edge])
+        repository.save_security_ir(
+            snapshot_2.snapshot_id,
+            source_files,
+            [caller, mutated_callee, unrelated],
+            [edge],
+        )
 
         stale = repository.findings_requiring_revalidation("codebase-1", snapshot_2.snapshot_id, hops=3)
         assert set(stale) == {caller_finding.finding_id, callee_finding.finding_id}

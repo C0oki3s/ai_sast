@@ -29,7 +29,10 @@ class Base(DeclarativeBase):
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 
@@ -68,7 +71,14 @@ class ScanJobRecord(TimestampMixin, Base):
             "attempt_count >= 0 AND maximum_attempts > 0 AND priority >= 0",
             name="ck_code_scanning_scan_job_attempts",
         ),
-        Index("ix_code_scanning_scan_job_lease", "tenant_id", "state", "priority", "lease_expires_at", "created_at"),
+        Index(
+            "ix_code_scanning_scan_job_lease",
+            "tenant_id",
+            "state",
+            "priority",
+            "lease_expires_at",
+            "created_at",
+        ),
     )
 
     job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -179,7 +189,8 @@ class SnapshotRecord(TimestampMixin, Base):
     snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     revision: Mapped[str] = mapped_column(String(128), nullable=False)
     tree_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -192,14 +203,23 @@ class SnapshotRecord(TimestampMixin, Base):
 
 class RepositoryContextRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_repository_contexts"
-    __table_args__ = (Index("ix_code_scanning_repository_context", "tenant_id", "codebase_id", "created_at"),)
+    __table_args__ = (
+        Index(
+            "ix_code_scanning_repository_context",
+            "tenant_id",
+            "codebase_id",
+            "created_at",
+        ),
+    )
 
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        primary_key=True,
     )
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     context_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     context_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -214,7 +234,9 @@ class SourceFileRecord(TimestampMixin, Base):
 
     source_file_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     path: Mapped[str] = mapped_column(String(2048), nullable=False)
     language: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
@@ -233,10 +255,12 @@ class SymbolRecord(TimestampMixin, Base):
     symbol_version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     symbol_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
     )
     source_file_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_source_files.source_file_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_source_files.source_file_id", ondelete="CASCADE"),
+        nullable=False,
     )
     stable_key: Mapped[str] = mapped_column(String(2300), nullable=False)
     qualified_name: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -258,7 +282,8 @@ class SymbolSummaryRecord(TimestampMixin, Base):
 
     summary_record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
     )
     symbol_id: Mapped[str] = mapped_column(String(2048), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -276,12 +301,17 @@ class OverlaySymbolSummaryRecord(TimestampMixin, Base):
             "(summary_state = 'deleted' AND content_hash IS NULL AND summary_data IS NULL)",
             name="ck_code_scanning_overlay_symbol_summary_state",
         ),
-        Index("ix_code_scanning_overlay_symbol_summary_snapshot", "snapshot_id", "summary_state"),
+        Index(
+            "ix_code_scanning_overlay_symbol_summary_snapshot",
+            "snapshot_id",
+            "summary_state",
+        ),
     )
 
     summary_record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
     )
     symbol_id: Mapped[str] = mapped_column(String(2048), nullable=False)
     summary_state: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -293,15 +323,28 @@ class CodeEdgeRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_edges"
     __table_args__ = (
         UniqueConstraint(
-            "snapshot_id", "source_symbol_id", "target_symbol_id", "relation", name="uq_code_scanning_edge"
+            "snapshot_id",
+            "source_symbol_id",
+            "target_symbol_id",
+            "relation",
+            name="uq_code_scanning_edge",
         ),
-        Index("ix_code_scanning_edge_reverse", "snapshot_id", "target_symbol_id", "relation"),
-        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_code_scanning_edge_confidence"),
+        Index(
+            "ix_code_scanning_edge_reverse",
+            "snapshot_id",
+            "target_symbol_id",
+            "relation",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_code_scanning_edge_confidence",
+        ),
     )
 
     edge_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="CASCADE"),
+        nullable=False,
     )
     source_symbol_id: Mapped[str] = mapped_column(String(64), nullable=False)
     target_symbol_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -318,7 +361,8 @@ class ThreatStatementRecord(TimestampMixin, Base):
     threat_statement_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     category: Mapped[str] = mapped_column(String(128), nullable=False)
     statement: Mapped[str] = mapped_column(Text, nullable=False)
@@ -330,7 +374,15 @@ class ThreatStatementRecord(TimestampMixin, Base):
 
 class SecurityMemoryRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_security_memories"
-    __table_args__ = (Index("ix_code_scanning_memory_scope", "tenant_id", "codebase_id", "category", "status"),)
+    __table_args__ = (
+        Index(
+            "ix_code_scanning_memory_scope",
+            "tenant_id",
+            "codebase_id",
+            "category",
+            "status",
+        ),
+    )
 
     memory_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -349,8 +401,17 @@ class SecurityKnowledgeRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_security_knowledge"
     __table_args__ = (
         UniqueConstraint("tenant_id", "content_hash", name="uq_code_scanning_knowledge_hash"),
-        Index("ix_code_scanning_knowledge_lookup", "tenant_id", "ecosystem", "framework", "status"),
-        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_code_scanning_knowledge_confidence"),
+        Index(
+            "ix_code_scanning_knowledge_lookup",
+            "tenant_id",
+            "ecosystem",
+            "framework",
+            "status",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_code_scanning_knowledge_confidence",
+        ),
     )
 
     knowledge_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -377,16 +438,22 @@ class ScanRunRecord(TimestampMixin, Base):
     scan_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"),
+        nullable=False,
     )
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     mode: Mapped[str] = mapped_column(String(32), nullable=False)
     workflow_version: Mapped[str] = mapped_column(String(64), nullable=False)
     coverage_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     failure_code: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    scan_status: Mapped[str] = mapped_column(String(32), nullable=False, default="RUNNING")
+    scan_parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class HuntPlanRecord(TimestampMixin, Base):
@@ -395,7 +462,8 @@ class HuntPlanRecord(TimestampMixin, Base):
 
     plan_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
     )
     strategy: Mapped[str] = mapped_column(Text, nullable=False)
     context_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -411,7 +479,8 @@ class HuntTaskRecord(TimestampMixin, Base):
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     plan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_hunt_plans.plan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_hunt_plans.plan_id", ondelete="CASCADE"),
+        nullable=False,
     )
     task_key: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -428,21 +497,38 @@ class InvestigationRecord(TimestampMixin, Base):
 
     __tablename__ = "code_scanning_investigations"
     __table_args__ = (
-        UniqueConstraint("scan_id", "stable_key", "evidence_hash", name="uq_code_scanning_investigation_evidence"),
-        Index("ix_code_scanning_investigation_queue", "tenant_id", "scan_id", "state", "created_at"),
-        CheckConstraint("revision > 0 AND attempt_count >= 0", name="ck_code_scanning_investigation_counters"),
+        UniqueConstraint(
+            "scan_id",
+            "stable_key",
+            "evidence_hash",
+            name="uq_code_scanning_investigation_evidence",
+        ),
+        Index(
+            "ix_code_scanning_investigation_queue",
+            "tenant_id",
+            "scan_id",
+            "state",
+            "created_at",
+        ),
+        CheckConstraint(
+            "revision > 0 AND attempt_count >= 0",
+            name="ck_code_scanning_investigation_counters",
+        ),
     )
 
     investigation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     scan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
     )
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("code_scanning_snapshots.snapshot_id", ondelete="RESTRICT"),
+        nullable=False,
     )
     stable_key: Mapped[str] = mapped_column(String(512), nullable=False)
     evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -459,10 +545,12 @@ class KnowledgeUsageRecord(TimestampMixin, Base):
 
     usage_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
     )
     task_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_hunt_tasks.task_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_hunt_tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
     )
     knowledge_id: Mapped[str | None] = mapped_column(
         ForeignKey("code_scanning_security_knowledge.knowledge_id", ondelete="SET NULL")
@@ -479,11 +567,10 @@ class ModelInvocationRecord(TimestampMixin, Base):
 
     invocation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
     )
-    task_id: Mapped[str | None] = mapped_column(
-        ForeignKey("code_scanning_hunt_tasks.task_id", ondelete="SET NULL")
-    )
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("code_scanning_hunt_tasks.task_id", ondelete="SET NULL"))
     stage: Mapped[str] = mapped_column(String(128), nullable=False)
     model_tier: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_request_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
@@ -499,7 +586,9 @@ class PromptCacheMetricRecord(TimestampMixin, Base):
 
     metric_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     invocation_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_model_invocations.invocation_id", ondelete="CASCADE"), nullable=False, unique=True
+        ForeignKey("code_scanning_model_invocations.invocation_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
     )
     cache_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -517,10 +606,12 @@ class FindingRecord(TimestampMixin, Base):
     finding_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     codebase_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_codebases.codebase_id", ondelete="CASCADE"),
+        nullable=False,
     )
     scan_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
     )
     fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -540,7 +631,8 @@ class FindingEvidenceRecord(TimestampMixin, Base):
 
     evidence_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     finding_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_findings.finding_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_findings.finding_id", ondelete="CASCADE"),
+        nullable=False,
     )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     evidence_type: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -556,15 +648,51 @@ class FindingDependencyRecord(TimestampMixin, Base):
     __tablename__ = "code_scanning_finding_dependencies"
     __table_args__ = (
         UniqueConstraint(
-            "finding_id", "dependency_type", "dependency_key", name="uq_code_scanning_finding_dependency"
+            "finding_id",
+            "dependency_type",
+            "dependency_key",
+            name="uq_code_scanning_finding_dependency",
         ),
-        Index("ix_code_scanning_finding_dependency_reverse", "dependency_type", "dependency_key"),
+        Index(
+            "ix_code_scanning_finding_dependency_reverse",
+            "dependency_type",
+            "dependency_key",
+        ),
     )
 
     finding_dependency_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     finding_id: Mapped[str] = mapped_column(
-        ForeignKey("code_scanning_findings.finding_id", ondelete="CASCADE"), nullable=False
+        ForeignKey("code_scanning_findings.finding_id", ondelete="CASCADE"),
+        nullable=False,
     )
     dependency_type: Mapped[str] = mapped_column(String(64), nullable=False)
     dependency_key: Mapped[str] = mapped_column(String(2300), nullable=False)
     dependency_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class ScanFindingRecord(TimestampMixin, Base):
+    """Immutable-per-scan report snapshot, including structured attack evidence."""
+
+    __tablename__ = "code_scanning_scan_findings"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "fingerprint", name="uq_code_scanning_scan_finding"),
+        Index("ix_code_scanning_scan_finding_severity", "scan_id", "severity"),
+        Index("ix_code_scanning_scan_finding_cwe", "tenant_id", "cwe_id"),
+        CheckConstraint("report_schema_version > 0", name="ck_code_scanning_scan_finding_version"),
+        CheckConstraint("cwe_id IS NULL OR cwe_id > 0", name="ck_code_scanning_scan_finding_cwe"),
+    )
+
+    scan_finding_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("code_scanning_scan_runs.scan_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    finding_id: Mapped[str | None] = mapped_column(ForeignKey("code_scanning_findings.finding_id", ondelete="SET NULL"))
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    category: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    cwe_id: Mapped[int | None] = mapped_column(Integer)
+    owasp_category: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    report_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    report_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

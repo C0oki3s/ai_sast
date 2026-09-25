@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -13,9 +15,21 @@ from .ai import AIConfigurationError, PlaidNoxDeepHuntAgent
 from .assets import load_json
 from .config import load_local_project_config
 from .errors import AIStageError
-from .checkpoint import ScanCheckpoint, candidate_from_dict, candidate_to_dict, finding_from_dict, unit_key
-from .fingerprint import CandidateIndex, candidate_evidence_packet, candidate_fingerprint, deduplicate
+from .checkpoint import (
+    ScanCheckpoint,
+    candidate_from_dict,
+    candidate_to_dict,
+    finding_from_dict,
+    unit_key,
+)
+from .fingerprint import (
+    CandidateIndex,
+    candidate_evidence_packet,
+    candidate_fingerprint,
+    deduplicate,
+)
 from .graph import build_structural_graph
+from .graph import source_file_is_admitted
 from .routers import CandidateRouter
 from .models import (
     Depth,
@@ -39,11 +53,178 @@ from .persistence import (
     unit_of_work,
 )
 from .policy import PolicyEngine
+from .redaction import redact as redact_sensitive_values
 from .saist import DatadogSAISTDetector
 from .validation import FindingValidator, priority_score
 
 _SECURITY_IR_CONTEXT_VERSION = SECURITY_IR_CONTEXT_VERSION
 _stable_id = stable_id
+
+
+def _report_classifications(finding: Finding) -> tuple[int | None, str]:
+    references = finding.metadata.get("classification_references", [])
+    if not isinstance(references, list):
+        return None, ""
+    cwe_id = None
+    owasp_category = ""
+    for reference in references[:8]:
+        if not isinstance(reference, dict):
+            continue
+        namespace = str(reference.get("namespace", "")).strip().casefold()
+        identifier = str(reference.get("identifier", "")).strip()
+        if namespace == "cwe" and cwe_id is None:
+            match = re.search(r"\d+", identifier)
+            if match:
+                cwe_id = int(match.group())
+        elif namespace.startswith("owasp") and not owasp_category:
+            owasp_category = f"{identifier}: {str(reference.get('name', '')).strip()}".strip(": ")[:255]
+    if cwe_id is None:
+        match = re.fullmatch(r"CWE[-_ ]?(\d+)", finding.vulnerability_class.strip(), re.IGNORECASE)
+        if match:
+            cwe_id = int(match.group(1))
+    return cwe_id, owasp_category
+
+
+def _finding_report_data(
+    finding: Finding,
+    *,
+    root: Path,
+    scan_id: str,
+    finding_id: str,
+    codebase: str,
+    revision: str,
+    exclude: list[str],
+    max_file_bytes: int,
+) -> dict:
+    """Build a bounded, redacted, scan-scoped report snapshot from a verified finding."""
+    deep_hunt = finding.metadata.get("deep_hunt", {})
+    if not isinstance(deep_hunt, dict):
+        deep_hunt = {}
+    references = finding.metadata.get("classification_references", [])
+    references = (
+        [dict(item) for item in references[:8] if isinstance(item, dict)] if isinstance(references, list) else []
+    )
+    evidence_locations = deep_hunt.get("evidence_locations", [])
+    if not isinstance(evidence_locations, list):
+        evidence_locations = []
+    locations = [
+        {
+            "path": finding.evidence.path,
+            "start_line": finding.evidence.start_line,
+            "end_line": finding.evidence.end_line,
+            "role": "origin",
+        },
+        *[dict(item) for item in evidence_locations[:7] if isinstance(item, dict)],
+    ]
+    taint_path: list[dict] = []
+    for location in locations[:8]:
+        path = str(location.get("path", "")).replace("\\", "/")[:2048]
+        try:
+            start_line = max(1, int(location.get("start_line", location.get("line", 1))))
+            end_line = max(start_line, int(location.get("end_line", start_line)))
+        except (TypeError, ValueError):
+            continue
+        code = ""
+        source_path = (root / path).resolve()
+        if root.resolve() in source_path.parents and source_file_is_admitted(
+            root,
+            source_path,
+            exclude=exclude,
+            max_file_bytes=max_file_bytes,
+        ):
+            try:
+                source_lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                code = "\n".join(
+                    f"{number}: {source_lines[number - 1]}"
+                    for number in range(
+                        start_line,
+                        min(end_line, start_line + 19, len(source_lines)) + 1,
+                    )
+                )
+            except OSError:
+                code = ""
+        if not code and path == finding.evidence.path and start_line <= finding.evidence.end_line:
+            code = finding.evidence.snippet
+        role = str(location.get("role", "propagation"))[:64]
+        taint_path.append(
+            {
+                "type": role,
+                "file": path,
+                "line": start_line,
+                "end_line": end_line,
+                "code": redact_sensitive_values(code)[:4000],
+                "description": str(location.get("description", ""))[:1000],
+                "provenance": "deep_hunt_evidence_location",
+            }
+        )
+
+    cwe_id, owasp_category = _report_classifications(finding)
+    deep_packet = finding.metadata.get("evidence_packet", {})
+    if not isinstance(deep_packet, dict):
+        deep_packet = {}
+    tags = finding.metadata.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "schema_version": 1,
+        "finding_id": finding_id,
+        "uuid": finding_id,
+        "duplicate_of": None,
+        "fingerprint": finding.fingerprint,
+        "title": redact_sensitive_values(finding.title)[:1000],
+        "tags": [redact_sensitive_values(str(tag))[:255] for tag in tags[:50]],
+        "description": redact_sensitive_values(finding.message)[:8000],
+        "severity": finding.severity.value,
+        "confidence": finding.confidence,
+        "state": finding.state.value,
+        "category": finding.vulnerability_class[:255],
+        "owasp_category": owasp_category,
+        "cwe_id": cwe_id,
+        "recommendation": redact_sensitive_values(finding.remediation)[:8000],
+        "business_impact": redact_sensitive_values(finding.impact)[:8000],
+        "affected_file": finding.evidence.path[:2048],
+        "affected_code": redact_sensitive_values(finding.evidence.snippet)[:8000],
+        "root_cause_symbol": str(finding.metadata.get("root_cause_symbol", ""))[:1000],
+        "proof_of_concept": redact_sensitive_values(str(finding.metadata.get("proof_of_concept", "")))[:8000],
+        "proof_plan": redact_sensitive_values(str(deep_hunt.get("proof_plan", "")))[:4000],
+        "regression_test_expectation": redact_sensitive_values(str(deep_hunt.get("regression_test", "")))[:4000],
+        "security_invariant": redact_sensitive_values(str(deep_hunt.get("security_invariant", "")))[:4000],
+        "gained_capability": redact_sensitive_values(str(deep_hunt.get("gained_capability", "")))[:1000],
+        "attack_path": redact_sensitive_values(str(deep_hunt.get("attack_path", "")))[:8000],
+        "classification_references": references,
+        "validation_gates": [dict(item) for item in deep_hunt.get("gate_results", [])[:16] if isinstance(item, dict)],
+        "evidence_gaps": [
+            str(item)[:1000]
+            for item in (
+                deep_hunt.get("evidence_gaps", []) if isinstance(deep_hunt.get("evidence_gaps", []), list) else []
+            )[:32]
+        ],
+        "evidence_packet": deep_packet,
+        "taint_sources": [
+            redact_sensitive_values(str(item))[:1000] for item in deep_packet.get("attacker_origins", [])[:16]
+        ]
+        if isinstance(deep_packet.get("attacker_origins", []), list)
+        else [],
+        "taint_path": taint_path,
+        "occurrence_count": max(1, _occurrence_count(finding.metadata)),
+        "last_seen_at": datetime.now(UTC).isoformat(),
+        "scan_id": scan_id,
+        "scan_ids": [scan_id],
+        "scan_type": "deep",
+        "scan_name": codebase,
+        "codebase": codebase,
+        "revision": revision,
+        "commitSha": revision,
+        "repo_url": codebase if codebase.startswith(("https://", "http://")) else None,
+        "sourceHost": None,
+    }
+
+
+def _occurrence_count(metadata: dict) -> int:
+    try:
+        return int(metadata.get("duplicate_reports", 0) or 0) + 1
+    except (TypeError, ValueError):
+        return 1
 
 
 def _symbol_at_location(symbols_by_path: dict[str, list], path: str, line: int):
@@ -53,6 +234,7 @@ def _symbol_at_location(symbols_by_path: dict[str, list], path: str, line: int):
         if symbol.start_line <= line <= symbol.end_line:
             return symbol
     return None
+
 
 def _finding_dependencies(
     finding: Finding,
@@ -133,6 +315,7 @@ class SastPipeline:
         graph = build_structural_graph(root, exclude=config.exclude, max_file_bytes=config.max_file_bytes)
         tree_hash = snapshot_tree_hash(graph)
         revision = revision or f"snapshot-{tree_hash}"
+        scan_id = _stable_id("scan", codebase, revision, uuid.uuid4().hex)
         context_scope = json.dumps(
             {
                 "business_context": config.business_context,
@@ -172,7 +355,6 @@ class SastPipeline:
             reset_search_query_errors()
 
         codebase_id = ""
-        scan_id = ""
         persistence_enabled = self.session_factory is not None
         persistence_indexed = False
         persistence_error_type = ""
@@ -183,7 +365,9 @@ class SastPipeline:
             try:
                 codebase_id = _stable_id("codebase", self.tenant_id, codebase)
                 snapshot_id = _stable_id("snapshot", self.tenant_id, codebase, revision)
-                scan_id = _stable_id("scan", codebase_id, snapshot_id)
+                # A scan_id identifies one execution, while snapshot_id identifies
+                # the immutable source revision. Repeated runs therefore retain
+                # separate findings, health, and cost records.
                 workflow_version = str(load_json("prompts/manifest.json")["version"])
                 source_files, symbol_inputs, edge_inputs = security_ir_inputs(root, graph)
                 persisted_ir = (source_files, symbol_inputs, edge_inputs)
@@ -195,9 +379,29 @@ class SastPipeline:
                 with unit_of_work(self.session_factory, self.tenant_id) as repository:
                     repository.add_codebase(codebase_id, external_key=codebase, display_name=codebase)
                     repository.add_snapshot(
-                        snapshot_id, codebase_id, revision, tree_hash, _SECURITY_IR_CONTEXT_VERSION
+                        snapshot_id,
+                        codebase_id,
+                        revision,
+                        tree_hash,
+                        _SECURITY_IR_CONTEXT_VERSION,
                     )
-                    repository.start_scan(scan_id, codebase_id, snapshot_id, mode="deep", workflow_version=workflow_version)
+                    repository.start_scan(
+                        scan_id,
+                        codebase_id,
+                        snapshot_id,
+                        mode="deep",
+                        workflow_version=workflow_version,
+                        scan_parameters={
+                            "codebase": codebase,
+                            "revision": revision,
+                            "tree_hash": tree_hash,
+                            "context_scope_hash": context_scope_hash,
+                            "workflow_version": workflow_version,
+                            "mode": "deep",
+                            "max_file_bytes": config.max_file_bytes,
+                            "excluded_path_count": len(config.exclude),
+                        },
+                    )
                     repository.save_security_ir(snapshot_id, source_files, symbol_inputs, edge_inputs)
                     # A callee's content changing must revalidate its callers and any
                     # finding that depended on either -- otherwise a fixed or newly
@@ -255,12 +459,29 @@ class SastPipeline:
             if saved is not None:
                 if saved["outcome"] == "unsupported":
                     return candidate, None, 1, 0, 0, 1, "", "", False
-                return candidate, finding_from_dict(saved["finding"]), 1, 1, 0, 0, "", "", False
+                return (
+                    candidate,
+                    finding_from_dict(saved["finding"]),
+                    1,
+                    1,
+                    0,
+                    0,
+                    "",
+                    "",
+                    False,
+                )
             try:
                 hunt = getattr(deep_hunt_agent, "hunt", None)
                 if not callable(hunt):
                     hunt = deep_hunt_agent.review
-                review = hunt(root, candidate, finding, config.security_context, model_tier=route.model_tier, route=route)
+                review = hunt(
+                    root,
+                    candidate,
+                    finding,
+                    config.security_context,
+                    model_tier=route.model_tier,
+                    route=route,
+                )
                 if not review.supported:
                     if checkpoint is not None:
                         checkpoint.put("review", review_key, {"outcome": "unsupported"})
@@ -282,11 +503,25 @@ class SastPipeline:
                 finding.state = FindingState.VALIDATED
                 finding.validator = "plaidnox-deep-hunt"
                 if checkpoint is not None:
-                    checkpoint.put("review", review_key, {"outcome": "supported", "finding": finding.to_dict()})
+                    checkpoint.put(
+                        "review",
+                        review_key,
+                        {"outcome": "supported", "finding": finding.to_dict()},
+                    )
                 return candidate, finding, 1, 1, 0, 0, "", "", False
             except Exception as exc:  # noqa: BLE001
                 unexpected = not isinstance(exc, AIStageError)
-                return candidate, None, 0, 0, 1, 1, type(exc).__name__, str(exc)[:240], unexpected
+                return (
+                    candidate,
+                    None,
+                    0,
+                    0,
+                    1,
+                    1,
+                    type(exc).__name__,
+                    str(exc)[:240],
+                    unexpected,
+                )
 
         try:
             context = context_builder(root, codebase, revision, graph, config.business_context)
@@ -297,15 +532,9 @@ class SastPipeline:
             ai_discovery_error_types = list(getattr(deep_hunt_agent, "discovery_error_types", []))
             ai_discovery_errors = list(getattr(deep_hunt_agent, "discovery_errors", []))
             ai_discovery_unexpected_failures = int(getattr(deep_hunt_agent, "discovery_unexpected_failures", 0))
-            ai_discovery_unresolved_obligations = int(
-                getattr(deep_hunt_agent, "discovery_unresolved_obligations", 0)
-            )
-            ai_required_coverage_unresolved = int(
-                getattr(deep_hunt_agent, "discovery_required_coverage_unresolved", 0)
-            )
-            ai_discovery_contract_failures = int(
-                getattr(deep_hunt_agent, "discovery_contract_failures", 0)
-            )
+            ai_discovery_unresolved_obligations = int(getattr(deep_hunt_agent, "discovery_unresolved_obligations", 0))
+            ai_required_coverage_unresolved = int(getattr(deep_hunt_agent, "discovery_required_coverage_unresolved", 0))
+            ai_discovery_contract_failures = int(getattr(deep_hunt_agent, "discovery_contract_failures", 0))
         except Exception as exc:  # noqa: BLE001
             ai_context_failures += 1
             ai_context_error_type = type(exc).__name__
@@ -315,7 +544,10 @@ class SastPipeline:
                 # resilience the same as any other stage error, but flagged
                 # distinctly so it is not mistaken for ordinary AI flakiness.
                 ai_context_unexpected_failures += 1
-            repository_context = {"error": ai_context_error_type, "message": ai_context_error}
+            repository_context = {
+                "error": ai_context_error_type,
+                "message": ai_context_error,
+            }
             if callable(planner):
                 ai_planning_failures += 1
 
@@ -418,7 +650,10 @@ class SastPipeline:
                 ai_variant_rounds += 1
                 round_key = unit_key(sorted(candidate_fingerprint(codebase, item) for item, _ in verified_round))
                 variants, sweep_failures = _resumable(
-                    checkpoint, "variants", round_key, lambda: sweeper(root, context, plan, verified_round)
+                    checkpoint,
+                    "variants",
+                    round_key,
+                    lambda: sweeper(root, context, plan, verified_round),
                 )
                 ai_variant_failures += sweep_failures
                 ai_variant_unexpected_failures += int(getattr(deep_hunt_agent, "variant_unexpected_failures", 0))
@@ -432,7 +667,10 @@ class SastPipeline:
                 if callable(chainer):
                     ai_capability_chain_rounds += 1
                     pivots, chain_failures = _resumable(
-                        checkpoint, "capability_chain", round_key, lambda: chainer(root, context, plan, verified_round)
+                        checkpoint,
+                        "capability_chain",
+                        round_key,
+                        lambda: chainer(root, context, plan, verified_round),
                     )
                     ai_capability_chain_failures += chain_failures
                     ai_capability_chain_unexpected_failures += int(
@@ -462,52 +700,13 @@ class SastPipeline:
             ai_consolidation_error_type = type(exc).__name__
             ai_consolidation_error = str(exc)[:240]
             ai_consolidation_unexpected_failure = not isinstance(exc, AIStageError)
-        findings.sort(key=lambda item: (-item.priority_score, item.evidence.path, item.evidence.start_line))
-
-        persistence_findings_saved = 0
-        persistence_finding_error_type = ""
-        persistence_finding_error = ""
-        if self.session_factory is not None and persistence_indexed:
-            try:
-                with unit_of_work(self.session_factory, self.tenant_id) as repository:
-                    for finding in findings:
-                        finding_id = _stable_id("finding", codebase_id, finding.fingerprint)
-                        evidence = [
-                            FindingEvidenceInput(
-                                "primary",
-                                finding.evidence.path,
-                                finding.evidence.start_line,
-                                finding.evidence.end_line,
-                                finding.evidence.snippet,
-                                hashlib.sha256(finding.evidence.snippet.encode("utf-8")).hexdigest(),
-                                finding.validator,
-                            )
-                        ]
-                        dependencies = _finding_dependencies(
-                            finding,
-                            persisted_ir[1] if persisted_ir is not None else [],
-                        )
-                        repository.save_finding(
-                            finding_id,
-                            codebase_id,
-                            scan_id,
-                            finding.fingerprint,
-                            finding.title,
-                            finding.vulnerability_class,
-                            finding.severity.value,
-                            finding.state.value,
-                            finding.confidence,
-                            finding.message,
-                            finding.impact,
-                            finding.remediation,
-                            finding.metadata,
-                            evidence,
-                            dependencies,
-                        )
-                        persistence_findings_saved += 1
-            except Exception as exc:  # noqa: BLE001
-                persistence_finding_error_type = type(exc).__name__
-                persistence_finding_error = str(exc)[:240]
+        findings.sort(
+            key=lambda item: (
+                -item.priority_score,
+                item.evidence.path,
+                item.evidence.start_line,
+            )
+        )
 
         ai_patch_proposals = 0
         ai_patch_verified = 0
@@ -569,37 +768,15 @@ class SastPipeline:
         elif ai_scan_incomplete:
             policy = PolicyResult(
                 policy.decision,
-                [*policy.reasons, "PlaidNox Deep Hunt was also incomplete; review recorded error metrics"],
+                [
+                    *policy.reasons,
+                    "PlaidNox Deep Hunt was also incomplete; review recorded error metrics",
+                ],
             )
+        persistence_findings_saved = 0
+        persistence_finding_error_type = ""
+        persistence_finding_error = ""
         persistence_scan_finalized = False
-        if self.session_factory is not None and scan_id:
-            try:
-                with unit_of_work(self.session_factory, self.tenant_id) as repository:
-                    persistence_scan_finalized = repository.finish_scan(
-                        scan_id,
-                        coverage_complete=not ai_scan_incomplete,
-                        failure_code="ai_scan_incomplete" if ai_scan_incomplete else "",
-                    )
-                    # Feed the tenant monthly cost quota; without this no usage
-                    # event is ever written and the quota can never trip.
-                    usage_by_model = getattr(
-                        getattr(deep_hunt_agent, "model_budget", None), "usage_by_model", dict
-                    )()
-                    # scan_id is stable per revision, but every run (rescan, worker
-                    # retry) really spends, so each run gets its own usage identity.
-                    usage_run = uuid.uuid4().hex
-                    for model_alias, (input_tokens, output_tokens, cost_usd) in usage_by_model.items():
-                        repository.record_model_usage(
-                            stable_id("usage", scan_id, usage_run, model_alias),
-                            scan_id,
-                            model_alias,
-                            input_tokens,
-                            output_tokens,
-                            cost_usd,
-                        )
-            except Exception as exc:  # noqa: BLE001
-                persistence_error_type = persistence_error_type or type(exc).__name__
-                persistence_error = persistence_error or str(exc)[:240]
         prompt_cache_metrics = getattr(deep_hunt_agent, "prompt_cache_metrics", dict)()
         model_input_metrics = getattr(deep_hunt_agent, "model_input_metrics", dict)()
         model_budget_metrics = getattr(deep_hunt_agent, "model_budget_metrics", dict)()
@@ -615,6 +792,7 @@ class SastPipeline:
             findings=findings,
             policy=policy,
             metrics={
+                "scan_id": scan_id,
                 "saist_candidates": len(saist_candidates),
                 "ai_discovery_candidates": len(ai_discovery_candidates),
                 "ai_context_failures": ai_context_failures,
@@ -631,7 +809,12 @@ class SastPipeline:
                 **{
                     f"discovery_{key}": value
                     for key, value in getattr(deep_hunt_agent, "discovery_metrics", {}).items()
-                    if key.startswith("canonical_") or key in {"obligations_reconciled_by_sibling", "candidate_grounding_rejections"}
+                    if key.startswith("canonical_")
+                    or key
+                    in {
+                        "obligations_reconciled_by_sibling",
+                        "candidate_grounding_rejections",
+                    }
                 },
                 "ai_discovery_contract_failures": ai_discovery_contract_failures,
                 "deduplicated_candidates": duplicate_count,
@@ -644,8 +827,7 @@ class SastPipeline:
                 "tree_sitter_files": graph.tree_sitter_files,
                 "syntax_fallback_files": graph.fallback_files,
                 "rg_queries": graph.rg_queries + int(discovery_metrics.get("queries_raw", 0)),
-                "rg_hits": len(graph.search_hits)
-                + int(discovery_metrics.get("rg_hits_unique", 0)),
+                "rg_hits": len(graph.search_hits) + int(discovery_metrics.get("rg_hits_unique", 0)),
                 "rg_queries_recon": graph.rg_queries,
                 "rg_queries_discovery": int(discovery_metrics.get("queries_raw", 0)),
                 "rg_hits_recon": len(graph.search_hits),
@@ -729,6 +911,146 @@ class SastPipeline:
                 **discovery_metrics,
             },
             repository_context=repository_context,
+            scan_id=scan_id,
+        )
+        if self.session_factory is not None and persistence_indexed and scan_id:
+            try:
+                with unit_of_work(self.session_factory, self.tenant_id) as repository:
+                    for finding in findings:
+                        finding_id = _stable_id("finding", codebase_id, finding.fingerprint)
+                        report_data = _finding_report_data(
+                            finding,
+                            root=root,
+                            scan_id=scan_id,
+                            finding_id=finding_id,
+                            codebase=codebase,
+                            revision=revision,
+                            exclude=config.exclude,
+                            max_file_bytes=config.max_file_bytes,
+                        )
+                        taint_path = report_data["taint_path"]
+                        evidence = [
+                            FindingEvidenceInput(
+                                evidence_type=str(item["type"])[:64],
+                                path=str(item["file"]),
+                                start_line=int(item["line"]),
+                                end_line=int(item["end_line"]),
+                                redacted_content=str(item["code"]),
+                                content_hash=hashlib.sha256(str(item["code"]).encode("utf-8")).hexdigest(),
+                                provenance=str(item["provenance"])[:128],
+                            )
+                            for item in taint_path
+                        ]
+                        dependencies = _finding_dependencies(
+                            finding,
+                            persisted_ir[1] if persisted_ir is not None else [],
+                        )
+                        validation_data = {
+                            "deep_hunt": finding.metadata.get("deep_hunt", {}),
+                            "classification_references": finding.metadata.get("classification_references", []),
+                            "evidence_packet": finding.metadata.get("evidence_packet", {}),
+                            "route_depth": finding.metadata.get("route_depth", ""),
+                            "route_task_class": finding.metadata.get("route_task_class", ""),
+                        }
+                        repository.save_finding(
+                            finding_id,
+                            codebase_id,
+                            scan_id,
+                            finding.fingerprint,
+                            finding.title,
+                            finding.vulnerability_class,
+                            finding.severity.value,
+                            finding.state.value,
+                            finding.confidence,
+                            finding.message,
+                            finding.impact,
+                            finding.remediation,
+                            validation_data,
+                            evidence,
+                            dependencies,
+                        )
+                        repository.save_scan_finding(
+                            scan_id=scan_id,
+                            finding_id=finding_id,
+                            fingerprint=finding.fingerprint,
+                            severity=finding.severity.value,
+                            category=finding.vulnerability_class,
+                            cwe_id=report_data["cwe_id"],
+                            owasp_category=report_data["owasp_category"],
+                            report_schema_version=report_data["schema_version"],
+                            report_data=report_data,
+                        )
+                        persistence_findings_saved += 1
+
+                    result_summary = {
+                        "schema_version": 1,
+                        "scan_status": result.scan_status.value,
+                        "finding_count": len(findings),
+                        "findings_summary": result.to_dict()["findings_summary"],
+                        "policy": {
+                            "decision": policy.decision.value,
+                            "reasons": [str(reason)[:1000] for reason in policy.reasons[:32]],
+                        },
+                        "metrics": {
+                            key: value for key, value in result.metrics.items() if not key.startswith("persistence_")
+                        },
+                    }
+                    persistence_scan_finalized = repository.finish_scan(
+                        scan_id,
+                        coverage_complete=result.scan_status.value == "SUCCESSFUL",
+                        failure_code="" if result.scan_status.value == "SUCCESSFUL" else "ai_scan_incomplete",
+                        scan_status=result.scan_status.value,
+                        result_summary=result_summary,
+                    )
+
+                    usage_by_model = getattr(
+                        getattr(deep_hunt_agent, "model_budget", None),
+                        "usage_by_model",
+                        dict,
+                    )()
+                    usage_run = uuid.uuid4().hex
+                    for model_alias, (
+                        input_tokens,
+                        output_tokens,
+                        cost_usd,
+                    ) in usage_by_model.items():
+                        repository.record_model_usage(
+                            stable_id("usage", scan_id, usage_run, model_alias),
+                            scan_id,
+                            model_alias,
+                            input_tokens,
+                            output_tokens,
+                            cost_usd,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                persistence_finding_error_type = type(exc).__name__
+                persistence_finding_error = str(exc)[:240]
+                persistence_error_type = persistence_error_type or persistence_finding_error_type
+                persistence_error = persistence_error or persistence_finding_error
+                try:
+                    with unit_of_work(self.session_factory, self.tenant_id) as repository:
+                        persistence_scan_finalized = repository.finish_scan(
+                            scan_id,
+                            coverage_complete=False,
+                            failure_code="finding_persistence_failed",
+                            scan_status="UNSUCCESSFUL",
+                            result_summary={
+                                "schema_version": 1,
+                                "scan_status": "UNSUCCESSFUL",
+                                "persistence_error_type": persistence_finding_error_type,
+                            },
+                        )
+                except Exception:
+                    persistence_scan_finalized = False
+        result.metrics.update(
+            {
+                "persistence_error_type": persistence_error_type,
+                "persistence_error": persistence_error,
+                "persistence_findings_saved": persistence_findings_saved,
+                "persistence_finding_error_type": persistence_finding_error_type,
+                "persistence_finding_error": persistence_finding_error,
+                "persistence_scan_finalized": persistence_scan_finalized,
+            }
         )
         if checkpoint is not None:
             checkpoint.close()

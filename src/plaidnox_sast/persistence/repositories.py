@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ from .models import (
     OverlaySymbolSummaryRecord,
     RepositoryContextRecord,
     ScanJobRecord,
+    ScanFindingRecord,
     ScanRunRecord,
     SecurityKnowledgeRecord,
     SecurityMemoryRecord,
@@ -115,6 +116,24 @@ class ScanRunValue:
     state: str
     mode: str
     workflow_version: str
+    scan_status: str = "RUNNING"
+    scan_parameters: dict[str, Any] = field(default_factory=dict)
+    result_summary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ScanFindingValue:
+    scan_finding_id: str
+    tenant_id: str
+    scan_id: str
+    finding_id: str | None
+    fingerprint: str
+    severity: str
+    category: str
+    cwe_id: int | None
+    owasp_category: str
+    report_schema_version: int
+    report_data: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,7 +431,16 @@ class CodeScanningRepository:
         )
         if existing is not None:
             return _scan_job_value(existing)
-        if not all(value.strip() for value in (request_key, codebase_external_key, revision, snapshot_uri, output_uri)):
+        if not all(
+            value.strip()
+            for value in (
+                request_key,
+                codebase_external_key,
+                revision,
+                snapshot_uri,
+                output_uri,
+            )
+        ):
             raise ProductionControlError("scan job identity, revision, snapshot URI, and output URI are required")
         if priority < 0:
             raise ProductionControlError("scan job priority must be nonnegative")
@@ -507,14 +535,21 @@ class CodeScanningRepository:
                 ScanJobRecord.tenant_id == self.tenant_id,
                 ScanJobRecord.state.in_(("queued", "leased")),
                 ScanJobRecord.attempt_count < ScanJobRecord.maximum_attempts,
-                or_(ScanJobRecord.lease_expires_at.is_(None), ScanJobRecord.lease_expires_at <= moment),
+                or_(
+                    ScanJobRecord.lease_expires_at.is_(None),
+                    ScanJobRecord.lease_expires_at <= moment,
+                ),
             ]
             if considered:
                 filters.append(ScanJobRecord.job_id.not_in(considered))
             candidate_id = self.session.scalar(
                 select(ScanJobRecord.job_id)
                 .where(*filters)
-                .order_by(ScanJobRecord.priority, ScanJobRecord.created_at, ScanJobRecord.job_id)
+                .order_by(
+                    ScanJobRecord.priority,
+                    ScanJobRecord.created_at,
+                    ScanJobRecord.job_id,
+                )
                 .limit(1)
             )
             if candidate_id is None:
@@ -527,7 +562,10 @@ class CodeScanningRepository:
                     ScanJobRecord.tenant_id == self.tenant_id,
                     ScanJobRecord.state.in_(("queued", "leased")),
                     ScanJobRecord.attempt_count < ScanJobRecord.maximum_attempts,
-                    or_(ScanJobRecord.lease_expires_at.is_(None), ScanJobRecord.lease_expires_at <= moment),
+                    or_(
+                        ScanJobRecord.lease_expires_at.is_(None),
+                        ScanJobRecord.lease_expires_at <= moment,
+                    ),
                 )
                 .values(
                     state="leased",
@@ -669,14 +707,9 @@ class CodeScanningRepository:
 
     def list_source_files(self, snapshot_id: str) -> list[SourceFileInput]:
         records = self.session.scalars(
-            select(SourceFileRecord)
-            .where(SourceFileRecord.snapshot_id == snapshot_id)
-            .order_by(SourceFileRecord.path)
+            select(SourceFileRecord).where(SourceFileRecord.snapshot_id == snapshot_id).order_by(SourceFileRecord.path)
         ).all()
-        return [
-            SourceFileInput(item.path, item.language, item.content_hash, item.size_bytes)
-            for item in records
-        ]
+        return [SourceFileInput(item.path, item.language, item.content_hash, item.size_bytes) for item in records]
 
     def get_repository_context(self, snapshot_id: str) -> dict[str, object] | None:
         record = self.session.scalar(
@@ -769,9 +802,7 @@ class CodeScanningRepository:
         """Remove a just-indexed full summary set before storing its sparse overlay delta."""
         if self.get_snapshot(snapshot_id) is None:
             raise PersistenceConflictError("snapshot does not exist in the tenant scope")
-        self.session.execute(
-            delete(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id)
-        )
+        self.session.execute(delete(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id))
 
     def start_scan(
         self,
@@ -780,6 +811,7 @@ class CodeScanningRepository:
         snapshot_id: str,
         mode: str,
         workflow_version: str,
+        scan_parameters: dict[str, Any] | None = None,
     ) -> ScanRunValue:
         existing = self.session.scalar(
             select(ScanRunRecord).where(
@@ -793,6 +825,10 @@ class CodeScanningRepository:
             if existing.state != "completed":
                 existing.state = "running"
                 existing.failure_code = ""
+                existing.scan_status = "RUNNING"
+                existing.scan_parameters = redact_payload(scan_parameters or {})
+                existing.result_summary = {}
+                existing.finished_at = None
                 self.session.flush()
             return _scan_value(existing)
         snapshot = self.get_snapshot(snapshot_id)
@@ -808,13 +844,36 @@ class CodeScanningRepository:
             workflow_version=workflow_version,
             coverage_complete=False,
             failure_code="",
+            scan_status="RUNNING",
+            scan_parameters=redact_payload(scan_parameters or {}),
+            result_summary={},
         )
         self.session.add(record)
         self.session.flush()
         return _scan_value(record)
 
-    def finish_scan(self, scan_id: str, *, coverage_complete: bool, failure_code: str = "") -> bool:
+    def get_scan(self, scan_id: str) -> ScanRunValue | None:
+        record = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        return _scan_value(record) if record is not None else None
+
+    def finish_scan(
+        self,
+        scan_id: str,
+        *,
+        coverage_complete: bool,
+        failure_code: str = "",
+        scan_status: str | None = None,
+        result_summary: dict[str, Any] | None = None,
+    ) -> bool:
         state = "completed" if coverage_complete else "incomplete"
+        normalized_status = scan_status or ("SUCCESSFUL" if coverage_complete else "UNSUCCESSFUL")
+        if normalized_status not in {"SUCCESSFUL", "UNSUCCESSFUL"}:
+            raise ValueError("scan_status must be SUCCESSFUL or UNSUCCESSFUL")
         result = self.session.execute(
             update(ScanRunRecord)
             .where(
@@ -825,10 +884,80 @@ class CodeScanningRepository:
                 state=state,
                 coverage_complete=coverage_complete,
                 failure_code=failure_code.strip()[:128],
+                scan_status=normalized_status,
+                result_summary=redact_payload(result_summary or {}),
+                finished_at=datetime.now(UTC),
             )
         )
         self.session.flush()
         return result.rowcount == 1
+
+    def save_scan_finding(
+        self,
+        *,
+        scan_id: str,
+        finding_id: str | None,
+        fingerprint: str,
+        severity: str,
+        category: str,
+        cwe_id: int | None,
+        owasp_category: str,
+        report_schema_version: int,
+        report_data: dict[str, Any],
+    ) -> ScanFindingValue:
+        """Persist the finding's reportable fields and evidence snapshot for this run."""
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None:
+            raise PersistenceConflictError("scan does not exist in the tenant scope")
+        if report_schema_version < 1 or cwe_id is not None and cwe_id < 1:
+            raise ValueError("report schema version and CWE identifiers must be positive")
+        record = self.session.scalar(
+            select(ScanFindingRecord).where(
+                ScanFindingRecord.scan_id == scan_id,
+                ScanFindingRecord.fingerprint == fingerprint,
+                ScanFindingRecord.tenant_id == self.tenant_id,
+            )
+        )
+        values = dict(
+            finding_id=finding_id,
+            severity=severity.strip().lower()[:32],
+            category=category.strip()[:255],
+            cwe_id=cwe_id,
+            owasp_category=owasp_category.strip()[:255],
+            report_schema_version=report_schema_version,
+            report_data=redact_payload(report_data),
+        )
+        if record is None:
+            record = ScanFindingRecord(
+                scan_finding_id=stable_id("scan-finding", scan_id, fingerprint),
+                tenant_id=self.tenant_id,
+                scan_id=scan_id,
+                fingerprint=fingerprint,
+                **values,
+            )
+            self.session.add(record)
+        else:
+            for name, value in values.items():
+                setattr(record, name, value)
+        self.session.flush()
+        return _scan_finding_value(record)
+
+    def scan_findings(self, scan_id: str) -> list[ScanFindingValue]:
+        """Load the complete, tenant-scoped finding snapshots for a scan run."""
+        rows = self.session.scalars(
+            select(ScanFindingRecord)
+            .where(
+                ScanFindingRecord.scan_id == scan_id,
+                ScanFindingRecord.tenant_id == self.tenant_id,
+            )
+            .order_by(ScanFindingRecord.severity, ScanFindingRecord.fingerprint)
+        ).all()
+        return [_scan_finding_value(row) for row in rows]
 
     def record_model_usage(
         self,
@@ -884,9 +1013,7 @@ class CodeScanningRepository:
 
         self.tenant_controls()
         record = self.session.scalar(
-            select(TenantControlRecord)
-            .where(TenantControlRecord.tenant_id == self.tenant_id)
-            .with_for_update()
+            select(TenantControlRecord).where(TenantControlRecord.tenant_id == self.tenant_id).with_for_update()
         )
         return _tenant_control_value(record)
 
@@ -1095,9 +1222,7 @@ class CodeScanningRepository:
         self.session.flush()
         return True
 
-    def save_security_summaries(
-        self, snapshot_id: str, summaries: Iterable[dict[str, Any]]
-    ) -> int:
+    def save_security_summaries(self, snapshot_id: str, summaries: Iterable[dict[str, Any]]) -> int:
         """Persist immutable content-versioned summaries for one tenant snapshot."""
         if self.get_snapshot(snapshot_id) is None:
             raise PersistenceConflictError("snapshot does not exist in the tenant scope")
@@ -1108,23 +1233,21 @@ class CodeScanningRepository:
             validate_security_contract("security_summary", data)
             if data["symbol_id"] != symbol_id_value:
                 raise PersistenceConflictError("summary key does not match its symbol identity")
-        existing_rows = self.session.execute(
-            select(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id)
-        ).scalars().all()
+        existing_rows = (
+            self.session.execute(select(SymbolSummaryRecord).where(SymbolSummaryRecord.snapshot_id == snapshot_id))
+            .scalars()
+            .all()
+        )
         existing = {item.symbol_id: item for item in existing_rows}
         if existing and set(existing) != set(incoming):
-            raise PersistenceConflictError(
-                "immutable snapshot has a conflicting symbol summary set"
-            )
+            raise PersistenceConflictError("immutable snapshot has a conflicting symbol summary set")
         inserted = 0
         for symbol_id_value, data in incoming.items():
             content_hash = str(data.get("content_hash", ""))
             prior = existing.get(symbol_id_value)
             if prior is not None:
                 if prior.content_hash != content_hash or prior.summary_data != data:
-                    raise PersistenceConflictError(
-                        "immutable snapshot has conflicting symbol summary data"
-                    )
+                    raise PersistenceConflictError("immutable snapshot has conflicting symbol summary data")
                 continue
             record_id = stable_id("summary", snapshot_id, symbol_id_value)
             self.session.add(
@@ -1144,11 +1267,15 @@ class CodeScanningRepository:
         """Load summaries only from an existing tenant-owned snapshot."""
         if self.get_snapshot(snapshot_id) is None:
             raise PersistenceConflictError("snapshot does not exist in the tenant scope")
-        rows = self.session.execute(
-            select(SymbolSummaryRecord.summary_data)
-            .where(SymbolSummaryRecord.snapshot_id == snapshot_id)
-            .order_by(SymbolSummaryRecord.symbol_id)
-        ).scalars().all()
+        rows = (
+            self.session.execute(
+                select(SymbolSummaryRecord.summary_data)
+                .where(SymbolSummaryRecord.snapshot_id == snapshot_id)
+                .order_by(SymbolSummaryRecord.symbol_id)
+            )
+            .scalars()
+            .all()
+        )
         return [dict(item) for item in rows]
 
     def save_overlay_security_summaries(
@@ -1182,15 +1309,21 @@ class CodeScanningRepository:
         expected: dict[str, tuple[str, str | None, dict[str, Any] | None]] = {}
         for symbol_id_value, data in incoming.items():
             if base.get(symbol_id_value) != data:
-                expected[symbol_id_value] = ("active", str(data.get("content_hash", "")), data)
+                expected[symbol_id_value] = (
+                    "active",
+                    str(data.get("content_hash", "")),
+                    data,
+                )
         for symbol_id_value in set(base) - set(incoming):
             expected[symbol_id_value] = ("deleted", None, None)
 
-        existing_rows = self.session.execute(
-            select(OverlaySymbolSummaryRecord).where(
-                OverlaySymbolSummaryRecord.snapshot_id == snapshot_id
+        existing_rows = (
+            self.session.execute(
+                select(OverlaySymbolSummaryRecord).where(OverlaySymbolSummaryRecord.snapshot_id == snapshot_id)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         existing = {item.symbol_id: item for item in existing_rows}
         if existing and set(existing) != set(expected):
             raise PersistenceConflictError("immutable summary overlay has a conflicting delta set")
@@ -1199,7 +1332,11 @@ class CodeScanningRepository:
         for symbol_id_value, (state, content_hash, data) in expected.items():
             prior = existing.get(symbol_id_value)
             if prior is not None:
-                if (prior.summary_state, prior.content_hash, prior.summary_data) != (state, content_hash, data):
+                if (prior.summary_state, prior.content_hash, prior.summary_data) != (
+                    state,
+                    content_hash,
+                    data,
+                ):
                     raise PersistenceConflictError("immutable summary overlay has conflicting data")
                 continue
             self.session.add(
@@ -1241,11 +1378,13 @@ class CodeScanningRepository:
             ).all()
             for row in base_rows:
                 effective[row.symbol_id] = dict(row.summary_data)
-            overlay_rows = self.session.execute(
-                select(OverlaySymbolSummaryRecord).where(
-                    OverlaySymbolSummaryRecord.snapshot_id == revision_id
+            overlay_rows = (
+                self.session.execute(
+                    select(OverlaySymbolSummaryRecord).where(OverlaySymbolSummaryRecord.snapshot_id == revision_id)
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for row in overlay_rows:
                 if row.summary_state == "deleted":
                     effective.pop(row.symbol_id, None)
@@ -1255,9 +1394,11 @@ class CodeScanningRepository:
 
     def list_symbol_identities(self, snapshot_id: str) -> list[SymbolIdentity]:
         rows = self.session.execute(
-            select(SymbolRecord.symbol_id, SymbolRecord.stable_key, SymbolRecord.content_hash).where(
-                SymbolRecord.snapshot_id == snapshot_id
-            )
+            select(
+                SymbolRecord.symbol_id,
+                SymbolRecord.stable_key,
+                SymbolRecord.content_hash,
+            ).where(SymbolRecord.snapshot_id == snapshot_id)
         ).all()
         return [SymbolIdentity(row.symbol_id, row.stable_key, row.content_hash) for row in rows]
 
@@ -1268,7 +1409,10 @@ class CodeScanningRepository:
         rows = (
             self.session.execute(
                 select(FindingDependencyRecord.finding_id)
-                .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+                .join(
+                    FindingRecord,
+                    FindingRecord.finding_id == FindingDependencyRecord.finding_id,
+                )
                 .where(
                     FindingRecord.tenant_id == self.tenant_id,
                     FindingRecord.codebase_id == codebase_id,
@@ -1299,8 +1443,14 @@ class CodeScanningRepository:
         stable_key_by_symbol_id = {item.symbol_id: item.stable_key for item in symbols}
 
         recorded = self.session.execute(
-            select(FindingDependencyRecord.dependency_key, FindingDependencyRecord.dependency_hash)
-            .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+            select(
+                FindingDependencyRecord.dependency_key,
+                FindingDependencyRecord.dependency_hash,
+            )
+            .join(
+                FindingRecord,
+                FindingRecord.finding_id == FindingDependencyRecord.finding_id,
+            )
             .where(
                 FindingRecord.tenant_id == self.tenant_id,
                 FindingRecord.codebase_id == codebase_id,
@@ -1338,7 +1488,10 @@ class CodeScanningRepository:
             return 0
         result = self.session.execute(
             update(FindingRecord)
-            .where(FindingRecord.finding_id.in_(ids), FindingRecord.tenant_id == self.tenant_id)
+            .where(
+                FindingRecord.finding_id.in_(ids),
+                FindingRecord.tenant_id == self.tenant_id,
+            )
             .values(state="discovered")
         )
         self.session.flush()
@@ -1370,9 +1523,11 @@ class CodeScanningRepository:
             query = query.where(SymbolRecord.symbol_id.in_(selected_ids))
         if selected_paths:
             query = query.where(SymbolRecord.path.in_(selected_paths))
-        rows = self.session.execute(
-            query.order_by(SymbolRecord.path, SymbolRecord.start_line, SymbolRecord.symbol_id)
-        ).scalars().all()
+        rows = (
+            self.session.execute(query.order_by(SymbolRecord.path, SymbolRecord.start_line, SymbolRecord.symbol_id))
+            .scalars()
+            .all()
+        )
         return [
             SymbolValue(
                 symbol_id=row.symbol_id,
@@ -1466,22 +1621,26 @@ class CodeScanningRepository:
         codebase_id: str,
         category: str,
     ) -> list[SecurityMemoryValue]:
-        rows = self.session.execute(
-            select(SecurityMemoryRecord)
-            .where(
-                SecurityMemoryRecord.tenant_id == self.tenant_id,
-                SecurityMemoryRecord.status == "active",
-                or_(
-                    SecurityMemoryRecord.codebase_id == codebase_id,
-                    SecurityMemoryRecord.codebase_id.is_(None),
-                ),
-                or_(
-                    SecurityMemoryRecord.category == category,
-                    SecurityMemoryRecord.category == "all",
-                ),
+        rows = (
+            self.session.execute(
+                select(SecurityMemoryRecord)
+                .where(
+                    SecurityMemoryRecord.tenant_id == self.tenant_id,
+                    SecurityMemoryRecord.status == "active",
+                    or_(
+                        SecurityMemoryRecord.codebase_id == codebase_id,
+                        SecurityMemoryRecord.codebase_id.is_(None),
+                    ),
+                    or_(
+                        SecurityMemoryRecord.category == category,
+                        SecurityMemoryRecord.category == "all",
+                    ),
+                )
+                .order_by(SecurityMemoryRecord.memory_id)
             )
-            .order_by(SecurityMemoryRecord.memory_id)
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return [_security_memory_value(row) for row in rows]
 
     def link_finding_symbols(
@@ -1537,18 +1696,25 @@ class CodeScanningRepository:
         keys = [item.stable_key for item in symbols]
         if not keys:
             return []
-        rows = self.session.execute(
-            select(FindingRecord.fingerprint)
-            .join(FindingDependencyRecord, FindingDependencyRecord.finding_id == FindingRecord.finding_id)
-            .where(
-                FindingRecord.tenant_id == self.tenant_id,
-                FindingRecord.codebase_id == codebase_id,
-                FindingDependencyRecord.dependency_type == "symbol",
-                FindingDependencyRecord.dependency_key.in_(keys),
+        rows = (
+            self.session.execute(
+                select(FindingRecord.fingerprint)
+                .join(
+                    FindingDependencyRecord,
+                    FindingDependencyRecord.finding_id == FindingRecord.finding_id,
+                )
+                .where(
+                    FindingRecord.tenant_id == self.tenant_id,
+                    FindingRecord.codebase_id == codebase_id,
+                    FindingDependencyRecord.dependency_type == "symbol",
+                    FindingDependencyRecord.dependency_key.in_(keys),
+                )
+                .distinct()
+                .order_by(FindingRecord.fingerprint)
             )
-            .distinct()
-            .order_by(FindingRecord.fingerprint)
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return list(rows)
 
     def create_hunt_plan(
@@ -1778,7 +1944,10 @@ class CodeScanningRepository:
     def list_investigations(self, scan_id: str) -> list[InvestigationValue]:
         rows = self.session.scalars(
             select(InvestigationRecord)
-            .where(InvestigationRecord.tenant_id == self.tenant_id, InvestigationRecord.scan_id == scan_id)
+            .where(
+                InvestigationRecord.tenant_id == self.tenant_id,
+                InvestigationRecord.scan_id == scan_id,
+            )
             .order_by(InvestigationRecord.created_at, InvestigationRecord.investigation_id)
         ).all()
         return [_investigation_value(row) for row in rows]
@@ -1800,7 +1969,10 @@ class CodeScanningRepository:
             filters = [
                 HuntTaskRecord.plan_id == plan_id,
                 HuntTaskRecord.state.in_(("planned", "leased")),
-                or_(HuntTaskRecord.lease_expires_at.is_(None), HuntTaskRecord.lease_expires_at <= moment),
+                or_(
+                    HuntTaskRecord.lease_expires_at.is_(None),
+                    HuntTaskRecord.lease_expires_at <= moment,
+                ),
             ]
             if considered:
                 filters.append(HuntTaskRecord.task_id.not_in(considered))
@@ -1815,7 +1987,10 @@ class CodeScanningRepository:
                 .where(
                     HuntTaskRecord.task_id == candidate_id,
                     HuntTaskRecord.state.in_(("planned", "leased")),
-                    or_(HuntTaskRecord.lease_expires_at.is_(None), HuntTaskRecord.lease_expires_at <= moment),
+                    or_(
+                        HuntTaskRecord.lease_expires_at.is_(None),
+                        HuntTaskRecord.lease_expires_at <= moment,
+                    ),
                 )
                 .values(
                     state="leased",
@@ -1893,28 +2068,28 @@ class CodeScanningRepository:
                 codebase_id=codebase_id,
                 scan_id=scan_id,
                 fingerprint=fingerprint,
-                title=title,
+                title=redact_payload(title),
                 vulnerability_class=vulnerability_class,
                 severity=severity,
                 state=state,
                 confidence=confidence,
-                summary=summary,
-                impact=impact,
-                remediation=remediation,
-                validation=validation,
+                summary=redact_payload(summary),
+                impact=redact_payload(impact),
+                remediation=redact_payload(remediation),
+                validation=redact_payload(validation),
             )
             self.session.add(record)
         else:
             record.scan_id = scan_id
-            record.title = title
+            record.title = redact_payload(title)
             record.vulnerability_class = vulnerability_class
             record.severity = severity
             record.state = state
             record.confidence = confidence
-            record.summary = summary
-            record.impact = impact
-            record.remediation = remediation
-            record.validation = validation
+            record.summary = redact_payload(summary)
+            record.impact = redact_payload(impact)
+            record.remediation = redact_payload(remediation)
+            record.validation = redact_payload(validation)
         self.session.flush()
 
         self.session.execute(delete(FindingEvidenceRecord).where(FindingEvidenceRecord.finding_id == record.finding_id))
@@ -1922,6 +2097,7 @@ class CodeScanningRepository:
             delete(FindingDependencyRecord).where(FindingDependencyRecord.finding_id == record.finding_id)
         )
         for sequence, item in enumerate(evidence):
+            safe_content = str(redact_payload(item.redacted_content))
             self.session.add(
                 FindingEvidenceRecord(
                     evidence_id=f"ev-{_hash(record.finding_id, str(sequence))}",
@@ -1931,8 +2107,8 @@ class CodeScanningRepository:
                     path=item.path,
                     start_line=item.start_line,
                     end_line=item.end_line,
-                    redacted_content=item.redacted_content,
-                    content_hash=item.content_hash,
+                    redacted_content=safe_content,
+                    content_hash=hashlib.sha256(safe_content.encode("utf-8")).hexdigest(),
                     provenance=item.provenance,
                 )
             )
@@ -2155,7 +2331,10 @@ def security_ir_inputs(
         entries = sorted(symbols_by_path.get(file_ir.path, []), key=lambda item: item.line)
         if not any(entry.kind != "route" for entry in entries):
             # Routes alone leave module-level code unowned; keep the file symbol too.
-            entries = [*entries, Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file")]
+            entries = [
+                *entries,
+                Symbol(Path(file_ir.path).stem, file_ir.path, 1, max(1, len(lines)), "file"),
+            ]
         stable_key_by_symbol = stable_symbol_keys(entries)
         for entry in entries:
             name = entry.qualified_name or entry.name
@@ -2176,7 +2355,12 @@ def security_ir_inputs(
                     signature=entry.signature,
                 )
             )
-            aliases = {entry.name, name, entry.name.rsplit(".", 1)[-1], name.rsplit(".", 1)[-1]}
+            aliases = {
+                entry.name,
+                name,
+                entry.name.rsplit(".", 1)[-1],
+                name.rsplit(".", 1)[-1],
+            }
             for alias in aliases:
                 stable_keys_by_path_name.setdefault((file_ir.path, alias), []).append(stable_key)
                 stable_keys_by_name.setdefault(alias, []).append(stable_key)
@@ -2262,6 +2446,25 @@ def _scan_value(record: ScanRunRecord) -> ScanRunValue:
         record.state,
         record.mode,
         record.workflow_version,
+        record.scan_status,
+        record.scan_parameters,
+        record.result_summary,
+    )
+
+
+def _scan_finding_value(record: ScanFindingRecord) -> ScanFindingValue:
+    return ScanFindingValue(
+        scan_finding_id=record.scan_finding_id,
+        tenant_id=record.tenant_id,
+        scan_id=record.scan_id,
+        finding_id=record.finding_id,
+        fingerprint=record.fingerprint,
+        severity=record.severity,
+        category=record.category,
+        cwe_id=record.cwe_id,
+        owasp_category=record.owasp_category,
+        report_schema_version=record.report_schema_version,
+        report_data=record.report_data,
     )
 
 

@@ -162,6 +162,7 @@ class ScanResult:
     policy: PolicyResult
     metrics: dict[str, Any]
     repository_context: dict[str, Any] = field(default_factory=dict)
+    scan_id: str = ""
 
     @property
     def scan_status(self) -> ScanStatus:
@@ -182,9 +183,7 @@ class ScanResult:
         if "ai_required_coverage_unresolved" not in self.metrics:
             # Compatibility for stored reports produced before global coverage
             # reconciliation was introduced.
-            incomplete = incomplete or int(
-                self.metrics.get("ai_discovery_unresolved_obligations", 0) or 0
-            ) > 0
+            incomplete = incomplete or int(self.metrics.get("ai_discovery_unresolved_obligations", 0) or 0) > 0
         incomplete = incomplete or any(int(self.metrics.get(key, 0) or 0) > 0 for key in required_failures)
         return ScanStatus.UNSUCCESSFUL if incomplete else ScanStatus.SUCCESSFUL
 
@@ -194,9 +193,6 @@ class ScanResult:
         value["scan_status"] = self.scan_status.value
         value["findings_summary"] = {
             "total": len(self.findings),
-            **{
-                severity.value: sum(finding.severity is severity for finding in self.findings)
-                for severity in Severity
-            },
+            **{severity.value: sum(finding.severity is severity for finding in self.findings) for severity in Severity},
         }
         return value

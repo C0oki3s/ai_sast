@@ -374,6 +374,11 @@ Status: implemented and verified against the checked-in PostgreSQL migration.
 - Apply independently reviewable PostgreSQL migrations.
 - Run Context Fabric, knowledge, hunt plans/tasks, findings, evidence, and
   exact symbol dependencies through PostgreSQL repositories in production.
+- Persist each invocation's scan parameters and final result summary, plus a
+  versioned per-scan finding snapshot containing classification references,
+  redacted affected code, Deep Hunt gates, and taint-path code/evidence. A
+  rescan of the same revision receives a distinct scan ID and preserves its
+  own result history.
 - Add tenant isolation keys, optimistic concurrency, timestamps, retention
   state, indexes, transaction tests, and backup/restore verification.
 - Keep SQLite only for isolated unit tests or an explicitly labelled local mode.
