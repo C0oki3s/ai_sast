@@ -17,7 +17,11 @@ from .graph_targets import (
     map_repository_surfaces_to_graph,
 )
 from .graphify_adapter import CodeGraphSnapshot
-from .investigations import Investigation, bind_storage_snapshot, validate_investigation
+from .investigations import (
+    Investigation,
+    bind_storage_snapshot,
+    investigation_from_payload,
+)
 from .persistence.repositories import (
     InvestigationValue,
     PersistenceConflictError,
@@ -43,6 +47,7 @@ class GraphSurfacePlanningResult:
     planning_gaps: tuple[GraphSurfacePlanningGap, ...]
     reused_groups: int = 0
     persisted_groups: int = 0
+    reused_group_ids: tuple[str, ...] = ()
 
     @property
     def mapping_gap_count(self) -> int:
@@ -79,6 +84,19 @@ class InvestigationOrmStore:
     ) -> SurfacePlanningValue:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.complete_surface_planning(scan_id, snapshot_id)
+
+    def record_group_status(
+        self,
+        scan_id: str,
+        snapshot_id: str,
+        group_id: str,
+        status: str,
+        investigation_id: str | None = None,
+    ) -> SurfacePlanningValue:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.record_surface_planning_group(
+                scan_id, snapshot_id, group_id, status, investigation_id
+            )
 
 
 class GraphSurfacePlanningCoordinator:
@@ -122,6 +140,7 @@ class GraphSurfacePlanningCoordinator:
         investigations: list[Investigation] = []
         gaps: list[GraphSurfacePlanningGap] = []
         reused_groups = 0
+        reused_group_ids: list[str] = []
         persisted_groups = 0
         durable_snapshot_id = storage_snapshot_id or graph_snapshot.snapshot_id
         existing_by_stable_key: dict[str, InvestigationValue] = {}
@@ -163,13 +182,36 @@ class GraphSurfacePlanningCoordinator:
                     )
                 investigations.append(investigation)
                 reused_groups += 1
+                reused_group_ids.append(group.group_id)
+                if self.persistence is not None:
+                    assert scan_id is not None
+                    self.persistence.record_group_status(
+                        scan_id,
+                        durable_snapshot_id,
+                        group.group_id,
+                        "reused",
+                        investigation.investigation_id,
+                    )
                 continue
-            investigation = self.plan_group(
-                codebase_id=codebase_id,
-                target_node_ids=group.node_ids,
-                surface_context=group.surface_context,
-                stable_key=group.group_id,
-            )
+            if self.persistence is not None:
+                assert scan_id is not None
+                self.persistence.record_group_status(
+                    scan_id, durable_snapshot_id, group.group_id, "planning"
+                )
+            try:
+                investigation = self.plan_group(
+                    codebase_id=codebase_id,
+                    target_node_ids=group.node_ids,
+                    surface_context=group.surface_context,
+                    stable_key=group.group_id,
+                )
+            except Exception:
+                if self.persistence is not None:
+                    assert scan_id is not None
+                    self.persistence.record_group_status(
+                        scan_id, durable_snapshot_id, group.group_id, "failed"
+                    )
+                raise
             if investigation.stable_key != group.group_id:
                 raise PersistenceConflictError(
                     "planner returned an investigation for a different graph surface group"
@@ -180,6 +222,15 @@ class GraphSurfacePlanningCoordinator:
                 self.persistence.save(scan_id, investigation)
                 persisted_groups += 1
             investigations.append(investigation)
+            if self.persistence is not None:
+                assert scan_id is not None
+                self.persistence.record_group_status(
+                    scan_id,
+                    durable_snapshot_id,
+                    group.group_id,
+                    "planned",
+                    investigation.investigation_id,
+                )
         if self.persistence is not None:
             assert scan_id is not None
             self.persistence.complete_surface_plan(scan_id, durable_snapshot_id)
@@ -191,22 +242,12 @@ class GraphSurfacePlanningCoordinator:
             planning_gaps=tuple(gaps),
             reused_groups=reused_groups,
             persisted_groups=persisted_groups,
+            reused_group_ids=tuple(reused_group_ids),
         )
 
 
 def _restore_investigation(value: InvestigationValue) -> Investigation:
-    data = dict(value.investigation_data)
-    for field in (
-        "security_questions",
-        "graph_refs",
-        "source_windows",
-        "context_dependencies",
-        "coverage_notes",
-        "prior_evidence_refs",
-    ):
-        data[field] = tuple(data[field])
-    investigation = Investigation(**data)
-    validate_investigation(investigation)
+    investigation = investigation_from_payload(dict(value.investigation_data))
     if (
         investigation.investigation_id != value.investigation_id
         or investigation.snapshot_id != value.snapshot_id
@@ -254,11 +295,8 @@ def _surface_plan_data(
                 "group_id": group.group_id,
                 "surface_keys": list(group.surface_keys),
                 "node_ids": list(group.node_ids),
-                "planning_status": (
-                    "gap"
-                    if group.group_id in oversized_group_ids
-                    else "eligible_for_planning"
-                ),
+                "planning_status": "gap" if group.group_id in oversized_group_ids else "pending",
+                "investigation_id": None,
             }
             for group in grouping.groups
         ],

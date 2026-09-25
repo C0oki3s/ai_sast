@@ -16,7 +16,7 @@ from plaidnox_sast.graph_surface_planning import (
 )
 from plaidnox_sast.graphify_adapter import CodeEdge, CodeGraphSnapshot, CodeNode
 from plaidnox_sast.persistence.models import Base
-from plaidnox_sast.persistence.repositories import unit_of_work
+from plaidnox_sast.persistence.repositories import PersistenceConflictError, unit_of_work
 
 
 def _snapshot(root: Path, *, connected: bool) -> CodeGraphSnapshot:
@@ -192,13 +192,11 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     assert interrupted.state == "planning"
     assert interrupted.planning_data["mapping_counts"]["no_location"] == 1
     assert len(interrupted.planning_data["unmapped_surface_keys"]) == 1
+    assert interrupted.planning_data["groups"][0]["planning_status"] == "failed"
+    with pytest.raises(PersistenceConflictError, match="groups remain unresolved"):
+        persistence.complete_surface_plan("scan-a", snapshot.snapshot_id)
 
     first = coordinator.plan(**arguments)
-    resumed = GraphSurfacePlanningCoordinator(
-        lambda **_arguments: pytest.fail("persisted investigation should be reused"),
-        persistence=persistence,
-    ).plan(**arguments)
-
     assert len(model_calls) == 1
     assert first.persisted_groups == 1
     assert first.reused_groups == 0
@@ -206,8 +204,13 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
         completed = repository.get_surface_planning("scan-a")
     assert completed is not None
     assert completed.state == "complete"
-    assert completed.revision == 2
-    assert completed.planning_data == interrupted.planning_data
+    assert completed.revision == 6
+    assert completed.planning_data["groups"][0]["planning_status"] == "planned"
+    assert completed.planning_data["groups"][0]["investigation_id"] == first.investigations[0].investigation_id
+    resumed = GraphSurfacePlanningCoordinator(
+        lambda **_arguments: pytest.fail("persisted investigation should be reused"),
+        persistence=persistence,
+    ).plan(**arguments)
     assert resumed.persisted_groups == 0
     assert resumed.reused_groups == 1
     assert (

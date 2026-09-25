@@ -1984,10 +1984,9 @@ class CodeScanningRepository:
             )
         )
         if existing is not None:
-            if (
-                existing.snapshot_id != snapshot_id
-                or existing.planning_data != planning_data
-            ):
+            if existing.snapshot_id != snapshot_id or _surface_plan_identity(
+                existing.planning_data
+            ) != _surface_plan_identity(planning_data):
                 raise PersistenceConflictError(
                     "surface planning identity has conflicting snapshot or coverage data"
                 )
@@ -2004,6 +2003,59 @@ class CodeScanningRepository:
         self.session.flush()
         return _surface_planning_value(record)
 
+    def record_surface_planning_group(
+        self,
+        scan_id: str,
+        snapshot_id: str,
+        group_id: str,
+        status: str,
+        investigation_id: str | None = None,
+    ) -> SurfacePlanningValue:
+        """Persist one group's planning state without changing its coverage identity."""
+        record = self.session.scalar(
+            select(SurfacePlanningRecord).where(
+                SurfacePlanningRecord.scan_id == scan_id,
+                SurfacePlanningRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None or record.snapshot_id != snapshot_id:
+            raise PersistenceConflictError(
+                "surface planning record does not exist for this tenant snapshot"
+            )
+        planning_data = dict(record.planning_data)
+        groups = [dict(item) for item in planning_data.get("groups", [])]
+        selected = next((item for item in groups if item.get("group_id") == group_id), None)
+        if selected is None:
+            raise PersistenceConflictError("surface planning group is not in the stored ledger")
+        allowed_statuses = {"pending", "planning", "planned", "reused", "failed", "gap"}
+        if status not in allowed_statuses:
+            raise PersistenceConflictError("surface planning group status is invalid")
+        current_status = str(selected.get("planning_status", "pending"))
+        if current_status == "eligible_for_planning":
+            current_status = "pending"
+        allowed_transitions = {
+            "pending": {"planning", "gap"},
+            "planning": {"planning", "planned", "failed"},
+            "failed": {"planning", "failed"},
+            "planned": {"planned", "reused", "planning"},
+            "reused": {"reused", "planning"},
+            "gap": {"gap"},
+        }
+        if status not in allowed_transitions.get(current_status, set()):
+            raise PersistenceConflictError(
+                f"surface planning group cannot transition from {current_status} to {status}"
+            )
+        if status == current_status and selected.get("investigation_id") == investigation_id:
+            return _surface_planning_value(record)
+        selected["planning_status"] = status
+        if investigation_id is not None:
+            selected["investigation_id"] = investigation_id
+        planning_data["groups"] = groups
+        record.planning_data = planning_data
+        record.revision += 1
+        self.session.flush()
+        return _surface_planning_value(record)
+
     def complete_surface_planning(
         self, scan_id: str, snapshot_id: str
     ) -> SurfacePlanningValue:
@@ -2017,6 +2069,15 @@ class CodeScanningRepository:
         if record is None or record.snapshot_id != snapshot_id:
             raise PersistenceConflictError(
                 "surface planning record does not exist for this tenant snapshot"
+            )
+        nonterminal_groups = [
+            str(group.get("group_id", ""))
+            for group in record.planning_data.get("groups", [])
+            if group.get("planning_status") not in {"planned", "reused", "gap"}
+        ]
+        if nonterminal_groups:
+            raise PersistenceConflictError(
+                "surface planning cannot complete while groups remain unresolved"
             )
         if record.state == "planning":
             record.state = "complete"
@@ -2664,3 +2725,17 @@ def _surface_planning_value(record: SurfacePlanningRecord) -> SurfacePlanningVal
         revision=record.revision,
         planning_data=dict(record.planning_data),
     )
+
+
+def _surface_plan_identity(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove mutable progress fields before comparing immutable plan identity."""
+    result = dict(value)
+    result["groups"] = [
+        {
+            key: item_value
+            for key, item_value in item.items()
+            if key not in {"planning_status", "investigation_id"}
+        }
+        for item in value.get("groups", [])
+    ]
+    return result

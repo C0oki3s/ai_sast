@@ -141,6 +141,23 @@ def bind_storage_snapshot(investigation: Investigation, snapshot_id: str) -> Inv
     return result
 
 
+def investigation_from_payload(value: dict[str, Any]) -> Investigation:
+    """Restore and validate a serialized investigation from a durable store."""
+    data = dict(value)
+    for field in (
+        "security_questions",
+        "graph_refs",
+        "source_windows",
+        "context_dependencies",
+        "coverage_notes",
+        "prior_evidence_refs",
+    ):
+        data[field] = tuple(data[field])
+    investigation = Investigation(**data)
+    validate_investigation(investigation)
+    return investigation
+
+
 def validate_investigation(value: Investigation | dict[str, Any]) -> None:
     payload = value.payload() if isinstance(value, Investigation) else value
     errors = sorted(

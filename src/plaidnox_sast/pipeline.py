@@ -33,6 +33,7 @@ from .graph import source_file_is_admitted
 from .graph_context import GraphContextBroker
 from .graph_surface_planning import GraphSurfacePlanningCoordinator, InvestigationOrmStore
 from .graphify_adapter import extract_structural_graph
+from .investigations import investigation_from_payload, validate_investigation
 from .routers import CandidateRouter
 from .models import (
     Depth,
@@ -448,6 +449,9 @@ class SastPipeline:
         graphify_investigation_count = 0
         graphify_mapping_gaps = 0
         graphify_planning_gaps = 0
+        graphify_checkpoint_reused = 0
+        graphify_checkpoint_saved = 0
+        graphify_checkpoint_reused_groups: set[str] = set()
         context_builder = getattr(deep_hunt_agent, "build_repository_context", None)
         planner = getattr(deep_hunt_agent, "plan_tasks", None)
         discovery = getattr(deep_hunt_agent, "discover_candidates", None)
@@ -543,7 +547,9 @@ class SastPipeline:
                 graphify_shadow_status = "running"
                 try:
                     graph_cache = (
-                        self.checkpoint_path.parent / "graphify-cache"
+                        self.checkpoint_path.parent
+                        / "graphify-cache"
+                        / _stable_id("graphify-cache", self.tenant_id, codebase, revision)
                         if self.checkpoint_path is not None
                         else None
                     )
@@ -557,6 +563,7 @@ class SastPipeline:
                     graphify_snapshot_id = graph_snapshot.snapshot_id
                     graphify_node_count = len(graph_snapshot.nodes)
                     graphify_edge_count = len(graph_snapshot.edges)
+                    graph_planning_context = context.to_dict()
                     graph_persistence = (
                         InvestigationOrmStore(self.session_factory, self.tenant_id)
                         if self.session_factory is not None and persistence_indexed
@@ -564,19 +571,99 @@ class SastPipeline:
                     )
 
                     def plan_graph_group(**arguments):
+                        nonlocal graphify_checkpoint_reused, graphify_checkpoint_saved
                         graph_planner = getattr(deep_hunt_agent, "plan_graph_investigation", None)
                         if not callable(graph_planner):
                             raise AIConfigurationError(
                                 "Deep Hunt agent does not provide Graphify investigation planning"
                             )
-                        arguments.pop("codebase_id", None)
-                        return graph_planner(
-                            context,
-                            codebase_id=codebase_id,
-                            graph_snapshot=graph_snapshot,
-                            context_broker=broker,
-                            **arguments,
+                        planning_identity = json.dumps(
+                            {
+                                "graph_snapshot_id": graph_snapshot.snapshot_id,
+                                "repository_context": graph_planning_context,
+                                "security_context": config.security_context,
+                                "surface_context": arguments.get("surface_context", ()),
+                                "stable_key": arguments.get("stable_key", ""),
+                                "target_node_ids": arguments.get("target_node_ids", ()),
+                            },
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            default=str,
+                            separators=(",", ":"),
                         )
+                        planning_context_hash = hashlib.sha256(
+                            planning_identity.encode("utf-8")
+                        ).hexdigest()
+                        checkpoint_key = unit_key(
+                            "graphify_investigation_plan",
+                            graph_snapshot.snapshot_id,
+                            arguments.get("stable_key", ""),
+                            planning_context_hash,
+                        )
+                        if checkpoint is not None:
+                            saved_investigation = checkpoint.get(
+                                "graphify_investigation_plan", checkpoint_key
+                            )
+                            if saved_investigation is not None:
+                                investigation = investigation_from_payload(saved_investigation)
+                                if (
+                                    investigation.graph_snapshot_id
+                                    != graph_snapshot.snapshot_id
+                                    or investigation.codebase_id != codebase_id
+                                    or investigation.stable_key != arguments.get("stable_key")
+                                ):
+                                    raise AIConfigurationError(
+                                        "checkpointed Graphify investigation does not match its source identity"
+                                    )
+                                graphify_checkpoint_reused += 1
+                                graphify_checkpoint_reused_groups.add(
+                                    investigation.stable_key
+                                )
+                                return investigation
+                        arguments.pop("codebase_id", None)
+                        if checkpoint is not None:
+                            checkpoint.begin(
+                                "graphify_investigation_plan",
+                                checkpoint_key,
+                                {
+                                    "graph_snapshot_id": graph_snapshot.snapshot_id,
+                                    "planning_context_hash": planning_context_hash,
+                                },
+                                {
+                                    "operation": "graphify_investigation_plan",
+                                    "work_identity": checkpoint_key,
+                                },
+                            )
+                        try:
+                            investigation = graph_planner(
+                                context,
+                                codebase_id=codebase_id,
+                                graph_snapshot=graph_snapshot,
+                                context_broker=broker,
+                                **arguments,
+                            )
+                            validate_investigation(investigation)
+                            if (
+                                investigation.codebase_id != codebase_id
+                                or investigation.graph_snapshot_id
+                                != graph_snapshot.snapshot_id
+                                or investigation.stable_key != arguments.get("stable_key")
+                            ):
+                                raise AIConfigurationError(
+                                    "Graphify investigation planner returned mismatched source identity"
+                                )
+                        except Exception as exc:
+                            if checkpoint is not None:
+                                checkpoint.fail("graphify_investigation_plan", checkpoint_key, type(exc).__name__)
+                            raise
+                        if checkpoint is not None:
+                            checkpoint.complete(
+                                "graphify_investigation_plan",
+                                checkpoint_key,
+                                investigation.payload(),
+                            )
+                            graphify_checkpoint_saved += 1
+                        return investigation
 
                     graph_result = GraphSurfacePlanningCoordinator(
                         plan_graph_group,
@@ -588,10 +675,71 @@ class SastPipeline:
                         graph_snapshot=graph_snapshot,
                         storage_snapshot_id=snapshot_id,
                     )
+                    if graph_persistence is not None and scan_id:
+                        persisted_by_group = {
+                            item.stable_key: item for item in graph_result.investigations
+                        }
+                        for group_id in graphify_checkpoint_reused_groups:
+                            investigation = persisted_by_group.get(group_id)
+                            if investigation is not None:
+                                graph_persistence.record_group_status(
+                                    scan_id,
+                                    snapshot_id,
+                                    group_id,
+                                    "reused",
+                                    investigation.investigation_id,
+                                )
                     graphify_surface_count = len(graph_result.inventory.targets)
                     graphify_investigation_count = len(graph_result.investigations)
                     graphify_mapping_gaps = graph_result.mapping_gap_count
                     graphify_planning_gaps = len(graph_result.planning_gaps)
+                    coverage_item_limit = int(
+                        load_json("runtime/code_intelligence.json")[
+                            "maximum_compact_context_items_per_section"
+                        ]
+                    )
+                    investigations_by_group = {
+                        item.stable_key: item for item in graph_result.investigations
+                    }
+                    gaps_by_group = {
+                        item.group_id: item for item in graph_result.planning_gaps
+                    }
+                    reused_group_ids = set(graph_result.reused_group_ids)
+                    reused_group_ids.update(graphify_checkpoint_reused_groups)
+                    targets_for_report = [
+                        {
+                            "surface_key": target.surface_key,
+                            "mapping_status": target.mapping_status.value,
+                            "node_ids": list(target.node_ids),
+                            "source_locations": list(target.source_locations),
+                            "gap_reason": target.gap_reason,
+                        }
+                        for target in graph_result.inventory.targets
+                    ]
+                    groups_for_report = []
+                    for group in graph_result.grouping.groups:
+                        investigation = investigations_by_group.get(group.group_id)
+                        planning_gap = gaps_by_group.get(group.group_id)
+                        if planning_gap is not None:
+                            planning_status = "gap"
+                        elif group.group_id in reused_group_ids:
+                            planning_status = "reused"
+                        elif investigation is not None:
+                            planning_status = "planned"
+                        else:
+                            planning_status = "unresolved"
+                        groups_for_report.append(
+                            {
+                                "group_id": group.group_id,
+                                "surface_keys": list(group.surface_keys),
+                                "node_ids": list(group.node_ids),
+                                "planning_status": planning_status,
+                                "investigation_id": (
+                                    investigation.investigation_id if investigation else None
+                                ),
+                                "gap_reason": planning_gap.reason if planning_gap else "",
+                            }
+                        )
                     repository_context["graphify_shadow_planning"] = {
                         "status": "complete",
                         "graph_snapshot_id": graphify_snapshot_id,
@@ -601,9 +749,38 @@ class SastPipeline:
                         "investigation_count": graphify_investigation_count,
                         "mapping_gap_count": graphify_mapping_gaps,
                         "planning_gap_count": graphify_planning_gaps,
+                        "mapping_counts": graph_result.inventory.mapping_counts,
+                        "group_status_counts": {
+                            status: sum(
+                                item["planning_status"] == status
+                                for item in groups_for_report
+                            )
+                            for status in sorted(
+                                {item["planning_status"] for item in groups_for_report}
+                            )
+                        },
+                        "unresolved_edge_count": graph_snapshot.unresolved_edges,
+                        "unindexed_file_count": len(graph_snapshot.unindexed_files),
+                        "unindexed_files": list(graph_snapshot.unindexed_files[:coverage_item_limit]),
+                        "unindexed_files_omitted": max(
+                            0, len(graph_snapshot.unindexed_files) - coverage_item_limit
+                        ),
+                        "surface_targets": targets_for_report[:coverage_item_limit],
+                        "surface_targets_omitted": max(
+                            0, len(targets_for_report) - coverage_item_limit
+                        ),
+                        "groups": groups_for_report[:coverage_item_limit],
+                        "groups_omitted": max(
+                            0, len(groups_for_report) - coverage_item_limit
+                        ),
                         "investigation_ids": [
-                            item.investigation_id for item in graph_result.investigations
+                            item.investigation_id
+                            for item in graph_result.investigations[:coverage_item_limit]
                         ],
+                        "investigation_ids_omitted": max(
+                            0, len(graph_result.investigations) - coverage_item_limit
+                        ),
+                        "coverage_item_limit": coverage_item_limit,
                     }
                     graphify_shadow_status = "complete"
                 except Exception as exc:  # noqa: BLE001
@@ -898,6 +1075,8 @@ class SastPipeline:
                 "graphify_investigations": graphify_investigation_count,
                 "graphify_mapping_gaps": graphify_mapping_gaps,
                 "graphify_planning_gaps": graphify_planning_gaps,
+                "graphify_checkpoint_reused": graphify_checkpoint_reused,
+                "graphify_checkpoint_saved": graphify_checkpoint_saved,
                 "ai_planning_failures": ai_planning_failures,
                 "ai_discovery_failures": ai_discovery_failures,
                 "ai_discovery_error_types": ai_discovery_error_types,

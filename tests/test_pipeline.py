@@ -81,6 +81,9 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
             }
 
     class GraphPlanningAI(FakeContextualAI):
+        def __init__(self):
+            self.graph_plan_calls = 0
+
         def build_repository_context(self, root, repository, commit, graph, business_context=""):
             return GraphContext()
 
@@ -95,6 +98,7 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
             surface_context,
             stable_key,
         ):
+            self.graph_plan_calls += 1
             return build_investigation(
                 stable_key=stable_key,
                 codebase_id=codebase_id,
@@ -114,10 +118,19 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
                 context_dependencies=(),
             )
 
-    result = SastPipeline().scan_snapshot(
+    agent = GraphPlanningAI()
+    checkpoint_path = tmp_path.parent / f"{tmp_path.name}-scan-checkpoint.sqlite"
+    pipeline = SastPipeline(checkpoint_path=checkpoint_path)
+    result = pipeline.scan_snapshot(
         tmp_path,
         "local/account-service",
-        deep_hunt_agent=GraphPlanningAI(),
+        deep_hunt_agent=agent,
+        graphify_shadow_planning=True,
+    )
+    resumed = pipeline.scan_snapshot(
+        tmp_path,
+        "local/account-service",
+        deep_hunt_agent=agent,
         graphify_shadow_planning=True,
     )
 
@@ -129,7 +142,22 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
     assert result.metrics["graphify_surfaces"] == 1
     assert result.metrics["graphify_investigations"] == 1
     assert result.repository_context["graphify_shadow_planning"]["status"] == "complete"
+    assert result.repository_context["graphify_shadow_planning"]["surface_targets"][0][
+        "mapping_status"
+    ] == "mapped"
+    assert result.repository_context["graphify_shadow_planning"]["groups"][0][
+        "planning_status"
+    ] == "planned"
     assert result.metrics["ai_discovery_candidates"] == 1
+    assert agent.graph_plan_calls == 1
+    assert result.metrics["graphify_checkpoint_saved"] == 1
+    assert resumed.metrics["graphify_checkpoint_reused"] == 1
+    assert resumed.repository_context["graphify_shadow_planning"]["groups"][0][
+        "planning_status"
+    ] == "reused"
+    assert resumed.repository_context["graphify_shadow_planning"]["investigation_ids"] == result.repository_context[
+        "graphify_shadow_planning"
+    ]["investigation_ids"]
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):
