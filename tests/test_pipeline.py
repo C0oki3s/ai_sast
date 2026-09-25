@@ -154,6 +154,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
                     "category": "authorization",
                     "engine": "plaidnox-graphify-investigation",
                     "graph_investigation_id": investigation.investigation_id,
+                    "graph_snapshot_id": investigation.graph_snapshot_id,
                 },
             )
             return [candidate], {
@@ -204,8 +205,14 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert result.metrics["graphify_checkpoint_saved"] == 1
     with unit_of_work(factory, "default") as repository:
         stored = repository.list_investigations(result.scan_id)
+        linked_findings = repository.findings_by_dependency_keys(
+            stored[0].codebase_id,
+            [stored[0].investigation_id],
+            dependency_type="graph_investigation",
+        )
     assert len(stored) == 1
     assert stored[0].state == "candidate"
+    assert linked_findings
 
     agent.return_no_candidate = True
     unchanged_findings = pipeline.scan_snapshot(
@@ -237,6 +244,7 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     assert rerun.repository_context["graphify_shadow_planning"][
         "invalidated_prior_investigation_count"
     ] == 1
+    assert rerun.metrics["graphify_findings_flagged_for_revalidation"] == 1
     assert agent.graph_plan_calls == 2
     assert agent.graph_hunt_calls == 3
     with unit_of_work(factory, "default") as repository:

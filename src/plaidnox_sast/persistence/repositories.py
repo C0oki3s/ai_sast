@@ -1467,22 +1467,28 @@ class CodeScanningRepository:
         ).all()
         return [SymbolIdentity(row.symbol_id, row.stable_key, row.content_hash) for row in rows]
 
-    def findings_by_dependency_keys(self, codebase_id: str, dependency_keys: Iterable[str]) -> list[str]:
+    def findings_by_dependency_keys(
+        self,
+        codebase_id: str,
+        dependency_keys: Iterable[str],
+        *,
+        dependency_type: str | None = None,
+    ) -> list[str]:
         keys = set(dependency_keys)
         if not keys:
             return []
+        filters = [
+            FindingRecord.tenant_id == self.tenant_id,
+            FindingRecord.codebase_id == codebase_id,
+            FindingDependencyRecord.dependency_key.in_(keys),
+        ]
+        if dependency_type:
+            filters.append(FindingDependencyRecord.dependency_type == dependency_type)
         rows = (
             self.session.execute(
                 select(FindingDependencyRecord.finding_id)
-                .join(
-                    FindingRecord,
-                    FindingRecord.finding_id == FindingDependencyRecord.finding_id,
-                )
-                .where(
-                    FindingRecord.tenant_id == self.tenant_id,
-                    FindingRecord.codebase_id == codebase_id,
-                    FindingDependencyRecord.dependency_key.in_(keys),
-                )
+                .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+                .where(*filters)
             )
             .scalars()
             .all()

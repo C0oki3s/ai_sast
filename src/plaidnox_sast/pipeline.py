@@ -396,6 +396,16 @@ def _finding_dependencies(
                 symbol.stable_key,
                 symbol.content_hash,
             )
+    graph_investigation_id = str(
+        finding.metadata.get("graph_investigation_id", "")
+    ).strip()
+    graph_snapshot_id = str(finding.metadata.get("graph_snapshot_id", "")).strip()
+    if graph_investigation_id and re.fullmatch(r"[0-9a-f]{64}", graph_snapshot_id):
+        dependencies[f"graph-investigation:{graph_investigation_id}"] = FindingDependencyInput(
+            "graph_investigation",
+            graph_investigation_id,
+            graph_snapshot_id,
+        )
     return list(dependencies.values())
 
 
@@ -490,6 +500,7 @@ class SastPipeline:
         persistence_error_type = ""
         persistence_error = ""
         persistence_findings_flagged_for_revalidation = 0
+        graphify_findings_flagged_for_revalidation = 0
         symbols_by_path: dict[str, list] = {}
         if self.session_factory is not None:
             try:
@@ -757,6 +768,20 @@ class SastPipeline:
                                     snapshot=graph_snapshot,
                                 )
                             )
+                            if invalidated_prior_investigation_ids:
+                                with unit_of_work(
+                                    self.session_factory, self.tenant_id
+                                ) as repository:
+                                    affected_finding_ids = repository.findings_by_dependency_keys(
+                                        codebase_id,
+                                        invalidated_prior_investigation_ids,
+                                        dependency_type="graph_investigation",
+                                    )
+                                    graphify_findings_flagged_for_revalidation = (
+                                        repository.flag_findings_for_revalidation(
+                                            affected_finding_ids
+                                        )
+                                    )
                             graphify_changed_file_count = len(
                                 graph_delta.added_files
                                 + graph_delta.changed_files
@@ -1427,6 +1452,7 @@ class SastPipeline:
                     item.get("status") == "reused_no_candidate"
                     for item in graphify_hunt_results
                 ),
+                "graphify_findings_flagged_for_revalidation": graphify_findings_flagged_for_revalidation,
                 "graphify_verified_findings_carried_forward": graphify_carried_forward_findings,
                 "graphify_prior_report_snapshots_rejected": graphify_rejected_stale_report_snapshots,
                 "graphify_hunt_unresolved_obligations": sum(
