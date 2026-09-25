@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "surface_key": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "collection": {"type": "string", "minLength": 1},
+    "label": {"type": "string"},
+    "record": {"type": "object"},
+    "source_locations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "start_line": {"type": "integer", "minimum": 1},
+          "end_line": {"type": "integer", "minimum": 1},
+          "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "required": ["path", "start_line", "end_line", "source_hash"]
+      }
+    },
+    "node_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "mapping_status": {"enum": ["mapped", "ambiguous", "unmapped", "stale_source", "unverified_location", "no_location"]},
+    "gap_reason": {"type": "string"}
+  },
+  "required": ["surface_key", "collection", "label", "record", "source_locations", "node_ids", "mapping_status", "gap_reason"]
+}
