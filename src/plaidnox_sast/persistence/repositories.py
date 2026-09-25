@@ -1505,6 +1505,24 @@ class CodeScanningRepository:
         )
         return sorted(set(rows))
 
+    def finding_dependency_types(
+        self, codebase_id: str, finding_ids: Iterable[str]
+    ) -> list[str]:
+        """Return tenant-scoped dependency kinds attached to canonical findings."""
+        ids = set(finding_ids)
+        if not ids:
+            return []
+        rows = self.session.execute(
+            select(FindingDependencyRecord.dependency_type)
+            .join(FindingRecord, FindingRecord.finding_id == FindingDependencyRecord.finding_id)
+            .where(
+                FindingRecord.tenant_id == self.tenant_id,
+                FindingRecord.codebase_id == codebase_id,
+                FindingDependencyRecord.finding_id.in_(ids),
+            )
+        ).scalars().all()
+        return sorted(set(rows))
+
     def findings_requiring_revalidation(self, codebase_id: str, snapshot_id: str, hops: int = 3) -> list[str]:
         """A finding needs re-verification once a symbol it depends on -- directly, or
         transitively through a changed callee -- has a different `content_hash` than

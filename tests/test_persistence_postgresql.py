@@ -206,6 +206,113 @@ def test_finding_round_trips_through_postgresql_shaped_schema(pg_session_factory
     assert updated.evidence == []
 
 
+def test_postgresql_cross_snapshot_reuse_requires_complete_graph_dependency_contract(
+    pg_session_factory,
+):
+    factory = pg_session_factory
+    tenant_id = _id("tenant-pg-graph-reuse")
+    codebase_id = _id("codebase-pg-graph-reuse")
+    report = {
+        "schema_version": 1,
+        "fingerprint": _id("fingerprint-graph-reuse"),
+        "rule_id": "plaidnox.ai.graph-investigation",
+        "state": "validated",
+        "taint_path": [{"file": "app.js", "line": 3, "end_line": 4}],
+    }
+
+    with unit_of_work(factory, tenant_id) as repository:
+        repository.add_codebase(codebase_id, "local/graph-reuse", "Graph Reuse")
+        snapshot = repository.add_snapshot(
+            _id("snapshot-pg-graph-reuse"),
+            codebase_id,
+            "revision-graph-reuse",
+            "tree-graph-reuse",
+            "context-v1",
+        )
+        scan = repository.start_scan(
+            _id("scan-pg-graph-reuse"),
+            codebase_id,
+            snapshot.snapshot_id,
+            "deep",
+            "workflow-graph-reuse",
+            {"context_scope_hash": "context-hash"},
+        )
+        complete_fingerprint = ""
+        for suffix, validation in (
+            (
+                "complete",
+                {
+                    "graph_dependency_version": 1,
+                    "graph_dependencies_complete": True,
+                },
+            ),
+            ("legacy", {"deep_hunt": "supported"}),
+        ):
+            finding_id = _id(f"finding-pg-graph-{suffix}")
+            fingerprint = _id(f"fingerprint-pg-graph-{suffix}")
+            if suffix == "complete":
+                complete_fingerprint = fingerprint
+            repository.save_finding(
+                finding_id,
+                codebase_id,
+                scan.scan_id,
+                fingerprint,
+                "Graph-backed authorization finding",
+                "authorization",
+                "high",
+                "validated",
+                0.9,
+                "A reachable update path lacks ownership enforcement.",
+                "Cross-account update.",
+                "Enforce ownership.",
+                validation,
+                [],
+                [
+                    FindingDependencyInput(
+                        "graph_investigation", _id(f"investigation-{suffix}"), "snapshot-hash"
+                    ),
+                    FindingDependencyInput("graph_node", "handler", "node-hash"),
+                    FindingDependencyInput(
+                        "graph_node_neighborhood", "handler", "neighborhood-hash"
+                    ),
+                    FindingDependencyInput("source_file", "app.js", "source-hash"),
+                ]
+                if suffix == "complete"
+                else [],
+            )
+            repository.save_scan_finding(
+                scan_id=scan.scan_id,
+                finding_id=finding_id,
+                fingerprint=fingerprint,
+                severity="high",
+                category="authorization",
+                cwe_id=None,
+                owasp_category="",
+                report_schema_version=1,
+                report_data={**report, "fingerprint": fingerprint},
+            )
+        repository.finish_scan(scan.scan_id, coverage_complete=True)
+
+    with unit_of_work(factory, tenant_id) as repository:
+        delta_eligible = repository.reusable_scan_findings(
+            scan.scan_id,
+            codebase_id=codebase_id,
+            workflow_version="workflow-graph-reuse",
+            context_scope_hash="context-hash",
+            require_graph_dependencies=True,
+        )
+        exact_snapshot_eligible = repository.reusable_scan_findings(
+            scan.scan_id,
+            codebase_id=codebase_id,
+            workflow_version="workflow-graph-reuse",
+            context_scope_hash="context-hash",
+        )
+
+    assert len(delta_eligible) == 1
+    assert delta_eligible[0].fingerprint == complete_fingerprint
+    assert len(exact_snapshot_eligible) == 2
+
+
 def test_unit_of_work_rolls_back_the_full_transaction_on_exception(pg_session_factory):
     """SQLite's simpler transaction model doesn't meaningfully exercise this the same way real Postgres does."""
 

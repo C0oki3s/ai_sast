@@ -659,6 +659,9 @@ class SastPipeline:
         graphify_changed_edge_count = 0
         graphify_invalidated_investigation_count = 0
         graphify_prior_scan_findings = []
+        graphify_finding_reuse_requires_dependencies = False
+        graphify_findings_reuse_rejected_missing_dependencies = 0
+        graphify_finding_reuse_dependency_types: set[str] = set()
         context_builder = getattr(deep_hunt_agent, "build_repository_context", None)
         planner = getattr(deep_hunt_agent, "plan_tasks", None)
         discovery = getattr(deep_hunt_agent, "discover_candidates", None)
@@ -878,6 +881,9 @@ class SastPipeline:
                                     or graph_delta_reuse_enabled
                                 )
                             ):
+                                graphify_finding_reuse_requires_dependencies = (
+                                    not same_graph_snapshot
+                                )
                                 with unit_of_work(
                                     self.session_factory, self.tenant_id
                                 ) as repository:
@@ -888,6 +894,36 @@ class SastPipeline:
                                             workflow_version=workflow_version,
                                             context_scope_hash=context_scope_hash,
                                             require_graph_dependencies=not same_graph_snapshot,
+                                        )
+                                    )
+                                    if not same_graph_snapshot:
+                                        compatible_without_dependency_gate = (
+                                            repository.reusable_scan_findings(
+                                                previous_graph.scan_id,
+                                                codebase_id=codebase_id,
+                                                workflow_version=workflow_version,
+                                                context_scope_hash=context_scope_hash,
+                                            )
+                                        )
+                                        reusable_ids = {
+                                            item.scan_finding_id
+                                            for item in graphify_prior_scan_findings
+                                        }
+                                        graphify_findings_reuse_rejected_missing_dependencies = len(
+                                            {
+                                                item.scan_finding_id
+                                                for item in compatible_without_dependency_gate
+                                            }
+                                            - reusable_ids
+                                        )
+                                    graphify_finding_reuse_dependency_types.update(
+                                        repository.finding_dependency_types(
+                                            codebase_id,
+                                            (
+                                                item.finding_id
+                                                for item in graphify_prior_scan_findings
+                                                if item.finding_id
+                                            ),
                                         )
                                     )
 
@@ -1545,6 +1581,16 @@ class SastPipeline:
                 ),
                 "graphify_findings_flagged_for_revalidation": graphify_findings_flagged_for_revalidation,
                 "graphify_verified_findings_carried_forward": graphify_carried_forward_findings,
+                "graphify_finding_reuse_requires_graph_dependencies": (
+                    graphify_finding_reuse_requires_dependencies
+                ),
+                "graphify_findings_reuse_candidates": len(graphify_prior_scan_findings),
+                "graphify_findings_reuse_rejected_missing_dependencies": (
+                    graphify_findings_reuse_rejected_missing_dependencies
+                ),
+                "graphify_finding_reuse_dependency_types": sorted(
+                    graphify_finding_reuse_dependency_types
+                ),
                 "graphify_prior_report_snapshots_rejected": graphify_rejected_stale_report_snapshots,
                 "graphify_hunt_unresolved_obligations": sum(
                     int(item.get("unresolved_count", 0)) for item in graphify_hunt_results

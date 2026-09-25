@@ -255,6 +255,15 @@ def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_
     )
     assert delta_findings.metrics["graphify_verified_findings_carried_forward"] == 1
     assert len(delta_findings.findings) == 1
+    assert delta_findings.metrics["graphify_finding_reuse_requires_graph_dependencies"] is True
+    assert delta_findings.metrics["graphify_findings_reuse_candidates"] == 1
+    assert delta_findings.metrics["graphify_findings_reuse_rejected_missing_dependencies"] == 0
+    assert {
+        "graph_investigation",
+        "graph_node",
+        "graph_node_neighborhood",
+        "source_file",
+    } <= set(delta_findings.metrics["graphify_finding_reuse_dependency_types"])
     assert unchanged_findings.findings[0].metadata["carried_forward"] is True
     with unit_of_work(factory, "default") as repository:
         carried_report = repository.scan_findings(unchanged_findings.scan_id)
