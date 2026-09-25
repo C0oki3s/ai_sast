@@ -253,7 +253,9 @@ model calls, then transitions the current scan's ORM lifecycle independently.
 Failed or contract-invalid investigations do not write this result checkpoint.
 An unresolved question or failed execution remains visible in
 coverage and makes an opt-in Graphify investigation run incomplete. Tests are
-in `tests/test_graph_investigation_hunt.py`, `tests/test_graph_planner.py`,
+in `tests/test_graph_investigation_hunt.py`, the pipeline/ORM integration test
+`test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_persists_state`,
+`tests/test_graph_planner.py`,
 `tests/test_graph_surface_planning.py`, and `tests/test_pipeline.py`. Switch the
 default only after seeded-root recall, grounding, incremental invalidation, and
 checkpoint resume reach parity.

@@ -39,7 +39,7 @@ def test_pipeline_scans_a_non_git_source_snapshot(tmp_path):
     assert result.findings
 
 
-def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
+def test_pipeline_executes_graphify_investigations_through_shared_deep_hunt_and_persists_state(
     tmp_path, monkeypatch
 ):
     from plaidnox_sast.investigations import build_investigation
@@ -83,6 +83,8 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
     class GraphPlanningAI(FakeContextualAI):
         def __init__(self):
             self.graph_plan_calls = 0
+            self.graph_hunt_calls = 0
+            self.review_calls = 0
 
         def build_repository_context(self, root, repository, commit, graph, business_context=""):
             return GraphContext()
@@ -118,20 +120,50 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
                 context_dependencies=(),
             )
 
+        def discover_candidates(self, root, context, plan=None):
+            return [], 0
+
+        def hunt_graph_investigation(self, root, investigation, context_broker):
+            from plaidnox_sast.models import Candidate, Evidence, Severity
+
+            self.graph_hunt_calls += 1
+            candidate = Candidate(
+                rule_id="plaidnox.ai.graph-investigation",
+                title="Graph investigation hypothesis",
+                vulnerability_class="Object authorization failure",
+                severity=Severity.HIGH,
+                confidence=0.82,
+                message="The account handler may accept an unowned account selector.",
+                evidence=Evidence(
+                    "app.js", 1, 1, "app.get('/accounts', listAccounts);",
+                    "listAccounts", "authorization", ["account-route"],
+                ),
+                metadata={
+                    "category": "authorization",
+                    "engine": "plaidnox-graphify-investigation",
+                    "graph_investigation_id": investigation.investigation_id,
+                },
+            )
+            return [candidate], {
+                "investigation_id": investigation.investigation_id,
+                "obligation_results": [{"status": "CANDIDATE_FOUND"}],
+                "candidate_count": 1,
+                "unresolved_count": 0,
+            }
+
+        def review(self, *args, **kwargs):
+            self.review_calls += 1
+            return super().review(*args, **kwargs)
+
     agent = GraphPlanningAI()
     checkpoint_path = tmp_path.parent / f"{tmp_path.name}-scan-checkpoint.sqlite"
-    pipeline = SastPipeline(checkpoint_path=checkpoint_path)
+    factory = _sqlite_session_factory()
+    pipeline = SastPipeline(checkpoint_path=checkpoint_path, session_factory=factory)
     result = pipeline.scan_snapshot(
         tmp_path,
         "local/account-service",
         deep_hunt_agent=agent,
-        graphify_shadow_planning=True,
-    )
-    resumed = pipeline.scan_snapshot(
-        tmp_path,
-        "local/account-service",
-        deep_hunt_agent=agent,
-        graphify_shadow_planning=True,
+        graphify_investigations=True,
     )
 
     assert result.metrics["graphify_shadow_status"] == "complete", (
@@ -149,15 +181,19 @@ def test_pipeline_graphify_shadow_planning_is_opt_in_and_reports_planned_work(
         "planning_status"
     ] == "planned"
     assert result.metrics["ai_discovery_candidates"] == 1
+    assert result.metrics["graphify_hunt_candidates"] == 1
+    assert result.metrics["graphify_hunt_failures"] == 0
+    assert result.metrics["graphify_hunt_results"][0]["status"] == "candidate"
+    assert len(result.findings) == 1
+    assert agent.graph_hunt_calls >= 1
+    assert agent.review_calls == 1
+    assert result.metrics["ai_reviews"] == 1
     assert agent.graph_plan_calls == 1
     assert result.metrics["graphify_checkpoint_saved"] == 1
-    assert resumed.metrics["graphify_checkpoint_reused"] == 1
-    assert resumed.repository_context["graphify_shadow_planning"]["groups"][0][
-        "planning_status"
-    ] == "reused"
-    assert resumed.repository_context["graphify_shadow_planning"]["investigation_ids"] == result.repository_context[
-        "graphify_shadow_planning"
-    ]["investigation_ids"]
+    with unit_of_work(factory, "default") as repository:
+        stored = repository.list_investigations(result.scan_id)
+    assert len(stored) == 1
+    assert stored[0].state == "candidate"
 
 
 def test_pipeline_deep_hunt_vertical_slice(sample_repo):
