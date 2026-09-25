@@ -709,6 +709,115 @@ def test_deep_hunt_receives_the_canonical_candidate_evidence_packet(sample_repo)
     assert supplied["candidate_evidence_packet"] == candidate.metadata["evidence_packet"]
 
 
+def test_seeded_verified_identity_root_requires_every_independent_hunt_gate(sample_repo):
+    middleware = (
+        "const payload = await verifier.verify(token);\n"
+        'if (req.headers["x-user-email"]) {\n'
+        '  payload["custom:email_db"] = req.headers["x-user-email"];\n'
+        "}\n"
+        "req.user = payload;\n"
+    )
+    route = (
+        'app.get("/dashboard", authCheck, async (req, res) => {\n'
+        '  const email = req.user["custom:email_db"];\n'
+        "  return User.findOne({ email });\n"
+        "});\n"
+    )
+    (sample_repo / "middleware").mkdir()
+    (sample_repo / "middleware/ValidateToken.js").write_text(middleware, encoding="utf-8")
+    (sample_repo / "app.js").write_text(route, encoding="utf-8")
+    candidate = Candidate(
+        rule_id="plaidnox.ai.graph-investigation",
+        title="Unverified request identity replaces the verified principal",
+        vulnerability_class="CWE-639",
+        severity=Severity.HIGH,
+        confidence=0.91,
+        message="A caller-controlled header changes the identity used by a protected account lookup.",
+        evidence=Evidence(
+            "middleware/ValidateToken.js",
+            2,
+            4,
+            "\n".join(middleware.splitlines()[1:4]),
+            "authCheck",
+            "req.headers.x-user-email -> payload.custom:email_db",
+            ["verified token", "request header", "protected account lookup"],
+        ),
+        metadata={
+            "engine": "plaidnox-graphify-investigation",
+            "evidence_packet": {
+                "root_cause": {"symbol": "authCheck", "path": "middleware/ValidateToken.js"},
+                "invariant": "Request-controlled identity must not replace the verified principal.",
+                "gained_capabilities": ["Select another user's account record."],
+                "source_windows": [
+                    {"path": "middleware/ValidateToken.js", "content": middleware},
+                    {"path": "app.js", "content": route},
+                ],
+            },
+        },
+    )
+    candidate_finding = replace(finding(), evidence=candidate.evidence)
+    gate_names = [
+        "design_invariant",
+        "reachability",
+        "attacker_control",
+        "effective_defense",
+        "new_capability",
+        "falsification",
+        "reproduction",
+        "remediation_invariant",
+    ]
+    evidence_locations = [
+        {
+            "path": "middleware/ValidateToken.js",
+            "start_line": 2,
+            "end_line": 4,
+            "role": "root_cause",
+        },
+        {"path": "app.js", "start_line": 1, "end_line": 3, "role": "sensitive_effect"},
+    ]
+    accepted_payload = review_payload(
+        supported=True,
+        title="Unverified request identity replaces verified Cognito claims",
+        vulnerability_class="CWE-639",
+        message="The header-controlled identity reaches a protected account lookup.",
+        attack_path="x-user-email -> verified payload overwrite -> req.user -> User.findOne",
+        security_invariant="Only the cryptographically verified identity may select an account.",
+        gained_capability="Select another user's account record.",
+        gate_results=[
+            {
+                "gate": gate,
+                "verdict": "pass",
+                "evidence": ["middleware/ValidateToken.js:2-4", "app.js:1-3"],
+                "explanation": "The independent gate is supported by the supplied source and graph context.",
+            }
+            for gate in gate_names
+        ],
+        evidence_locations=evidence_locations,
+    )
+    accepted = PlaidNoxDeepHuntAgent(FakeClient(accepted_payload)).review(
+        sample_repo, candidate, candidate_finding
+    )
+    assert accepted.supported is True
+    assert {item["gate"] for item in accepted.gate_results} == set(gate_names)
+
+    contradicted_payload = review_payload(
+        **{
+            **accepted_payload,
+            "gate_results": [
+                {
+                    **item,
+                    "verdict": "fail" if item["gate"] == "effective_defense" else "pass",
+                }
+                for item in accepted_payload["gate_results"]
+            ],
+        }
+    )
+    with pytest.raises(AIResponseError, match="without passing every verification gate"):
+        PlaidNoxDeepHuntAgent(FakeClient(contradicted_payload)).review(
+            sample_repo, candidate, candidate_finding
+        )
+
+
 def test_ai_review_rejects_supported_result_with_incomplete_gates(sample_repo):
     payload = review_payload()
     payload["gate_results"] = payload["gate_results"][:-1]
