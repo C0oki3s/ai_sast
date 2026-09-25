@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -192,3 +193,121 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     assert (
         resumed.investigations[0].evidence_hash == first.investigations[0].evidence_hash
     )
+
+
+def test_coordinator_plans_100k_loc_repository_in_bounded_graph_groups(
+    tmp_path: Path,
+):
+    """Exercise large surface planning without a live Graphify/model provider."""
+    nodes = []
+    edges = []
+    source_hashes = {}
+    source_characters = 0
+    repository_context = {"entry_points": []}
+
+    for file_index in range(100):
+        path = f"services/service_{file_index:03d}.py"
+        source = tmp_path / path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# indexed source line\n"] * 1000
+        file_symbols = []
+        for symbol_index in range(8):
+            line = symbol_index * 100 + 1
+            node_id = f"service-{file_index:03d}-handler-{symbol_index}"
+            label = f"handle_{file_index}_{symbol_index}"
+            lines[line - 1] = f"def {label}():\n"
+            file_symbols.append((node_id, label, line))
+        source.write_text("".join(lines), encoding="utf-8")
+        source_content = source.read_bytes()
+        source_characters += len(source_content)
+        source_hash = hashlib.sha256(source_content).hexdigest()
+        source_hashes[path] = source_hash
+        file_nodes = []
+        for node_id, label, line in file_symbols:
+            node = CodeNode(node_id, path, line, label, source_hash)
+            nodes.append(node)
+            file_nodes.append(node)
+            repository_context["entry_points"].append(
+                {
+                    "entry_id": node_id,
+                    "name": label,
+                    "evidence_locations": [
+                        {
+                            "path": path,
+                            "start_line": line,
+                            "end_line": line,
+                            "grounding_status": "verified_source_location",
+                            "source_content_hash": source_hash,
+                        }
+                    ],
+                }
+            )
+        edges.extend(
+            CodeEdge(
+                left.id,
+                right.id,
+                "CALLS",
+                "EXTRACTED",
+                path,
+                right.line,
+                source_hash,
+            )
+            for left, right in zip(file_nodes, file_nodes[1:])
+        )
+
+    snapshot = CodeGraphSnapshot(
+        source_hashes=source_hashes,
+        nodes=tuple(nodes),
+        edges=tuple(edges),
+        unresolved_edges=0,
+        extractor_version="synthetic-large-fixture",
+    )
+    broker = GraphContextBroker(tmp_path, snapshot)
+    model_payload_sizes = []
+    planner = GraphInvestigationPlanner(
+        lambda payload: (
+            model_payload_sizes.append(
+                len(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+            )
+            or {
+                "reason": "Review this source-grounded service flow.",
+                "security_questions": [
+                    "Can untrusted request data reach a sensitive effect without authorization?"
+                ],
+                "supporting_node_ids": [],
+                "supporting_edge_keys": [],
+                "coverage_notes": [],
+            }
+        )
+    )
+    coordinator = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot,
+            broker=broker,
+            repository_context={},
+            **arguments,
+        )
+    )
+
+    result = coordinator.plan(
+        codebase_id="large-codebase",
+        repository_context=repository_context,
+        graph_snapshot=snapshot,
+    )
+
+    limits = planner.limits
+    assert len(repository_context["entry_points"]) == 800
+    assert len(snapshot.nodes) == 800
+    assert len(snapshot.edges) == 700
+    assert len(result.inventory.targets) == 800
+    assert result.inventory.mapping_counts["mapped"] == 800
+    assert len(result.grouping.groups) == 100
+    assert len(result.investigations) == 100
+    assert all(len(group.node_ids) == 8 for group in result.grouping.groups)
+    assert not result.mapping_gap_count
+    assert not result.grouping.unmapped_surface_keys
+    assert not result.planning_gaps
+    assert len(model_payload_sizes) == len(result.investigations)
+    assert max(model_payload_sizes) <= limits.maximum_input_characters
+    assert all(size < 20_000 for size in model_payload_sizes)
+    assert sum(model_payload_sizes) < source_characters
