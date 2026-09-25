@@ -510,6 +510,13 @@ class InvestigationRecord(TimestampMixin, Base):
             "state",
             "created_at",
         ),
+        Index(
+            "ix_code_scanning_investigation_codebase_stable",
+            "tenant_id",
+            "codebase_id",
+            "stable_key",
+            "created_at",
+        ),
         CheckConstraint(
             "revision > 0 AND attempt_count >= 0",
             name="ck_code_scanning_investigation_counters",

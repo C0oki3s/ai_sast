@@ -16,6 +16,7 @@ from plaidnox_sast.graph_planner import (
 from plaidnox_sast.graphify_adapter import (
     CodeGraphSnapshot,
     CodeNode,
+    graph_node_neighborhood_hash,
     normalize_extraction,
 )
 from plaidnox_sast.models import ModelTier
@@ -106,6 +107,19 @@ def test_graph_planner_builds_source_grounded_open_ended_investigation(tmp_path:
     assert {item["provenance"] for item in result.graph_refs if "edge_id" in item} == {
         "INFERRED"
     }
+    neighborhood_dependencies = {
+        item["key"]: item["hash"]
+        for item in result.context_dependencies
+        if item["kind"] == "graph_node_neighborhood"
+    }
+    assert set(neighborhood_dependencies) == {
+        item["node_id"] for item in result.graph_refs if "node_id" in item
+    }
+    assert all(
+        neighborhood_dependencies[node_id]
+        == graph_node_neighborhood_hash(snapshot, node_id)
+        for node_id in neighborhood_dependencies
+    )
     assert result.evidence_hash
     assert result.state == "planned"
 

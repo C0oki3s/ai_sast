@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from plaidnox_sast.graphify_adapter import (
     CodeEdge,
+    CodeGraphSnapshot,
     GraphDelta,
     GraphifyAdapterError,
+    CodeNode,
     affected_investigation_ids,
     extract_structural_graph,
     graph_edge_identity,
+    graph_node_neighborhood_hash,
+    investigation_graph_mismatches,
     normalize_extraction,
 )
 
@@ -254,3 +259,105 @@ def test_graph_delta_matches_removed_edge_dependencies() -> None:
     delta = GraphDelta((), (), (), (), (), (), (), (edge,))
 
     assert affected_investigation_ids(investigations, delta) == ("route-handler",)
+
+
+def test_graph_delta_uses_bounded_reverse_dependency_fanout(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text(
+        "def route():\n    return service()\n\n"
+        "def service():\n    return model()\n\n"
+        "def model():\n    return 1\n"
+    )
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    snapshot = CodeGraphSnapshot(
+        source_hashes={"app.py": source_hash},
+        nodes=(
+            CodeNode("route", "app.py", 1, "route()", source_hash),
+            CodeNode("service", "app.py", 4, "service()", source_hash),
+            CodeNode("model", "app.py", 7, "model()", source_hash),
+        ),
+        edges=(
+            CodeEdge("route", "service", "calls", "EXTRACTED", "app.py", 2, source_hash),
+            CodeEdge("service", "model", "calls", "EXTRACTED", "app.py", 5, source_hash),
+        ),
+        unresolved_edges=0,
+        extractor_version="test",
+    )
+    investigations = [
+        {"investigation_id": "route-review", "target_ref": {"node_id": "route"}},
+        {"investigation_id": "unrelated", "target_ref": {"node_id": "elsewhere"}},
+    ]
+    delta = GraphDelta((), (), (), (), ("model",), (), (), ())
+
+    assert affected_investigation_ids(
+        investigations, delta, snapshot=snapshot
+    ) == ("route-review",)
+    assert affected_investigation_ids(
+        investigations, delta, snapshot=snapshot, maximum_reverse_depth=1
+    ) == ("route-review", "unrelated")
+
+
+def test_investigation_graph_reuse_detects_new_reverse_relationship(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def foo():\n    return bar()\n\ndef bar():\n    return 1\n")
+    original = normalize_extraction(tmp_path, [source], _graph("old"))
+    foo = next(node for node in original.nodes if node.label == "foo()")
+    bar = next(node for node in original.nodes if node.label == "bar()")
+    investigation = {
+        "investigation_id": "foo-investigation",
+        "context_dependencies": [
+            {"kind": "graph_node", "key": foo.id, "hash": foo.source_hash},
+            {
+                "kind": "graph_node_neighborhood",
+                "key": foo.id,
+                "hash": graph_node_neighborhood_hash(original, foo.id),
+            },
+            {
+                "kind": "graph_snapshot",
+                "key": original.snapshot_id,
+                "hash": original.snapshot_id,
+            },
+        ],
+        "source_windows": [
+            {"path": "app.py", "content_hash": original.source_hashes["app.py"]}
+        ],
+    }
+
+    assert investigation_graph_mismatches(investigation, original) == ()
+
+    new_reverse_call = CodeEdge(
+        bar.id, foo.id, "calls", "EXTRACTED", "app.py", 4, foo.source_hash
+    )
+    changed = CodeGraphSnapshot(
+        source_hashes=original.source_hashes,
+        nodes=original.nodes,
+        edges=(*original.edges, new_reverse_call),
+        unresolved_edges=0,
+        extractor_version=original.extractor_version,
+    )
+
+    assert investigation_graph_mismatches(investigation, changed) == (
+        "graph_node_neighborhood_changed",
+    )
+
+
+def test_legacy_investigation_without_neighborhood_fingerprint_is_not_reusable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def foo():\n    return 1\n")
+    snapshot = normalize_extraction(
+        tmp_path,
+        [source],
+        {"nodes": [{"id": "foo", "label": "foo()", "source_file": "app.py", "source_location": "L1"}], "edges": []},
+    )
+    node = snapshot.nodes[0]
+    investigation = {
+        "investigation_id": "legacy",
+        "context_dependencies": [{"kind": "graph_node", "key": node.id, "hash": node.source_hash}],
+        "source_windows": [{"path": "app.py", "content_hash": snapshot.source_hashes["app.py"]}],
+    }
+
+    assert investigation_graph_mismatches(investigation, snapshot) == (
+        "graph_node_neighborhood_unavailable",
+    )

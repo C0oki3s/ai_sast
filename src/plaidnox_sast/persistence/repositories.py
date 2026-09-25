@@ -1963,6 +1963,23 @@ class CodeScanningRepository:
         ).all()
         return [_investigation_value(row) for row in rows]
 
+    def list_investigations_for_codebase(
+        self, codebase_id: str
+    ) -> list[InvestigationValue]:
+        """List this tenant's prior investigations newest-first for safe rebase lookup."""
+        rows = self.session.scalars(
+            select(InvestigationRecord)
+            .where(
+                InvestigationRecord.tenant_id == self.tenant_id,
+                InvestigationRecord.codebase_id == codebase_id,
+            )
+            .order_by(
+                InvestigationRecord.created_at.desc(),
+                InvestigationRecord.investigation_id,
+            )
+        ).all()
+        return [_investigation_value(row) for row in rows]
+
     def save_surface_planning(
         self, scan_id: str, snapshot_id: str, planning_data: dict[str, Any]
     ) -> SurfacePlanningValue:
@@ -2034,7 +2051,7 @@ class CodeScanningRepository:
         if current_status == "eligible_for_planning":
             current_status = "pending"
         allowed_transitions = {
-            "pending": {"planning", "gap"},
+            "pending": {"planning", "reused", "gap"},
             "planning": {"planning", "planned", "failed"},
             "failed": {"planning", "failed"},
             "planned": {"planned", "reused", "planning"},

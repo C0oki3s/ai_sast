@@ -16,11 +16,13 @@ from .graph_targets import (
     group_connected_graph_targets,
     map_repository_surfaces_to_graph,
 )
-from .graphify_adapter import CodeGraphSnapshot
+from .graphify_adapter import CodeGraphSnapshot, investigation_graph_mismatches
 from .investigations import (
     Investigation,
     bind_storage_snapshot,
     investigation_from_payload,
+    planning_context_hash,
+    rebase_investigation,
 )
 from .persistence.repositories import (
     InvestigationValue,
@@ -68,6 +70,10 @@ class InvestigationOrmStore:
     def list_for_scan(self, scan_id: str) -> list[InvestigationValue]:
         with unit_of_work(self.factory, self.tenant_id) as repository:
             return repository.list_investigations(scan_id)
+
+    def list_for_codebase(self, codebase_id: str) -> list[InvestigationValue]:
+        with unit_of_work(self.factory, self.tenant_id) as repository:
+            return repository.list_investigations_for_codebase(codebase_id)
 
     def save(self, scan_id: str, investigation: Investigation) -> InvestigationValue:
         with unit_of_work(self.factory, self.tenant_id) as repository:
@@ -160,6 +166,7 @@ class GraphSurfacePlanningCoordinator:
         persisted_groups = 0
         durable_snapshot_id = storage_snapshot_id or graph_snapshot.snapshot_id
         existing_by_stable_key: dict[str, InvestigationValue] = {}
+        prior_by_stable_key: dict[str, InvestigationValue] = {}
         if self.persistence is not None:
             if not scan_id:
                 raise ValueError(
@@ -173,6 +180,10 @@ class GraphSurfacePlanningCoordinator:
                         "multiple stored investigation versions share one surface group and snapshot"
                     )
                 existing_by_stable_key[existing.stable_key] = existing
+            for prior in self.persistence.list_for_codebase(codebase_id):
+                if prior.scan_id == scan_id or prior.stable_key in prior_by_stable_key:
+                    continue
+                prior_by_stable_key[prior.stable_key] = prior
             self.persistence.save_surface_plan(
                 scan_id,
                 durable_snapshot_id,
@@ -196,6 +207,18 @@ class GraphSurfacePlanningCoordinator:
                     raise PersistenceConflictError(
                         "stored investigation belongs to another codebase"
                     )
+                mismatches = investigation_graph_mismatches(
+                    investigation,
+                    graph_snapshot,
+                    expected_planning_context_hash=planning_context_hash(
+                        dict(repository_context),
+                        tuple(dict(item) for item in group.surface_context),
+                    ),
+                )
+                if mismatches or not _targets_match(investigation, group.node_ids):
+                    raise PersistenceConflictError(
+                        "stored same-scan investigation no longer matches its immutable graph evidence"
+                    )
                 investigations.append(investigation)
                 reused_groups += 1
                 reused_group_ids.append(group.group_id)
@@ -209,6 +232,42 @@ class GraphSurfacePlanningCoordinator:
                         investigation.investigation_id,
                     )
                 continue
+            prior = prior_by_stable_key.get(group.group_id)
+            if prior is not None:
+                prior_investigation = _restore_investigation(prior)
+                expected_context_hash = planning_context_hash(
+                    dict(repository_context), tuple(dict(item) for item in group.surface_context)
+                )
+                mismatches = investigation_graph_mismatches(
+                    prior_investigation,
+                    graph_snapshot,
+                    expected_planning_context_hash=expected_context_hash,
+                )
+                if (
+                    prior_investigation.codebase_id == codebase_id
+                    and not mismatches
+                    and _targets_match(prior_investigation, group.node_ids)
+                ):
+                    investigation = rebase_investigation(
+                        prior_investigation,
+                        storage_snapshot_id=durable_snapshot_id,
+                        graph_snapshot_id=graph_snapshot.snapshot_id,
+                    )
+                    if self.persistence is not None:
+                        assert scan_id is not None
+                        self.persistence.save(scan_id, investigation)
+                        self.persistence.record_group_status(
+                            scan_id,
+                            durable_snapshot_id,
+                            group.group_id,
+                            "reused",
+                            investigation.investigation_id,
+                        )
+                        persisted_groups += 1
+                    investigations.append(investigation)
+                    reused_groups += 1
+                    reused_group_ids.append(group.group_id)
+                    continue
             if self.persistence is not None:
                 assert scan_id is not None
                 self.persistence.record_group_status(
@@ -275,6 +334,15 @@ def _restore_investigation(value: InvestigationValue) -> Investigation:
             "stored investigation row conflicts with its payload"
         )
     return investigation
+
+
+def _targets_match(investigation: Investigation, expected_node_ids: tuple[str, ...]) -> bool:
+    target_ref = investigation.target_ref
+    current = target_ref.get("node_ids")
+    if not isinstance(current, (list, tuple)):
+        single = target_ref.get("node_id")
+        current = [single] if isinstance(single, str) else []
+    return set(current) == set(expected_node_ids)
 
 
 def _surface_plan_data(

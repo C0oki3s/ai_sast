@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator
 
@@ -79,6 +79,29 @@ def investigation_evidence_hash(investigation: Investigation) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def planning_context_hash(
+    repository_context: Mapping[str, Any],
+    surface_context: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> str:
+    """Fingerprint the business/security context that shapes model-authored plans."""
+    value = redact_payload(
+        {
+            "repository_context": planner_repository_context(repository_context),
+            "surface_context": list(surface_context),
+        }
+    )
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def planner_repository_context(repository_context: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the configured context fields supplied to graph planning prompts."""
+    fields = load_json("runtime/code_intelligence.json")[
+        "planner_repository_context_fields"
+    ]
+    return {field: repository_context[field] for field in fields if field in repository_context}
+
+
 def build_investigation(
     *,
     stable_key: str,
@@ -132,6 +155,58 @@ def bind_storage_snapshot(investigation: Investigation, snapshot_id: str) -> Inv
     if investigation.snapshot_id == snapshot_id:
         return investigation
     draft = replace(investigation, snapshot_id=snapshot_id, evidence_hash="0" * 64)
+    evidence_hash = investigation_evidence_hash(draft)
+    identifier = hashlib.sha256(
+        f"{draft.codebase_id}\0{draft.stable_key}\0{evidence_hash}".encode("utf-8")
+    ).hexdigest()[:32]
+    result = replace(draft, investigation_id=identifier, evidence_hash=evidence_hash)
+    validate_investigation(result)
+    return result
+
+
+def rebase_investigation(
+    investigation: Investigation,
+    *,
+    storage_snapshot_id: str,
+    graph_snapshot_id: str,
+) -> Investigation:
+    """Carry a compatible prior plan onto a new immutable scan snapshot.
+
+    Callers must first prove source-window and graph-neighborhood compatibility.
+    This resets execution state: only the bounded planning result is reused; hunt
+    and verification work must run again for the new revision.
+    """
+    if not storage_snapshot_id or not graph_snapshot_id:
+        raise InvestigationContractError("rebase snapshot identities must not be empty")
+    graph_refs = tuple(
+        {
+            **reference,
+            **({"snapshot_id": graph_snapshot_id} if "snapshot_id" in reference else {}),
+        }
+        for reference in investigation.graph_refs
+    )
+    dependencies = tuple(
+        {
+            **dependency,
+            **(
+                {"key": graph_snapshot_id, "hash": graph_snapshot_id}
+                if dependency.get("kind") == "graph_snapshot"
+                else {}
+            ),
+        }
+        for dependency in investigation.context_dependencies
+    )
+    draft = replace(
+        investigation,
+        snapshot_id=storage_snapshot_id,
+        graph_snapshot_id=graph_snapshot_id,
+        graph_refs=graph_refs,
+        context_dependencies=dependencies,
+        state="planned",
+        checkpoint_ref=None,
+        revision=1,
+        evidence_hash="0" * 64,
+    )
     evidence_hash = investigation_evidence_hash(draft)
     identifier = hashlib.sha256(
         f"{draft.codebase_id}\0{draft.stable_key}\0{evidence_hash}".encode("utf-8")

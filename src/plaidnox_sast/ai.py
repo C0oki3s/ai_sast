@@ -28,7 +28,7 @@ from .graph_context import GraphContextBroker
 from .graphify_adapter import CodeGraphSnapshot, GraphifyAdapterError
 from .graph_planner import GraphInvestigationPlanner, GraphPlanningError
 from .errors import AIStageError
-from .investigations import Investigation
+from .investigations import Investigation, planner_repository_context
 from .graph import (
     RipgrepDiscovery,
     RipgrepQueryError,
@@ -1180,15 +1180,7 @@ class PlaidNoxDeepHuntAgent:
                 snapshot=graph_snapshot,
                 broker=context_broker,
                 target_node_ids=selected_targets,
-                repository_context={
-                    "architecture": context.architecture,
-                    "applications": context.applications,
-                    "business_context": context.business_context,
-                    "actors": context.actors,
-                    "sensitive_assets": context.sensitive_assets,
-                    "trust_boundaries": context.trust_boundaries,
-                    "security_invariants": context.security_invariants,
-                },
+                repository_context=planner_repository_context(context.to_dict()),
                 surface_context=surface_context,
                 stable_key=stable_key,
             )

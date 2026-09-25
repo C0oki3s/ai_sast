@@ -159,6 +159,7 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
             }
         )
     )
+    repository_context = _context(snapshot, include_unmapped=True)
     fail_before_first_plan = True
 
     def plan_group(**arguments):
@@ -169,7 +170,7 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
         return planner.plan_targets(
             snapshot=snapshot,
             broker=broker,
-            repository_context={},
+            repository_context=repository_context,
             **arguments,
         )
 
@@ -180,7 +181,7 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     arguments = {
         "codebase_id": "codebase-a",
         "scan_id": "scan-a",
-        "repository_context": _context(snapshot, include_unmapped=True),
+        "repository_context": repository_context,
         "graph_snapshot": snapshot,
     }
 
@@ -220,6 +221,176 @@ def test_coordinator_persists_each_plan_and_reuses_it_after_restart(tmp_path: Pa
     assert (
         resumed.investigations[0].evidence_hash == first.investigations[0].evidence_hash
     )
+
+
+def test_coordinator_reuses_compatible_plan_across_codebase_snapshots(tmp_path: Path):
+    first_snapshot = _snapshot(tmp_path, connected=True)
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text("def unrelated():\n    return 0\n", encoding="utf-8")
+    second_snapshot = CodeGraphSnapshot(
+        source_hashes={
+            **first_snapshot.source_hashes,
+            "unrelated.py": hashlib.sha256(unrelated.read_bytes()).hexdigest(),
+        },
+        nodes=first_snapshot.nodes,
+        edges=first_snapshot.edges,
+        unresolved_edges=first_snapshot.unresolved_edges,
+        extractor_version=first_snapshot.extractor_version,
+    )
+    assert first_snapshot.snapshot_id != second_snapshot.snapshot_id
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-a", "example/account", "Account")
+        for scan_id, snapshot, revision in (
+            ("scan-a", first_snapshot, "revision-a"),
+            ("scan-b", second_snapshot, "revision-b"),
+        ):
+            repository.add_snapshot(
+                snapshot.snapshot_id,
+                "codebase-a",
+                revision,
+                f"tree-{revision}",
+                "context-v1",
+            )
+            repository.start_scan(
+                scan_id, "codebase-a", snapshot.snapshot_id, "deep", "workflow-v1"
+            )
+
+    persistence = InvestigationOrmStore(factory, "tenant-a")
+    repository_context = _context(first_snapshot)
+    model_calls = []
+    planner = GraphInvestigationPlanner(
+        lambda payload: (
+            model_calls.append(payload)
+            or {
+                "reason": "Review the account identity boundary.",
+                "security_questions": ["Can the caller select another account?"],
+                "supporting_node_ids": [],
+                "supporting_edge_keys": [],
+                "coverage_notes": [],
+            }
+        )
+    )
+    first = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=first_snapshot,
+            broker=GraphContextBroker(tmp_path, first_snapshot),
+            repository_context=repository_context,
+            **arguments,
+        ),
+        persistence=persistence,
+    ).plan(
+        codebase_id="codebase-a",
+        scan_id="scan-a",
+        repository_context=repository_context,
+        graph_snapshot=first_snapshot,
+    )
+    assert first.persisted_groups == 1
+    original_id = first.investigations[0].investigation_id
+
+    second = GraphSurfacePlanningCoordinator(
+        lambda **_arguments: pytest.fail("compatible prior plan should be reused"),
+        persistence=persistence,
+    ).plan(
+        codebase_id="codebase-a",
+        scan_id="scan-b",
+        repository_context=_context(second_snapshot),
+        graph_snapshot=second_snapshot,
+    )
+
+    reused = second.investigations[0]
+    assert second.reused_groups == 1
+    assert second.persisted_groups == 1
+    assert len(model_calls) == 1
+    assert reused.investigation_id != original_id
+    assert reused.graph_snapshot_id == second_snapshot.snapshot_id
+    assert reused.state == "planned"
+    assert reused.checkpoint_ref is None
+    assert all(
+        reference.get("snapshot_id") == second_snapshot.snapshot_id
+        for reference in reused.graph_refs
+    )
+    assert all(
+        dependency["key"] == second_snapshot.snapshot_id
+        and dependency["hash"] == second_snapshot.snapshot_id
+        for dependency in reused.context_dependencies
+        if dependency["kind"] == "graph_snapshot"
+    )
+
+
+def test_coordinator_does_not_reuse_plan_when_business_context_changes(tmp_path: Path):
+    snapshot = _snapshot(tmp_path, connected=True)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-a", "example/account", "Account")
+        for scan_id in ("scan-a", "scan-b"):
+            snapshot_id = f"{scan_id}-snapshot"
+            repository.add_snapshot(
+                snapshot_id,
+                "codebase-a",
+                scan_id,
+                f"tree-{scan_id}",
+                "context-v1",
+            )
+            repository.start_scan(
+                scan_id, "codebase-a", snapshot_id, "deep", "workflow-v1"
+            )
+
+    persistence = InvestigationOrmStore(factory, "tenant-a")
+    model_calls = []
+    planner = GraphInvestigationPlanner(
+        lambda payload: (
+            model_calls.append(payload)
+            or {
+                "reason": "Review the account identity boundary.",
+                "security_questions": ["Can the caller select another account?"],
+                "supporting_node_ids": [],
+                "supporting_edge_keys": [],
+                "coverage_notes": [],
+            }
+        )
+    )
+    context = {**_context(snapshot), "business_context": "Accounts are customer-owned."}
+    GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot,
+            broker=GraphContextBroker(tmp_path, snapshot),
+            repository_context=context,
+            **arguments,
+        ),
+        persistence=persistence,
+    ).plan(
+        codebase_id="codebase-a",
+        scan_id="scan-a",
+        repository_context=context,
+        graph_snapshot=snapshot,
+        storage_snapshot_id="scan-a-snapshot",
+    )
+    changed_context = {**context, "business_context": "Accounts belong to organizations."}
+    rerun = GraphSurfacePlanningCoordinator(
+        lambda **arguments: planner.plan_targets(
+            snapshot=snapshot,
+            broker=GraphContextBroker(tmp_path, snapshot),
+            repository_context=changed_context,
+            **arguments,
+        ),
+        persistence=persistence,
+    ).plan(
+        codebase_id="codebase-a",
+        scan_id="scan-b",
+        repository_context=changed_context,
+        graph_snapshot=snapshot,
+        storage_snapshot_id="scan-b-snapshot",
+    )
+
+    assert rerun.reused_groups == 0
+    assert rerun.persisted_groups == 1
+    assert len(model_calls) == 2
 
 
 def test_coordinator_binds_graph_evidence_to_durable_scan_snapshot(tmp_path: Path):

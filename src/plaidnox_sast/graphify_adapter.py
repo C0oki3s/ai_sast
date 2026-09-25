@@ -17,6 +17,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from .assets import load_json
 from .graph import source_files
 
 
@@ -117,7 +118,12 @@ class GraphDelta:
 
 
 def affected_investigation_ids(
-    investigations: Iterable[Any], delta: GraphDelta
+    investigations: Iterable[Any],
+    delta: GraphDelta,
+    *,
+    snapshot: CodeGraphSnapshot | None = None,
+    maximum_reverse_depth: int | None = None,
+    maximum_reverse_nodes: int | None = None,
 ) -> tuple[str, ...]:
     """Return investigations whose explicit evidence intersects a graph delta.
 
@@ -132,6 +138,53 @@ def affected_investigation_ids(
         graph_edge_identity(edge) for edge in (*delta.added_edges, *delta.removed_edges)
     }
     changed_edges = (*delta.added_edges, *delta.removed_edges)
+    fanout_nodes = set(changed_nodes)
+    fanout_nodes.update(
+        node_id
+        for edge in changed_edges
+        for node_id in (edge.source_id, edge.target_id)
+    )
+    fanout_truncated = False
+    if snapshot is not None:
+        config = load_json("runtime/code_intelligence.json")
+        depth_limit = int(
+            maximum_reverse_depth
+            if maximum_reverse_depth is not None
+            else config["maximum_reverse_dependency_depth"]
+        )
+        node_limit = int(
+            maximum_reverse_nodes
+            if maximum_reverse_nodes is not None
+            else config["maximum_reverse_dependency_nodes"]
+        )
+        if depth_limit < 1 or node_limit < 1:
+            raise ValueError("reverse dependency bounds must be positive")
+        fanout_nodes.update(
+            node.id for node in snapshot.nodes if node.path in changed_paths
+        )
+        incoming: dict[str, set[str]] = defaultdict(set)
+        for edge in snapshot.edges:
+            incoming[edge.target_id].add(edge.source_id)
+        reached = set(fanout_nodes)
+        frontier = set(fanout_nodes)
+        for _depth in range(depth_limit):
+            following = {
+                source_id
+                for target_id in frontier
+                for source_id in incoming.get(target_id, ())
+                if source_id not in reached
+            }
+            if not following:
+                frontier = set()
+                break
+            if len(reached) + len(following) > node_limit:
+                fanout_truncated = True
+                break
+            reached.update(following)
+            frontier = following
+        if frontier and any(incoming.get(node_id) for node_id in frontier):
+            fanout_truncated = True
+        fanout_nodes = reached
     affected: list[str] = []
 
     for value in investigations:
@@ -174,7 +227,7 @@ def affected_investigation_ids(
             }
             if (
                 source_paths & changed_paths
-                or node_ids & changed_nodes
+                or node_ids & fanout_nodes
                 or edge_ids & changed_edge_ids
                 or any(
                     edge.source_id in node_ids or edge.target_id in node_ids
@@ -182,6 +235,16 @@ def affected_investigation_ids(
                 )
             ):
                 affected.append(investigation_id)
+
+    if fanout_truncated:
+        # A bounded traversal cannot prove unaffected status beyond its frontier.
+        # Conservatively invalidate all valid investigation identities.
+        for value in investigations:
+            payload = value.payload() if callable(getattr(value, "payload", None)) else value
+            if isinstance(payload, Mapping):
+                investigation_id = payload.get("investigation_id")
+                if isinstance(investigation_id, str) and investigation_id:
+                    affected.append(investigation_id)
 
     return tuple(sorted(set(affected)))
 
@@ -216,6 +279,93 @@ def graph_edge_identity(edge: CodeEdge) -> str:
     ]
     canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def graph_node_neighborhood_hash(snapshot: CodeGraphSnapshot, node_id: str) -> str | None:
+    """Fingerprint all observed incoming/outgoing edges for one stable node."""
+    if node_id not in {node.id for node in snapshot.nodes}:
+        return None
+    edge_ids = sorted(
+        graph_edge_identity(edge)
+        for edge in snapshot.edges
+        if edge.source_id == node_id or edge.target_id == node_id
+    )
+    return hashlib.sha256(
+        json.dumps(edge_ids, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def investigation_graph_mismatches(
+    investigation: Any,
+    snapshot: CodeGraphSnapshot,
+    *,
+    expected_planning_context_hash: str | None = None,
+) -> tuple[str, ...]:
+    """Explain why persisted graph evidence cannot be reused in ``snapshot``.
+
+    Older investigation records without full node-neighborhood fingerprints are
+    deliberately invalidated: their bounded prompt edges cannot prove that no
+    new relationship was added outside the selected slice.
+    """
+    payload = investigation.payload() if callable(getattr(investigation, "payload", None)) else investigation
+    if not isinstance(payload, Mapping):
+        return ("invalid_investigation_payload",)
+
+    nodes = {node.id: node for node in snapshot.nodes}
+    edge_ids = {graph_edge_identity(edge) for edge in snapshot.edges}
+    dependencies = payload.get("context_dependencies", ())
+    mismatches: set[str] = set()
+    node_dependencies: set[str] = set()
+    neighborhood_dependencies: dict[str, str] = {}
+    planning_context_found = False
+
+    for dependency in dependencies:
+        if not isinstance(dependency, Mapping):
+            continue
+        kind = dependency.get("kind")
+        key = dependency.get("key")
+        expected_hash = dependency.get("hash")
+        if not isinstance(key, str):
+            continue
+        if kind == "graph_node":
+            node_dependencies.add(key)
+            node = nodes.get(key)
+            if node is None:
+                mismatches.add("graph_node_missing")
+            elif node.source_hash != expected_hash:
+                mismatches.add("graph_node_changed")
+        elif kind == "graph_edge" and key not in edge_ids:
+            mismatches.add("graph_edge_missing")
+        elif kind == "graph_node_neighborhood" and isinstance(expected_hash, str):
+            neighborhood_dependencies[key] = expected_hash
+        elif kind == "planning_context" and expected_planning_context_hash is not None:
+            planning_context_found = True
+            if expected_hash != expected_planning_context_hash:
+                mismatches.add("planning_context_changed")
+
+    for node_id in node_dependencies:
+        expected = neighborhood_dependencies.get(node_id)
+        if expected is None:
+            mismatches.add("graph_node_neighborhood_unavailable")
+            continue
+        current = graph_node_neighborhood_hash(snapshot, node_id)
+        if current is None:
+            mismatches.add("graph_node_missing")
+        elif current != expected:
+            mismatches.add("graph_node_neighborhood_changed")
+    if expected_planning_context_hash is not None and not planning_context_found:
+        mismatches.add("planning_context_unavailable")
+
+    source_hashes = snapshot.source_hashes
+    for window in payload.get("source_windows", ()):
+        if not isinstance(window, Mapping):
+            continue
+        path = window.get("path")
+        content_hash = window.get("content_hash")
+        if isinstance(path, str) and source_hashes.get(path) != content_hash:
+            mismatches.add("source_window_changed")
+
+    return tuple(sorted(mismatches))
 
 
 def _edge_sort_key(edge: CodeEdge) -> tuple[str, str, str, str, int]:

@@ -18,8 +18,14 @@ from .graphify_adapter import (
     CodeNode,
     GraphifyAdapterError,
     graph_edge_identity,
+    graph_node_neighborhood_hash,
 )
-from .investigations import Investigation, build_investigation
+from .investigations import (
+    Investigation,
+    build_investigation,
+    planner_repository_context,
+    planning_context_hash,
+)
 from .redaction import redact_payload
 
 
@@ -203,7 +209,9 @@ class GraphInvestigationPlanner:
 
         edge_keys = {_edge_key(edge): edge for edge in selected_edges}
         payload = {
-            "repository_context": redact_payload(dict(repository_context)),
+            "repository_context": redact_payload(
+                planner_repository_context(repository_context)
+            ),
             "graph_snapshot_id": snapshot.snapshot_id,
             "targets": [
                 _node_payload(target, windows_by_node[target.id]) for target in targets
@@ -287,6 +295,14 @@ class GraphInvestigationPlanner:
             for node in (nodes_by_id[node_id] for node_id in sorted(referenced_ids))
         ]
         dependencies.extend(
+            {
+                "kind": "graph_node_neighborhood",
+                "key": node_id,
+                "hash": graph_node_neighborhood_hash(snapshot, node_id),
+            }
+            for node_id in sorted(referenced_ids)
+        )
+        dependencies.extend(
             {"kind": "graph_edge", "key": key, "hash": edge_keys[key].source_hash}
             for key in sorted(supporting_edge_keys)
         )
@@ -295,6 +311,16 @@ class GraphInvestigationPlanner:
                 "kind": "graph_snapshot",
                 "key": snapshot.snapshot_id,
                 "hash": snapshot.snapshot_id,
+            }
+        )
+        dependencies.append(
+            {
+                "kind": "planning_context",
+                "key": "repository-and-surface-context",
+                "hash": planning_context_hash(
+                    repository_context,
+                    tuple(dict(item) for item in surface_context),
+                ),
             }
         )
         coverage_notes = [str(note) for note in plan["coverage_notes"]]
