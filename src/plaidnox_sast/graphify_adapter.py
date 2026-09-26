@@ -134,6 +134,7 @@ def affected_investigation_ids(
     may add reverse-dependency fanout separately when their graph provider can
     prove those relationships.
     """
+    investigations = tuple(investigations)
     changed_paths = set(delta.added_files + delta.changed_files + delta.removed_files)
     changed_nodes = set(delta.added_node_ids + delta.changed_node_ids + delta.removed_node_ids)
     changed_edge_ids = {

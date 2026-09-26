@@ -367,7 +367,10 @@ def test_graph_delta_uses_bounded_reverse_dependency_fanout(tmp_path: Path) -> N
         investigations, delta, snapshot=snapshot
     ) == ("route-review",)
     assert affected_investigation_ids(
-        investigations, delta, snapshot=snapshot, maximum_reverse_depth=1
+        (item for item in investigations),
+        delta,
+        snapshot=snapshot,
+        maximum_reverse_depth=1,
     ) == ("route-review", "unrelated")
 
 
