@@ -11,10 +11,11 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["case_id", "report_path", "expected_findings"],
+          "required": ["case_id", "report_path", "expected_findings"],
         "properties": {
           "case_id": {"type": "string", "minLength": 1},
           "report_path": {"type": "string", "minLength": 1},
+          "comparison_report_path": {"type": "string", "minLength": 1},
           "expected_findings": {
             "type": "array",
             "items": {

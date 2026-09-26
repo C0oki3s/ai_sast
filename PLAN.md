@@ -229,18 +229,31 @@ Status: generic incremental core implemented; precision adapters deferred.
   while symbol summaries retain call-site text, uniquely resolved target IDs,
   and explicit limitations. Input trust, call semantics, and side effects remain
   unresolved; these are retrieval facts for later AI reasoning, not security
-  conclusions. Next extend indexed surfaces to explicit state/network/filesystem/
-  rendering effects using parser facts or AI-derived annotations with
-  provenance. Keep obligations scoped to canonical surfaces; do not repeat
-  repository-wide questions per region.
+  conclusions. Repository-context reconnaissance now asks for open-taxonomy
+  `sensitive_effects` covering state/persistence, outbound network, filesystem,
+  and rendering/template/PDF operations, each with source-grounded locations.
+  These effects use the existing repository-context and Graphify surface contract,
+  so no framework-specific effect patterns or closed vulnerability taxonomy are
+  embedded in the runtime. Keep obligations scoped to canonical surfaces; do not
+  repeat repository-wide questions per region.
   Repository-context reconnaissance now receives a compact, area-balanced
   inventory with exact primary source windows, related symbol IDs, unresolved
   edges, and explicit omission counts. Incremental context includes only
   surfaces intersecting changed/affected paths. Live discovery batches
   region-derived worksets and adds graph-derived cross-file evidence for
-  unambiguous route/registration matches. Persisted summary reuse has not yet
-  been connected to that live planner. Deep Hunt
-  receives canonical candidates after discovery and retains its verification
+  unambiguous route/registration matches. Persisted per-symbol summaries are now
+  loaded from the exact Context Fabric base/overlay and supplied to Graphify
+  planning only when their source paths overlap the bounded graph neighborhood.
+  Summary count/fact limits are external runtime policy; summaries remain syntax
+  observations and unresolved edges stay explicit. Typed Graphify lookups use
+  configured CALLS/REFERENCES/IMPORTS relationships instead of treating every
+  adjacent edge as equivalent. When a typed lookup yields no nodes or edges, an
+  AI-provided literal can use bounded fixed-string ripgrep against the same
+  admitted-file policy; source windows are hash-checked and labeled as fallback
+  evidence, with the requested graph relationship still unresolved. Generic
+  effect-family mapping, summary reuse/path scoping, configured relationship
+  selection, and fallback-without-synthetic-edges have focused regression tests.
+  Deep Hunt receives canonical candidates after discovery and retains its verification
   gates.
 - **AI-derived annotation location grounding implemented:** repository-context
   records for input surfaces, trust boundaries, entry points, sensitive effects,

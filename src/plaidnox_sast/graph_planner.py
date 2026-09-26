@@ -89,6 +89,7 @@ class GraphInvestigationPlanner:
         broker: GraphContextBroker,
         target_node_id: str,
         repository_context: Mapping[str, Any],
+        security_summaries: Sequence[Mapping[str, Any]] = (),
     ) -> Investigation:
         return self.plan_targets(
             codebase_id=codebase_id,
@@ -96,6 +97,7 @@ class GraphInvestigationPlanner:
             broker=broker,
             target_node_ids=(target_node_id,),
             repository_context=repository_context,
+            security_summaries=security_summaries,
             stable_key=f"graph-node:{target_node_id}",
         )
 
@@ -108,6 +110,7 @@ class GraphInvestigationPlanner:
         target_node_ids: Sequence[str],
         repository_context: Mapping[str, Any],
         surface_context: Sequence[Mapping[str, Any]] = (),
+        security_summaries: Sequence[Mapping[str, Any]] = (),
         stable_key: str | None = None,
     ) -> Investigation:
         """Plan one bounded investigation for one or more connected graph targets."""
@@ -207,6 +210,15 @@ class GraphInvestigationPlanner:
                 "redaction_state": "redacted",
             }
 
+        summary_policy = load_json("runtime/code_intelligence.json")
+        summary_paths = {window["path"] for window in windows_by_node.values()}
+        selected_summaries = _select_security_summaries(
+            security_summaries,
+            source_paths=summary_paths,
+            maximum=int(summary_policy["maximum_planner_security_summaries"]),
+            maximum_facts=int(summary_policy["maximum_planner_summary_facts"]),
+        )
+
         edge_keys = {_edge_key(edge): edge for edge in selected_edges}
         payload = {
             "repository_context": redact_payload(
@@ -217,6 +229,7 @@ class GraphInvestigationPlanner:
                 _node_payload(target, windows_by_node[target.id]) for target in targets
             ],
             "surface_context": redact_payload(grounded_surfaces),
+            "cached_security_summaries": redact_payload(selected_summaries),
             "graph_nodes": [
                 _node_payload(node, windows_by_node[node.id]) for node in evidence_nodes
             ],
@@ -317,9 +330,8 @@ class GraphInvestigationPlanner:
             {
                 "kind": "planning_context",
                 "key": "repository-and-surface-context",
-                "hash": planning_context_hash(
-                    repository_context,
-                    tuple(dict(item) for item in surface_context),
+                "hash": _planning_input_hash(
+                    repository_context, surface_context, selected_summaries
                 ),
             }
         )
@@ -372,6 +384,70 @@ def _node_sort_key(node: CodeNode) -> tuple[str, int, str]:
 
 def _edge_key(edge: CodeEdge) -> str:
     return graph_edge_identity(edge)
+
+
+def _select_security_summaries(
+    summaries: Sequence[Mapping[str, Any]],
+    *,
+    source_paths: set[str],
+    maximum: int,
+    maximum_facts: int,
+) -> list[dict[str, Any]]:
+    """Select persisted syntax summaries that overlap the bounded graph slice."""
+    if maximum < 1 or maximum_facts < 1:
+        raise ValueError("security-summary limits must be positive")
+    selected: list[dict[str, Any]] = []
+    for summary in summaries:
+        facts = summary.get("facts", [])
+        if not isinstance(facts, list):
+            continue
+        relevant = [
+            dict(fact)
+            for fact in facts
+            if isinstance(fact, Mapping)
+            and str(fact.get("path", "")) in source_paths
+        ][:maximum_facts]
+        if not relevant:
+            continue
+        selected.append(
+            {
+                "symbol_id": str(summary.get("symbol_id", "")),
+                "content_hash": str(summary.get("content_hash", "")),
+                "facts": relevant,
+                "dependency_symbol_ids": [
+                    str(item) for item in summary.get("dependency_symbol_ids", [])
+                ],
+                "unresolved_relationship_ids": [
+                    str(item)
+                    for item in summary.get("unresolved_relationship_ids", [])
+                ],
+                "provenance": "persisted_tree_sitter_syntax_summary",
+                "interpretation_limit": "structural retrieval evidence; not data-flow, reachability, or security proof",
+            }
+        )
+        if len(selected) >= maximum:
+            break
+    return selected
+
+
+def _planning_input_hash(
+    repository_context: Mapping[str, Any],
+    surface_context: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+) -> str:
+    base = planning_context_hash(
+        repository_context, tuple(dict(item) for item in surface_context)
+    )
+    if not summaries:
+        return base
+    return hashlib.sha256(
+        json.dumps(
+            {"context": base, "security_summaries": summaries},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _node_payload(node: CodeNode, window: Mapping[str, Any]) -> dict[str, Any]:

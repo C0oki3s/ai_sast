@@ -15,6 +15,7 @@ from .graphify_adapter import (
     GraphifyAdapterError,
     graph_edge_identity,
 )
+from .graph import RipgrepDiscovery, RipgrepQueryError
 from .redaction import redact
 
 
@@ -45,6 +46,7 @@ class GraphContextBroker:
         *,
         maximum_edges: int | None = None,
         maximum_source_characters: int | None = None,
+        fallback_discovery: RipgrepDiscovery | None = None,
     ) -> None:
         policy = load_json("runtime/code_intelligence.json")
         self.root = root.resolve()
@@ -56,6 +58,7 @@ class GraphContextBroker:
         if self.maximum_edges < 1 or self.maximum_source_characters < 1:
             raise ValueError("Graph context limits must be positive")
         self._nodes = {node.id: node for node in snapshot.nodes}
+        self.fallback_discovery = fallback_discovery
 
     def definitions(self, label: str, *, path: str | None = None) -> tuple[CodeNode, ...]:
         """Return exact label matches; several results remain explicitly ambiguous."""
@@ -110,12 +113,15 @@ class GraphContextBroker:
             seeds = self.definitions(symbol, path=path or None)
             edges = []
             related_nodes: dict[str, CodeNode] = {}
-            expected_relation = resolver.get("relation")
+            expected_relations = resolver.get("relations")
+            if not isinstance(expected_relations, list):
+                expected_relations = [resolver.get("relation")]
             direction = str(resolver.get("direction", "both"))
             for seed in seeds:
-                lookup_part = self._related(seed.id, relation=expected_relation, direction=direction)
-                edges.extend(lookup_part.edges)
-                related_nodes.update((node.id, node) for node in lookup_part.nodes)
+                for expected_relation in expected_relations:
+                    lookup_part = self._related(seed.id, relation=expected_relation, direction=direction)
+                    edges.extend(lookup_part.edges)
+                    related_nodes.update((node.id, node) for node in lookup_part.nodes)
             selected_edges = tuple(dict.fromkeys(edges))[:maximum_results]
             selected_nodes = tuple(sorted(related_nodes.values(), key=lambda item: (item.path, item.line, item.id)))[:maximum_results]
             lookup = GraphLookup(selected_nodes, selected_edges, len(edges) > maximum_results, self.snapshot.unresolved_edges)
@@ -136,7 +142,7 @@ class GraphContextBroker:
                 source_windows.append(_window_payload(self.source_window_around_node(node.id, lines_before=before, lines_after=after)))
             except GraphifyAdapterError:
                 continue
-        return {
+        result = {
             "request": kind,
             "nodes": [
                 {"node_id": node.id, "label": node.label, "path": node.path, "line": node.line, "source_hash": node.source_hash}
@@ -149,6 +155,71 @@ class GraphContextBroker:
             "source_windows": source_windows,
             "truncated": lookup.truncated,
             "unresolved_edges": lookup.unresolved_edges,
+        }
+        if (
+            not lookup.nodes
+            and not lookup.edges
+            and bool(load_json("runtime/code_intelligence.json")["graph_context_rg_fallback_enabled"])
+            and self.fallback_discovery is not None
+            and query.strip()
+        ):
+            result.update(self._rg_fallback(kind, query, maximum_results))
+        return result
+
+    def _rg_fallback(self, kind: str, query: str, maximum_results: int) -> dict:
+        """Use an AI-provided literal only after Graphify cannot resolve it.
+
+        Search results are source evidence, never synthetic graph relationships.
+        The caller can see that relationship resolution remains outstanding.
+        """
+        try:
+            hits = self.fallback_discovery.search_literals(
+                f"graph-context:{kind}", [query]
+            )[:maximum_results]
+        except RipgrepQueryError:
+            return {
+                "source_windows": [],
+                "fallback": {
+                    "provider": "ripgrep",
+                    "query_kind": kind,
+                    "hit_count": 0,
+                    "relationship_status": "unresolved",
+                    "provenance": "ai_directed_fixed_string_source_match",
+                    "error": "fallback_query_failed_or_exceeded_policy",
+                },
+            }
+        policy = load_json("runtime/code_intelligence.json")
+        before = int(policy["investigation_context_lines_before"])
+        after = int(policy["investigation_context_lines_after"])
+        windows = []
+        for hit in hits:
+            if hit.path not in self.snapshot.source_hashes:
+                continue
+            try:
+                content = (self.root / hit.path).read_bytes()
+                line_count = len(content.decode("utf-8").splitlines())
+                if line_count < 1:
+                    continue
+                windows.append(
+                    _window_payload(
+                        self.source_window(
+                            hit.path,
+                            max(1, hit.line - before),
+                            min(line_count, hit.line + after),
+                        )
+                    )
+                )
+            except (GraphifyAdapterError, OSError, UnicodeDecodeError):
+                continue
+        return {
+            "source_windows": windows,
+            "fallback": {
+                "provider": "ripgrep",
+                "query_kind": kind,
+                "hit_count": len(windows),
+                "relationship_status": "unresolved",
+                "provenance": "ai_directed_fixed_string_source_match",
+            },
         }
 
     def source_window_around_node(

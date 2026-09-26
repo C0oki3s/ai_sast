@@ -1175,6 +1175,11 @@ class PlaidNoxDeepHuntAgent:
                 selected_targets = (target_node_id,)
             if not selected_targets:
                 raise GraphPlanningError("at least one Graphify target node is required")
+            security_summaries = self._load_graph_planner_security_summaries(
+                context,
+                graph_snapshot,
+                selected_targets,
+            )
             investigation = planner.plan_targets(
                 codebase_id=codebase_id,
                 snapshot=graph_snapshot,
@@ -1182,6 +1187,7 @@ class PlaidNoxDeepHuntAgent:
                 target_node_ids=selected_targets,
                 repository_context=planner_repository_context(context.to_dict()),
                 surface_context=surface_context,
+                security_summaries=security_summaries,
                 stable_key=stable_key,
             )
         except GraphPlanningError as exc:
@@ -1197,6 +1203,66 @@ class PlaidNoxDeepHuntAgent:
             source_windows=len(investigation.source_windows),
         )
         return investigation
+
+    def _load_graph_planner_security_summaries(
+        self,
+        context: AIRepositoryContext,
+        snapshot: CodeGraphSnapshot,
+        target_node_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Load exact-snapshot persisted summaries for the bounded target neighborhood."""
+        if self.context_store is None:
+            return []
+        context_fabric = context.context_fabric
+        context_id = str(context_fabric.get("context_id", ""))
+        overlay_id = str(context_fabric.get("overlay_id", ""))
+        try:
+            if overlay_id and callable(
+                getattr(self.context_store, "effective_security_summaries", None)
+            ):
+                summaries = self.context_store.effective_security_summaries(overlay_id)
+            elif context_id and callable(
+                getattr(self.context_store, "list_security_summaries", None)
+            ):
+                summaries = self.context_store.list_security_summaries(context_id)
+            elif context_id and callable(
+                getattr(self.context_store, "effective_security_summaries", None)
+            ):
+                summaries = self.context_store.effective_security_summaries(context_id)
+            else:
+                return []
+        except (KeyError, TypeError, ValueError):
+            self._emit("graph_planner_security_summaries_unavailable", reason="context_lookup_failed")
+            return []
+
+        nodes = {node.id: node for node in snapshot.nodes}
+        relevant_ids = set(target_node_ids)
+        for edge in snapshot.edges:
+            if edge.source_id in relevant_ids or edge.target_id in relevant_ids:
+                relevant_ids.update((edge.source_id, edge.target_id))
+        paths = {nodes[node_id].path for node_id in relevant_ids if node_id in nodes}
+        selected: list[dict[str, Any]] = []
+        for item in summaries:
+            if not isinstance(item, Mapping):
+                continue
+            facts = item.get("facts", [])
+            if not isinstance(facts, list):
+                continue
+            relevant_facts = [
+                dict(fact)
+                for fact in facts
+                if isinstance(fact, Mapping)
+                and str(fact.get("path", "")) in paths
+            ]
+            if relevant_facts:
+                selected.append({**dict(item), "facts": relevant_facts})
+        self._emit(
+            "graph_planner_security_summaries_loaded",
+            summaries=len(selected),
+            source_paths=len(paths),
+            context_id=context_id,
+        )
+        return selected
 
     def hunt_graph_investigation(
         self,
@@ -1255,6 +1321,9 @@ class PlaidNoxDeepHuntAgent:
         context_requests_resolved = 0
         context_requests_empty = 0
         context_requests_deferred = 0
+        rg_fallback_requests = 0
+        rg_fallback_hits = 0
+        rg_fallback_failures = 0
         continuation_calls = 0
         context_truncated = False
         context_characters = 0
@@ -1372,12 +1441,19 @@ class PlaidNoxDeepHuntAgent:
             context_requests_deferred += max(0, len(requests) - maximum_requests)
             new_context_windows: dict[tuple, dict[str, Any]] = {}
             new_refs: dict[str, dict[str, Any]] = {}
+            fallback_evidence: list[dict[str, Any]] = []
             for request in requests[:maximum_requests]:
                 try:
                     resolved = context_broker.resolve_request(request, maximum_results=int(load_json("runtime/code_intelligence.json")["maximum_investigation_context_results"]))
                 except Exception:
                     resolved = {"nodes": [], "edges": [], "source_windows": [], "truncated": False}
                 context_truncated = context_truncated or bool(resolved.get("truncated"))
+                if isinstance(resolved.get("fallback"), dict):
+                    fallback_result = dict(resolved["fallback"])
+                    fallback_evidence.append(fallback_result)
+                    rg_fallback_requests += 1
+                    rg_fallback_hits += int(fallback_result.get("hit_count", 0))
+                    rg_fallback_failures += int("error" in fallback_result)
                 added_evidence = False
                 for window in resolved.get("source_windows", []):
                     try:
@@ -1410,6 +1486,7 @@ class PlaidNoxDeepHuntAgent:
             delta = {
                 "source_windows": delta_windows,
                 "graph_relationships": list(new_refs.values()),
+                "fallback_evidence": fallback_evidence,
                 "truncated": context_truncated,
             }
             # Graph relationships without new source still count as new machine evidence;
@@ -1442,6 +1519,9 @@ class PlaidNoxDeepHuntAgent:
             "context_requests_resolved": context_requests_resolved,
             "context_requests_empty": context_requests_empty,
             "context_requests_deferred": context_requests_deferred,
+            "rg_fallback_requests": rg_fallback_requests,
+            "rg_fallback_hits": rg_fallback_hits,
+            "rg_fallback_failures": rg_fallback_failures,
             "continuation_calls": continuation_calls,
             "context_truncated": context_truncated,
             "context_characters": context_characters,

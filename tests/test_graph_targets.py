@@ -66,6 +66,31 @@ def test_maps_only_exact_hash_grounded_locations_and_keeps_stable_surface_key():
     assert first.graph_target_ids == ("route",)
 
 
+@pytest.mark.parametrize(
+    "effect_type",
+    ["state_mutation", "network_egress", "filesystem_write", "rendering"],
+)
+def test_open_effect_families_are_graph_targets_when_source_grounded(effect_type: str):
+    snapshot = _snapshot()
+    context = {
+        "sensitive_effects": [
+            _surface(
+                f"observed {effect_type}",
+                3,
+                3,
+                snapshot.source_hashes["app.py"],
+                effect_id=f"effect-{effect_type}",
+                effect_type=effect_type,
+            )
+        ]
+    }
+
+    inventory = map_repository_surfaces_to_graph(context, snapshot)
+
+    assert inventory.targets[0].mapping_status is GraphTargetMappingStatus.MAPPED
+    assert inventory.targets[0].collection == "sensitive_effects"
+
+
 def test_preserves_all_overlapping_nodes_as_ambiguous_instead_of_guessing():
     snapshot = _snapshot()
     context = {

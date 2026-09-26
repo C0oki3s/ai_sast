@@ -28,6 +28,9 @@
   "maximum_planner_target_nodes": 12,
   "maximum_planner_input_characters": 80000,
   "maximum_planner_output_tokens": 2500,
+  "maximum_planner_security_summaries": 24,
+  "maximum_planner_summary_facts": 12,
+  "graph_context_rg_fallback_enabled": true,
   "planner_repository_context_fields": [
     "architecture",
     "applications",

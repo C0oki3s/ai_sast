@@ -243,7 +243,16 @@ unresolved/failed`). Structured discovery responses use the existing LiteLLM
 response checkpoint, so completed calls replay without provider calls. Typed
 Graphify context expansion is bounded to one delta continuation, at most three
 requests and a configured source-character budget; repeat/empty context cannot
-trigger another model call. Source excerpts are rechecked against the current
+trigger another model call. Exact-snapshot persisted Tree-sitter summaries are
+loaded into Graphify planning only for paths in the bounded graph neighborhood,
+with external limits and explicit syntax-only provenance. Typed relationship
+requests use configured CALLS/REFERENCES/IMPORTS edge kinds. If Graphify returns
+no relationship, a bounded AI-provided literal may use fixed-string `rg` under
+the same admitted-file policy; the result is source-grounded fallback evidence
+and does not manufacture a graph edge. Repository reconnaissance's open-ended
+`sensitive_effects` now explicitly covers state/persistence, outbound network,
+filesystem, and rendering/template/PDF effects with exact source locations.
+Source excerpts are rechecked against the current
 snapshot and redaction output before every model request. Context request yield,
 continuation count, and characters are reported. Typed request-to-graph mappings
 live in `runtime/graph_context_queries.json`, separate from resolver execution.
@@ -264,10 +273,10 @@ now available as `affected_investigation_ids()` in
 files, nodes, edges, and newly changed edges attached to their target nodes,
 without treating the global snapshot marker as a dependency on every task.
 `tests/test_graphify_adapter.py` verifies affected versus unrelated work and
-removed-edge dependencies. The next implementation step is wiring this mapping
-into cross-snapshot reuse and adding graph-derived reverse-dependency fanout;
-until then, cross-snapshot investigation reuse remains deferred and Graphify
-execution stays opt-in.
+removed-edge dependencies. Cross-snapshot planning reuse, graph invalidation,
+and finding dependency carry-forward are implemented and persistence-tested.
+Graphify remains opt-in pending real acceptance evidence for seeded recall,
+finding preservation, grounding, coverage gaps, interruption/resume, and cost.
 
 The sections below describe the current Tree-sitter/`rg` runtime and its
 already implemented contracts. They are migration inputs, not the new target.
@@ -341,7 +350,8 @@ batch now also receives a required open-ended surface-review obligation with a
 stable workset identity, so a clean answer from one batch cannot complete a
 multi-batch surface. The task plan retains hunt-specific obligations. Coverage
 of trust-boundary and sensitive-effect surfaces that produce no search-hit
-region, and richer workset-owned obligation generation, remain open. Tree-sitter
+region is supplied by AI reconnaissance annotations and remains subject to the
+pinned acceptance scan. Tree-sitter
 indexed HTTP routes and top-level symbol registrations in admitted source scope
 now seed regions even when `rg` returns no hit; already covered source is reused.
 Registration roles, runtime reachability, and security semantics remain
@@ -358,12 +368,15 @@ SQLite and PostgreSQL overlays store only changed summary records and deletion
 tombstones; effective readers merge parent snapshots with sparse deltas. The
 PostgreSQL schema adds a dedicated overlay-summary table and tenant-scoped ORM
 resolution. Tests cover changed callee fanout, updated caller relationships,
-line-only provenance shifts, and deleted symbols. Live scan orchestration still
-does not consume these summaries.
+line-only provenance shifts, and deleted symbols. Live Graphify planning now
+loads persisted summaries for the current Context Fabric base/overlay, scopes
+them to graph-neighborhood source paths, and caps the planner payload through
+runtime assets. Summary facts remain syntax observations, not security claims.
 
 Next: validate Graphify's structural extraction and stable PlaidNox IDs on the
-existing regression corpus. Preserve persisted summaries and overlays until
-Graphify-backed context retrieval and investigation invalidation are tested.
+existing regression corpus and run the real paired acceptance suite. Preserve
+persisted summaries and overlays until Graphify-backed context retrieval and
+investigation invalidation pass release acceptance.
 SCIP, Joern, and OpenGrep remain optional future evidence adapters.
 No indexer, CPG engine, or deterministic scanner is a final verdict authority.
 All reportable candidates still require independent PlaidNox Deep Hunt

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from plaidnox_sast.graph_context import GraphContextBroker
+from plaidnox_sast.graph import RipgrepDiscovery
 from plaidnox_sast.graphify_adapter import GraphifyAdapterError, normalize_extraction
 
 
@@ -103,3 +104,42 @@ def test_graph_broker_does_not_claim_evidence_for_unmatched_typed_request(tmp_pa
     assert result["nodes"] == []
     assert result["edges"] == []
     assert result["source_windows"] == []
+
+
+def test_graph_broker_uses_literal_rg_fallback_without_fabricating_edges(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    broker = GraphContextBroker(
+        tmp_path,
+        snapshot,
+        fallback_discovery=RipgrepDiscovery(tmp_path),
+    )
+
+    result = broker.resolve_request(
+        {
+            "kind": "callers",
+            "symbol": "missing_symbol",
+            "query": "return effect()",
+        }
+    )
+
+    assert result["nodes"] == []
+    assert result["edges"] == []
+    assert result["fallback"]["provider"] == "ripgrep"
+    assert result["fallback"]["relationship_status"] == "unresolved"
+    assert result["fallback"]["hit_count"] == 1
+    assert result["source_windows"][0]["content_hash"] == snapshot.source_hashes["service.py"]
+
+
+def test_graph_relationship_resolvers_use_configured_edges_not_generic_adjacency(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    broker = GraphContextBroker(tmp_path, snapshot)
+
+    route_context = broker.resolve_request(
+        {"kind": "middleware", "symbol": "entry()", "path": "service.py"}
+    )
+    reader_context = broker.resolve_request(
+        {"kind": "readers", "symbol": "entry()", "path": "service.py"}
+    )
+
+    assert [item["relation"] for item in route_context["edges"]] == ["calls"]
+    assert reader_context["edges"] == []

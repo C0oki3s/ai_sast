@@ -29,7 +29,7 @@ from .fingerprint import (
     candidate_fingerprint,
     deduplicate,
 )
-from .graph import build_structural_graph
+from .graph import RipgrepDiscovery, build_structural_graph
 from .graph import source_file_is_admitted
 from .graph_context import GraphContextBroker
 from .graph_surface_planning import (
@@ -769,7 +769,15 @@ class SastPipeline:
                         max_file_bytes=config.max_file_bytes,
                         cache_root=graph_cache,
                     )
-                    broker = GraphContextBroker(root, graph_snapshot)
+                    broker = GraphContextBroker(
+                        root,
+                        graph_snapshot,
+                        fallback_discovery=RipgrepDiscovery(
+                            root,
+                            exclude=config.exclude,
+                            max_file_bytes=config.max_file_bytes,
+                        ),
+                    )
                     graphify_snapshot_id = graph_snapshot.snapshot_id
                     graphify_node_count = len(graph_snapshot.nodes)
                     graphify_edge_count = len(graph_snapshot.edges)

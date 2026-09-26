@@ -12,6 +12,7 @@ from plaidnox_sast.graph_planner import (
     GraphInvestigationPlanner,
     GraphPlanningError,
     GraphPlanningLimits,
+    _select_security_summaries,
 )
 from plaidnox_sast.graphify_adapter import (
     CodeGraphSnapshot,
@@ -24,6 +25,70 @@ from plaidnox_sast.models import ModelTier
 
 def test_graph_planner_target_batch_limit_is_loaded_from_runtime_asset():
     assert GraphPlanningLimits.configured().maximum_target_nodes == 12
+
+
+def test_persisted_security_summaries_are_scoped_to_graph_source_paths():
+    selected = _select_security_summaries(
+        [
+            {
+                "symbol_id": "symbol-a",
+                "content_hash": "hash-a",
+                "facts": [
+                    {"kind": "indexed_symbol", "path": "account.py"},
+                    {"kind": "indexed_symbol", "path": "unrelated.py"},
+                ],
+            }
+        ],
+        source_paths={"account.py"},
+        maximum=4,
+        maximum_facts=3,
+    )
+
+    assert selected[0]["symbol_id"] == "symbol-a"
+    assert [item["path"] for item in selected[0]["facts"]] == ["account.py"]
+    assert selected[0]["provenance"] == "persisted_tree_sitter_syntax_summary"
+
+
+def test_agent_loads_persisted_summaries_for_graph_targets(tmp_path: Path):
+    snapshot = _graph(tmp_path)
+    target = next(node for node in snapshot.nodes if node.label == "update_account()")
+
+    class Store:
+        def list_security_summaries(self, context_id):
+            assert context_id == "ctx-current"
+            return [
+                {
+                    "symbol_id": "summary-account",
+                    "content_hash": "summary-hash",
+                    "facts": [{"kind": "indexed_symbol", "path": "account.py"}],
+                },
+                {
+                    "symbol_id": "summary-other",
+                    "content_hash": "other-hash",
+                    "facts": [{"kind": "indexed_symbol", "path": "other.py"}],
+                },
+            ]
+
+    agent = object.__new__(PlaidNoxDeepHuntAgent)
+    agent.context_store = Store()
+    agent.event_sink = None
+    context = AIRepositoryContext(
+        codebase="codebase",
+        revision="revision",
+        architecture="",
+        applications=[],
+        source_inventory=[],
+        source_tree=[],
+        graph_symbols=0,
+        graph_routes=0,
+        context_fabric={"context_id": "ctx-current"},
+    )
+
+    summaries = agent._load_graph_planner_security_summaries(
+        context, snapshot, (target.id,)
+    )
+
+    assert [item["symbol_id"] for item in summaries] == ["summary-account"]
 
 
 def _graph(root: Path):
@@ -96,9 +161,22 @@ def test_graph_planner_builds_source_grounded_open_ended_investigation(tmp_path:
         broker=broker,
         target_node_id=target.id,
         repository_context={"business_context": "Accounts are customer-owned."},
+        security_summaries=[
+            {
+                "symbol_id": "summary-account",
+                "content_hash": "summary-hash",
+                "facts": [
+                    {"kind": "indexed_symbol", "path": "account.py", "name": "update_account"}
+                ],
+                "dependency_symbol_ids": [],
+                "unresolved_relationship_ids": [],
+            }
+        ],
     )
 
     assert len(observed) == 1
+    assert observed[0]["cached_security_summaries"][0]["symbol_id"] == "summary-account"
+    assert observed[0]["cached_security_summaries"][0]["provenance"] == "persisted_tree_sitter_syntax_summary"
     assert result.target_ref["node_id"] == target.id
     assert result.security_questions == (
         "Is the selected account bound to the authenticated principal?",

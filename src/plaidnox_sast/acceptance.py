@@ -32,6 +32,8 @@ class AcceptanceResult:
     model_input_tokens: int
     model_output_tokens: int
     model_cost_usd: float
+    comparison_findings_preserved: int
+    comparison_findings_lost: int
     case_results: list[dict[str, Any]]
     failures: list[str]
 
@@ -61,6 +63,8 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
         "input_tokens": 0,
         "output_tokens": 0,
         "cost": 0.0,
+        "comparison_preserved": 0,
+        "comparison_lost": 0,
     }
     case_results: list[dict[str, Any]] = []
     engineering_failures: list[str] = []
@@ -74,9 +78,13 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
         fingerprints = [str(item.get("fingerprint", "")) for item in findings if item.get("fingerprint")]
         duplicates = len(fingerprints) - len(set(fingerprints))
         metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
-        incomplete = bool(metrics.get("ai_scan_incomplete")) or str(
+        incomplete = (
+            bool(metrics.get("ai_scan_incomplete"))
+            or str(report.get("scan_status", "")).upper() == "UNSUCCESSFUL"
+            or str(
             (report.get("policy") or {}).get("decision", "")
-        ).lower() == "incomplete"
+            ).lower() == "incomplete"
+        )
         totals["tp"] += len(matches)
         totals["fp"] += len(unmatched_findings)
         totals["fn"] += len(unmatched_expected)
@@ -94,6 +102,14 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
             manifest["thresholds"],
         )
         engineering_failures.extend(case_metric_failures)
+        comparison = _compare_prior_findings(base, case, findings)
+        if comparison is not None:
+            totals["comparison_preserved"] += comparison["preserved"]
+            totals["comparison_lost"] += len(comparison["lost_fingerprints"])
+            if comparison["lost_fingerprints"]:
+                engineering_failures.append(
+                    f"{case['case_id']}: {len(comparison['lost_fingerprints'])} prior finding(s) were not preserved"
+                )
         case_results.append(
             {
                 "case_id": str(case["case_id"]),
@@ -109,6 +125,7 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
                     str(item.get("fingerprint", "<missing>")) for item in unmatched_findings
                 ),
                 "discovery_metric_failures": case_metric_failures,
+                "prior_findings_comparison": comparison,
             }
         )
 
@@ -142,9 +159,55 @@ def evaluate_acceptance_manifest(path: Path) -> AcceptanceResult:
         model_input_tokens=totals["input_tokens"],
         model_output_tokens=totals["output_tokens"],
         model_cost_usd=round(totals["cost"], 8),
+        comparison_findings_preserved=totals["comparison_preserved"],
+        comparison_findings_lost=totals["comparison_lost"],
         case_results=case_results,
         failures=failures,
     )
+
+
+def _compare_prior_findings(
+    base: Path, case: dict[str, Any], findings: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    configured = case.get("comparison_report_path")
+    if not configured:
+        return None
+    previous = _load_json_object(_bounded_report_path(base, str(configured)))
+    remaining = list(findings)
+    preserved = 0
+    lost: list[str] = []
+    for old in previous.get("findings", []) or []:
+        match = next((item for item in remaining if _equivalent_finding(old, item)), None)
+        if match is None:
+            lost.append(str(old.get("fingerprint", old.get("finding_id", "<missing>"))))
+        else:
+            remaining.remove(match)
+            preserved += 1
+    return {
+        "baseline_report_path": str(_bounded_report_path(base, str(configured))),
+        "baseline_findings": preserved + len(lost),
+        "preserved": preserved,
+        "lost_fingerprints": sorted(lost),
+    }
+
+
+def _equivalent_finding(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    old_fingerprint = str(previous.get("fingerprint", previous.get("finding_id", "")))
+    if old_fingerprint and old_fingerprint == str(current.get("fingerprint", current.get("finding_id", ""))):
+        return True
+    old_evidence = previous.get("evidence") if isinstance(previous.get("evidence"), dict) else {}
+    new_evidence = current.get("evidence") if isinstance(current.get("evidence"), dict) else {}
+    if not old_evidence or not new_evidence:
+        return False
+    if str(old_evidence.get("path", "")) != str(new_evidence.get("path", "")):
+        return False
+    if str(previous.get("vulnerability_class", "")).casefold() != str(current.get("vulnerability_class", "")).casefold():
+        return False
+    old_start = int(old_evidence.get("start_line", 0) or 0)
+    old_end = int(old_evidence.get("end_line", old_start) or old_start)
+    new_start = int(new_evidence.get("start_line", 0) or 0)
+    new_end = int(new_evidence.get("end_line", new_start) or new_start)
+    return bool(old_start and new_start and old_start <= new_end and new_start <= old_end)
 
 
 def write_acceptance_result(result: AcceptanceResult, path: Path) -> None:

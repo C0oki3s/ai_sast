@@ -83,6 +83,36 @@ def test_acceptance_evaluator_matches_expected_findings_and_aggregates_cost(tmp_
     assert result.model_cost_usd == 0.25
 
 
+def test_acceptance_evaluator_fails_when_graphify_run_loses_a_prior_finding(tmp_path) -> None:
+    _write(tmp_path / "report.json", _report([_finding("new-fingerprint", path="other.py")]))
+    _write(tmp_path / "baseline.json", _report([_finding("baseline-fingerprint")]))
+    manifest = _manifest()
+    manifest["cases"][0]["comparison_report_path"] = "baseline.json"
+    _write(tmp_path / "manifest.json", manifest)
+
+    result = evaluate_acceptance_manifest(tmp_path / "manifest.json")
+
+    assert not result.passed
+    assert result.comparison_findings_preserved == 0
+    assert result.comparison_findings_lost == 1
+    assert any("prior finding" in failure for failure in result.failures)
+
+
+def test_acceptance_evaluator_preserves_findings_by_grounded_location_when_fingerprint_changes(tmp_path) -> None:
+    current = _finding("new-fingerprint")
+    _write(tmp_path / "report.json", _report([current]))
+    _write(tmp_path / "baseline.json", _report([_finding("baseline-fingerprint")]))
+    manifest = _manifest()
+    manifest["cases"][0]["comparison_report_path"] = "baseline.json"
+    _write(tmp_path / "manifest.json", manifest)
+
+    result = evaluate_acceptance_manifest(tmp_path / "manifest.json")
+
+    assert result.passed
+    assert result.comparison_findings_preserved == 1
+    assert result.comparison_findings_lost == 0
+
+
 def test_acceptance_evaluator_fails_incomplete_and_unexpected_findings(tmp_path) -> None:
     _write(tmp_path / "report.json", _report([_finding(), _finding("unexpected", "other.py")], incomplete=True))
     _write(tmp_path / "manifest.json", _manifest(precision=0.75))

@@ -6,6 +6,13 @@ positive and clean control, and keep reports below the manifest directory.
 Expected findings are matched by repository-relative path, optional
 vulnerability class, and optional overlapping line range.
 
+For a migration comparison, set `comparison_report_path` on a case to a
+completed report from the established scanner path. The evaluator then requires
+every baseline finding to remain in the candidate report, matching first by
+fingerprint and then by grounded path, vulnerability class, and overlapping
+source lines. Missing findings fail the acceptance result. Keep the baseline
+and candidate reports immutable and pinned to the same source revision.
+
 Run the evaluator after the scans finish:
 
 ```bash
