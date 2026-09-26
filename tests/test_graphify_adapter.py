@@ -138,6 +138,29 @@ def test_graphify_structural_ids_survive_root_changes_and_duplicate_method_inser
     assert {node.id for node in first.nodes} <= {node.id for node in updated.nodes}
 
 
+def test_graphify_external_locationless_symbols_remain_unresolved_not_fatal(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("graphify.extract")
+    source = tmp_path / "service.py"
+    source.write_text(
+        "from pathlib import Path\n"
+        "from abc import ABC\n"
+        "class Service(ABC):\n"
+        "    def run(self, path: Path) -> Path:\n"
+        "        return Path(path)\n"
+        "class Worker(ABC):\n"
+        "    def run(self) -> None:\n"
+        "        return None\n"
+    )
+
+    snapshot = extract_structural_graph(tmp_path)
+
+    assert snapshot.unresolved_edges >= 1
+    assert all(node.path == "service.py" for node in snapshot.nodes)
+    assert all(node.label != "ABC" for node in snapshot.nodes)
+
+
 def test_graphify_source_provenance_rejects_excluded_and_out_of_bounds_evidence(tmp_path: Path) -> None:
     file = tmp_path / "app.py"
     file.write_text("def foo():\n    pass\n")

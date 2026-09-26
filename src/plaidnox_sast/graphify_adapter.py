@@ -455,9 +455,17 @@ def normalize_extraction(
         raise GraphifyAdapterError("Graphify returned a malformed graph")
 
     ordered_nodes: list[tuple[str, int, str, str]] = []
+    seen_raw_node_ids: set[str] = set()
     for raw in raw_nodes:
         if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
             raise GraphifyAdapterError("Graphify returned a malformed node")
+        if not raw.get("source_file") and not raw.get("source_location"):
+            # Graphify represents external imports as location-free nodes. They
+            # are not source evidence; edges to them are counted unresolved.
+            continue
+        if raw["id"] in seen_raw_node_ids:
+            raise GraphifyAdapterError("Graphify returned duplicate node IDs")
+        seen_raw_node_ids.add(raw["id"])
         path = _relative_path(raw.get("source_file"), root, admitted)
         line = _line_number(raw.get("source_location"))
         if not 1 <= line <= line_counts[path]:
@@ -471,8 +479,6 @@ def normalize_extraction(
     raw_to_stable: dict[str, str] = {}
     occurrence_counts: dict[tuple[str, str], int] = defaultdict(int)
     for path, line, label, raw_id in sorted(ordered_nodes):
-        if raw_id in raw_to_stable:
-            raise GraphifyAdapterError("Graphify returned duplicate node IDs")
         key = (path, label)
         occurrence = occurrence_counts[key]
         occurrence_counts[key] += 1
