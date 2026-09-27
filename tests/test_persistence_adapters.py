@@ -233,6 +233,9 @@ def test_postgresql_knowledge_adapter_is_content_addressed_reusable_and_idempote
     )
     assert store.upsert(entry).knowledge_id == entry.knowledge_id
     assert store.search("configured proxies")[0].knowledge_id == entry.knowledge_id
+    other_tenant_entry = PostgresKnowledgeStore(factory, "tenant-b").upsert(entry)
+    assert other_tenant_entry.content_hash == entry.content_hash
+    assert other_tenant_entry.knowledge_id != entry.knowledge_id
 
     task = {
         "task_id": "boundary-review",

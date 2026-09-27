@@ -35,6 +35,7 @@ from .models import (
     HuntTaskRecord,
     InvestigationRecord,
     KnowledgeUsageRecord,
+    ModelInvocationRecord,
     OverlaySymbolSummaryRecord,
     RepositoryContextRecord,
     ScanJobRecord,
@@ -316,6 +317,20 @@ class FindingDependencyInput:
     dependency_type: str
     dependency_key: str
     dependency_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInvocationInput:
+    invocation_id: str
+    scan_id: str
+    stage: str
+    model_tier: str
+    model_name: str
+    work_identity: str
+    provider_request_id: str
+    prompt_asset_version: str
+    input_hash: str
+    state: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1066,6 +1081,102 @@ class CodeScanningRepository:
             )
         )
         self.session.flush()
+
+    def record_model_invocation(self, value: ModelInvocationInput) -> None:
+        """Persist one content-free LiteLLM operation for audit and finding lineage."""
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == value.scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None:
+            raise PersistenceConflictError("model invocation scan is outside the tenant scope")
+        if value.state not in {"completed", "failed", "incomplete", "invalid_response", "replayed", "running"}:
+            raise ValueError("model invocation state is invalid")
+        if len(value.input_hash) != 64:
+            raise ValueError("model invocation input hash must be SHA-256")
+        existing = self.session.get(ModelInvocationRecord, value.invocation_id)
+        if existing is not None:
+            if existing.scan_id != value.scan_id or existing.input_hash != value.input_hash:
+                raise PersistenceConflictError("model invocation identity has conflicting provenance")
+            return
+        self.session.add(
+            ModelInvocationRecord(
+                invocation_id=value.invocation_id,
+                scan_id=value.scan_id,
+                stage=value.stage[:128],
+                model_tier=value.model_tier[:32],
+                model_name=value.model_name[:255],
+                work_identity=value.work_identity[:255],
+                provider_request_id=value.provider_request_id[:255],
+                prompt_asset_version=value.prompt_asset_version[:64],
+                input_hash=value.input_hash,
+                state=value.state,
+                input_tokens=0,
+                output_tokens=0,
+            )
+        )
+        self.session.flush()
+
+    def finding_context_dependencies(
+        self, scan_id: str, task_ids: Iterable[str]
+    ) -> list[FindingDependencyInput]:
+        """Resolve immutable hunt-task and retrieved-knowledge dependencies."""
+        selected_ids = sorted({str(item).strip() for item in task_ids if str(item).strip()})
+        if not selected_ids:
+            return []
+        scan = self.session.scalar(
+            select(ScanRunRecord).where(
+                ScanRunRecord.scan_id == scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if scan is None:
+            raise PersistenceConflictError("finding context scan is outside the tenant scope")
+        context_scan_id = stable_id("scan", scan.codebase_id, scan.snapshot_id)
+        context_plan_id = stable_id("plan", context_scan_id)
+        dependencies: dict[tuple[str, str], FindingDependencyInput] = {}
+        task_rows = self.session.execute(
+            select(HuntTaskRecord)
+            .join(HuntPlanRecord, HuntPlanRecord.plan_id == HuntTaskRecord.plan_id)
+            .join(ScanRunRecord, ScanRunRecord.scan_id == HuntPlanRecord.scan_id)
+            .where(
+                HuntTaskRecord.task_key.in_(selected_ids),
+                HuntPlanRecord.plan_id == context_plan_id,
+                HuntPlanRecord.scan_id == context_scan_id,
+                ScanRunRecord.tenant_id == self.tenant_id,
+            )
+        ).scalars().all()
+        for task in task_rows:
+            task_hash = hashlib.sha256(
+                json.dumps(redact_payload(task.task_data), sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            dependencies[("hunt_task", task.task_id)] = FindingDependencyInput(
+                "hunt_task", task.task_id, task_hash
+            )
+        stored_task_ids = [item.task_id for item in task_rows]
+        if not stored_task_ids:
+            return list(dependencies.values())
+        knowledge_rows = self.session.execute(
+            select(KnowledgeUsageRecord, SecurityKnowledgeRecord.content_hash)
+            .join(
+                SecurityKnowledgeRecord,
+                SecurityKnowledgeRecord.knowledge_id == KnowledgeUsageRecord.knowledge_id,
+            )
+            .where(
+                KnowledgeUsageRecord.scan_id == context_scan_id,
+                KnowledgeUsageRecord.task_id.in_(stored_task_ids),
+                SecurityKnowledgeRecord.tenant_id == self.tenant_id,
+            )
+        ).all()
+        for usage, content_hash in knowledge_rows:
+            knowledge_id = str(usage.knowledge_id or "")
+            if knowledge_id:
+                dependencies[("knowledge", knowledge_id)] = FindingDependencyInput(
+                    "knowledge", knowledge_id, str(content_hash)
+                )
+        return list(dependencies.values())
 
     def monthly_model_cost_exceeded(self, *, now: datetime | None = None) -> bool:
         controls = self.tenant_controls()

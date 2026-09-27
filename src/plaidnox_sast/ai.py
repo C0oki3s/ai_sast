@@ -293,6 +293,7 @@ class PlaidNoxDeepHuntAgent:
         self.source_excludes: list[str] = []
         self.max_file_bytes: int | None = None
         self._model_input_audit: list[dict[str, Any]] = []
+        self._model_invocation_audit: list[dict[str, Any]] = []
         self._model_execution_routes: dict[str, ModelExecutionDecision] = {}
         self.search_query_errors: list[dict[str, Any]] = []
         self.knowledge_errors: list[dict[str, str]] = []
@@ -379,10 +380,16 @@ class PlaidNoxDeepHuntAgent:
 
         return [dict(item) for item in self._model_input_audit]
 
+    def model_invocation_audit(self) -> list[dict[str, Any]]:
+        """Return content-free execution provenance for durable scan auditing."""
+
+        return [dict(item) for item in self._model_invocation_audit]
+
     def reset_model_input_audit(self) -> None:
         """Start a new scan-scoped model-input audit."""
 
         self._model_input_audit.clear()
+        self._model_invocation_audit.clear()
         self._model_execution_routes.clear()
         self.rate_limit_waits = 0
 
@@ -2292,6 +2299,9 @@ class PlaidNoxDeepHuntAgent:
         schema_hash = hashlib.sha256(
             json.dumps(schema, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
+        model_input_hash = hashlib.sha256(
+            f"{system_prompt}\0{user_prompt}\0{schema_hash}".encode("utf-8")
+        ).hexdigest()
         checkpoint_key = unit_key(
             "llm_response",
             name,
@@ -2316,6 +2326,18 @@ class PlaidNoxDeepHuntAgent:
                         "source_context_characters": source_context_characters,
                         "repository_wide_context": repository_wide_context,
                         "checkpoint_reused": True,
+                    }
+                )
+                self._model_invocation_audit.append(
+                    {
+                        "stage": prompt_operation,
+                        "model_tier": str(execution.get("model_tier", "standard")),
+                        "model_name": str(execution.get("model", "")),
+                        "prompt_asset_version": str(load_json("prompts/manifest.json")["version"]),
+                        "input_hash": model_input_hash,
+                        "work_identity": checkpoint_work_identity,
+                        "state": "replayed",
+                        "provider_request_id": "",
                     }
                 )
                 self._emit(
@@ -2363,6 +2385,17 @@ class PlaidNoxDeepHuntAgent:
                 "checkpoint_reused": False,
             }
         )
+        invocation = {
+            "stage": prompt_operation,
+            "model_tier": model_execution.model_tier.value,
+            "model_name": model_execution.model_name,
+            "prompt_asset_version": str(load_json("prompts/manifest.json")["version"]),
+            "input_hash": model_input_hash,
+            "work_identity": checkpoint_work_identity,
+            "state": "running",
+            "provider_request_id": "",
+        }
+        self._model_invocation_audit.append(invocation)
         request_policy = _model_request_policy(agent_runtime, prompt_operation)
         operation_output_limits = agent_runtime.get("model_output_token_limit_by_operation", {})
         tier_output_limits = agent_runtime.get(
@@ -2447,6 +2480,8 @@ class PlaidNoxDeepHuntAgent:
                 response = self._create_with_rate_limit_wait(request_kwargs, agent_runtime)
             except BaseException as exc:
                 self.model_budget.cancel(reservation)
+                invocation["state"] = "failed"
+                invocation["error_type"] = type(exc).__name__
                 if self.checkpoint is not None:
                     self.checkpoint.fail("llm_response", checkpoint_key, type(exc).__name__)
                 self._emit(
@@ -2467,11 +2502,14 @@ class PlaidNoxDeepHuntAgent:
             )
             self.model_budget.complete(reservation, response)
             self.cache_telemetry.record_response(response)
+            invocation["provider_request_id"] = str(getattr(response, "id", "") or "")[:255]
             if getattr(response, "status", "completed") != "completed":
                 detail = getattr(response, "incomplete_details", None)
                 reason = getattr(detail, "reason", "unknown") if detail else "unknown"
                 if self.checkpoint is not None:
                     self.checkpoint.fail("llm_response", checkpoint_key, f"incomplete:{reason}")
+                invocation["state"] = "incomplete"
+                invocation["error_type"] = f"incomplete:{reason}"
                 retry_limit = int(retry_limits.get(model_execution.model_tier.value, 0))
                 if (
                     reason == "max_output_tokens"
@@ -2504,6 +2542,7 @@ class PlaidNoxDeepHuntAgent:
             except json.JSONDecodeError:
                 payload, matches = None, False
             if matches:
+                invocation["state"] = "completed"
                 if self.checkpoint is not None:
                     self.checkpoint.complete(
                         "llm_response",
@@ -2524,6 +2563,7 @@ class PlaidNoxDeepHuntAgent:
         # stage-specific AIResponseError.
         if self.checkpoint is not None:
             self.checkpoint.fail("llm_response", checkpoint_key, "StructuredResponseShapeMismatch")
+        invocation["state"] = "invalid_response"
         return StructuredResponse(response, best) if best is not None else response
 
     def _model_execution_route(
@@ -4294,6 +4334,7 @@ def _candidate_from_ai_item(
             "gained_capability": str(item.get("gained_capability", "")),
             "required_context": [str(value) for value in item.get("required_context", [])],
             "candidate_id": str(item.get("candidate_id", "")),
+            "task_ids": sorted({str(value) for value in segment.get("task_ids", []) if str(value)}),
         },
     )
 

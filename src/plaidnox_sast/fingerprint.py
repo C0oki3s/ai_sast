@@ -237,6 +237,13 @@ def candidate_evidence_packet(candidate: Candidate) -> CandidateEvidencePacket:
 def absorb(kept: Candidate, duplicate: Candidate) -> None:
     """Fold a repeat report into the candidate already kept instead of dropping its evidence."""
     kept.metadata["duplicate_reports"] = int(kept.metadata.get("duplicate_reports", 0)) + 1
+    kept.metadata["task_ids"] = sorted(
+        {
+            str(item)
+            for item in [*kept.metadata.get("task_ids", []), *duplicate.metadata.get("task_ids", [])]
+            if str(item)
+        }
+    )
     support = kept.metadata.setdefault("supporting_evidence", [])
     entry = {
         "path": duplicate.evidence.path,

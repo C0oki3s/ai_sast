@@ -693,6 +693,8 @@ class ModelInvocationRecord(TimestampMixin, Base):
     task_id: Mapped[str | None] = mapped_column(ForeignKey("code_scanning_hunt_tasks.task_id", ondelete="SET NULL"))
     stage: Mapped[str] = mapped_column(String(128), nullable=False)
     model_tier: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    work_identity: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     provider_request_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     prompt_asset_version: Mapped[str] = mapped_column(String(64), nullable=False)
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)

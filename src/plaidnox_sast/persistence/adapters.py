@@ -353,10 +353,13 @@ class PostgresKnowledgeStore:
 
     def upsert(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         value = entry.normalised()
+        # Knowledge is tenant-owned in PostgreSQL. The in-memory adapter's
+        # content-only identity must not become a cross-tenant primary key.
+        scoped_knowledge_id = stable_id("knowledge", self.tenant_id, value.content_hash)
         with unit_of_work(self.session_factory, self.tenant_id) as repo:
             saved = repo.upsert_knowledge(
                 KnowledgeInput(
-                    value.knowledge_id,
+                    scoped_knowledge_id,
                     value.topic,
                     value.vulnerability_class,
                     value.ecosystem,

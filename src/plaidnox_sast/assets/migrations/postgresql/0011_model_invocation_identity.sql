@@ -1,0 +1,3 @@
+ALTER TABLE code_scanning_model_invocations
+  ADD COLUMN IF NOT EXISTS model_name VARCHAR(255) NOT NULL DEFAULT '',
+  ADD COLUMN IF NOT EXISTS work_identity VARCHAR(255) NOT NULL DEFAULT '';

@@ -29,6 +29,7 @@ from plaidnox_sast.knowledge import KnowledgeDecision, KnowledgeEntry
 from plaidnox_sast.persistence import (
     FindingDependencyInput,
     FindingEvidenceInput,
+    ModelInvocationInput,
     HuntTaskInput,
     unit_of_work,
 )
@@ -204,6 +205,58 @@ def test_finding_round_trips_through_postgresql_shaped_schema(pg_session_factory
     assert updated.finding_id == saved.finding_id
     assert updated.state == "false_positive"
     assert updated.evidence == []
+
+
+def test_model_invocation_and_finding_lineage_persist_in_postgresql(pg_session_factory):
+    tenant_id = _id("tenant-pg-lineage")
+    codebase_id = _id("codebase-pg-lineage")
+    finding_id = _id("finding-pg-lineage")
+    fingerprint = _id("fingerprint-pg-lineage")
+    with unit_of_work(pg_session_factory, tenant_id) as repository:
+        repository.add_codebase(codebase_id, "local/lineage-example", "Lineage Example")
+        snapshot = repository.add_snapshot(
+            _id("snapshot-pg-lineage"), codebase_id, "revision-1", "tree-hash-lineage", "context-v1"
+        )
+        scan = repository.start_scan(
+            _id("scan-pg-lineage"), codebase_id, snapshot.snapshot_id, "deep", "workflow-v1"
+        )
+        repository.save_finding(
+            finding_id,
+            codebase_id,
+            scan.scan_id,
+            fingerprint,
+            "Unverified identity controls a write",
+            "authorization",
+            "high",
+            "validated",
+            0.95,
+            "A verified identity is replaced before a sensitive write.",
+            "Cross-account state mutation.",
+            "Keep identity claims from the verified principal.",
+            {"evidence_packet": {"candidate_id": "candidate-lineage"}},
+            [FindingEvidenceInput("source", "auth.js", 10, 12, "identity = header", "hash", "source_window")],
+            [FindingDependencyInput("symbol", "auth.js:authCheck", "b" * 64)],
+        )
+        repository.record_model_invocation(
+            ModelInvocationInput(
+                invocation_id=_id("invocation-pg-lineage"),
+                scan_id=scan.scan_id,
+                stage="security_review",
+                model_tier="deep",
+                model_name="claude-sonnet",
+                work_identity="security_review:candidate:candidate-lineage",
+                provider_request_id="provider-request-lineage",
+                prompt_asset_version="2026-09-27.1",
+                input_hash="c" * 64,
+                state="completed",
+            )
+        )
+
+    with unit_of_work(pg_session_factory, tenant_id) as repository:
+        restored = repository.get_finding(finding_id)
+    assert restored is not None
+    assert len(restored.evidence) == 1
+    assert restored.dependencies[0].dependency_hash == "b" * 64
 
 
 def test_postgresql_cross_snapshot_reuse_requires_complete_graph_dependency_contract(

@@ -10,7 +10,8 @@ from plaidnox_sast.models import PolicyDecision
 from plaidnox_sast.graphify_adapter import CodeGraphSnapshot, CodeNode
 from plaidnox_sast.persistence.models import Base
 from plaidnox_sast.persistence.repositories import unit_of_work
-from plaidnox_sast.pipeline import SastPipeline, _stable_id
+from plaidnox_sast.checkpoint import unit_key
+from plaidnox_sast.pipeline import SastPipeline, _finding_dependencies, _stable_id
 
 
 def test_pipeline_requires_the_deep_hunt_agent(sample_repo):
@@ -1016,7 +1017,7 @@ class _ExplodingSessionFactory:
         raise RuntimeError("database is unreachable")
 
 
-def test_pipeline_tolerates_a_persistence_failure_without_failing_the_scan(sample_repo):
+def test_pipeline_fails_scan_health_when_configured_persistence_is_unavailable(sample_repo):
     result = SastPipeline(session_factory=_ExplodingSessionFactory()).scan_snapshot(
         sample_repo,
         "plaidnox/test-fixture",
@@ -1029,6 +1030,54 @@ def test_pipeline_tolerates_a_persistence_failure_without_failing_the_scan(sampl
     assert result.metrics["persistence_error_type"] == "RuntimeError"
     assert result.metrics["persistence_findings_saved"] == 0
     assert result.metrics["ai_scan_incomplete"] is False
+    assert result.metrics["persistence_required_failure"] is True
+    assert result.scan_status.value == "UNSUCCESSFUL"
+
+
+def test_pipeline_fails_scan_health_when_persisted_scan_cannot_be_finalized(sample_repo, monkeypatch):
+    from plaidnox_sast.persistence.repositories import CodeScanningRepository
+
+    monkeypatch.setattr(CodeScanningRepository, "finish_scan", lambda *args, **kwargs: False)
+    result = SastPipeline(
+        session_factory=_sqlite_session_factory(), tenant_id="tenant-finalize"
+    ).scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+
+    assert result.metrics["persistence_scan_finalized"] is False
+    assert result.metrics["persistence_required_failure"] is True
+    assert result.scan_status.value == "UNSUCCESSFUL"
+
+
+def test_verified_finding_dependencies_include_its_deep_hunt_request(sample_repo):
+    result = SastPipeline().scan_snapshot(
+        sample_repo,
+        "plaidnox/test-fixture",
+        deep_hunt_agent=FakeContextualAI(),
+    )
+    finding = result.findings[0]
+    candidate_id = finding.metadata["evidence_packet"]["candidate_id"]
+    work_identity = unit_key("security_review", "candidate", candidate_id)
+    invocation = {
+        "stage": "security_review",
+        "work_identity": work_identity,
+        "invocation_id": "invocation-verified",
+        "input_hash": "a" * 64,
+        "prompt_asset_version": "2026-09-27.1",
+    }
+
+    dependencies = _finding_dependencies(finding, [], model_invocations=[invocation])
+
+    assert any(
+        item.dependency_type == "model_invocation" and item.dependency_key == "invocation-verified"
+        for item in dependencies
+    )
+    assert any(
+        item.dependency_type == "prompt_asset_version" and item.dependency_key == "2026-09-27.1"
+        for item in dependencies
+    )
 
 
 def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_on_rescan(

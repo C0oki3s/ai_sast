@@ -61,6 +61,7 @@ from .persistence import (
     SECURITY_IR_CONTEXT_VERSION,
     FindingDependencyInput,
     FindingEvidenceInput,
+    ModelInvocationInput,
     SymbolInput,
     security_ir_inputs,
     snapshot_tree_hash,
@@ -372,6 +373,8 @@ def _finding_dependencies(
     finding: Finding,
     symbols: list[SymbolInput],
     graph_snapshot=None,
+    model_invocations: list[dict[str, Any]] | None = None,
+    context_dependencies: list[FindingDependencyInput] | None = None,
 ) -> list[FindingDependencyInput]:
     """Link a verified finding to every evidenced Security IR symbol."""
 
@@ -391,7 +394,10 @@ def _finding_dependencies(
             continue
         locations.append((path, start, max(start, end)))
 
-    dependencies: dict[str, FindingDependencyInput] = {}
+    dependencies: dict[str, FindingDependencyInput] = {
+        f"{item.dependency_type}:{item.dependency_key}": item
+        for item in context_dependencies or []
+    }
     for symbol in symbols:
         if any(
             symbol.path == path and symbol.start_line <= end and symbol.end_line >= start
@@ -412,6 +418,27 @@ def _finding_dependencies(
             graph_investigation_id,
             graph_snapshot_id,
         )
+    evidence_packet = finding.metadata.get("evidence_packet", {})
+    candidate_id = str(evidence_packet.get("candidate_id", "")) if isinstance(evidence_packet, dict) else ""
+    if candidate_id:
+        review_work_identity = unit_key("security_review", "candidate", candidate_id)
+        for invocation in model_invocations or []:
+            if (
+                invocation.get("stage") == "security_review"
+                and invocation.get("work_identity") == review_work_identity
+            ):
+                invocation_id = str(invocation.get("invocation_id", ""))
+                input_hash = str(invocation.get("input_hash", ""))
+                if invocation_id and re.fullmatch(r"[0-9a-f]{64}", input_hash):
+                    dependencies[f"model-invocation:{invocation_id}"] = FindingDependencyInput(
+                        "model_invocation", invocation_id, input_hash
+                    )
+                    prompt_version = str(invocation.get("prompt_asset_version", ""))
+                    if prompt_version:
+                        prompt_hash = hashlib.sha256(prompt_version.encode("utf-8")).hexdigest()
+                        dependencies[f"prompt-version:{prompt_version}"] = FindingDependencyInput(
+                            "prompt_asset_version", prompt_version, prompt_hash
+                        )
     if graph_snapshot is not None:
         nodes_by_id = {node.id: node for node in graph_snapshot.nodes}
         edges_by_id = {
@@ -1756,6 +1783,31 @@ class SastPipeline:
         if self.session_factory is not None and persistence_indexed and scan_id:
             try:
                 with unit_of_work(self.session_factory, self.tenant_id) as repository:
+                    invocation_audit = getattr(deep_hunt_agent, "model_invocation_audit", list)()
+                    invocation_records: list[dict[str, Any]] = []
+                    for index, invocation in enumerate(invocation_audit):
+                        input_hash = str(invocation.get("input_hash", ""))
+                        if not re.fullmatch(r"[0-9a-f]{64}", input_hash):
+                            continue
+                        invocation_id = _stable_id(
+                            "model-invocation", scan_id, str(index), input_hash
+                        )
+                        persisted_invocation = {**invocation, "invocation_id": invocation_id}
+                        repository.record_model_invocation(
+                            ModelInvocationInput(
+                                invocation_id=invocation_id,
+                                scan_id=scan_id,
+                                stage=str(invocation.get("stage", "unknown")),
+                                model_tier=str(invocation.get("model_tier", "standard")),
+                                model_name=str(invocation.get("model_name", "")),
+                                work_identity=str(invocation.get("work_identity", "")),
+                                provider_request_id=str(invocation.get("provider_request_id", "")),
+                                prompt_asset_version=str(invocation.get("prompt_asset_version", "")),
+                                input_hash=input_hash,
+                                state=str(invocation.get("state", "invalid_response")),
+                            )
+                        )
+                        invocation_records.append(persisted_invocation)
                     for finding in findings:
                         finding_id = _stable_id("finding", codebase_id, finding.fingerprint)
                         report_data = _finding_report_data(
@@ -1785,6 +1837,11 @@ class SastPipeline:
                             finding,
                             persisted_ir[1] if persisted_ir is not None else [],
                             graph_snapshot=graph_snapshot,
+                            model_invocations=invocation_records,
+                            context_dependencies=repository.finding_context_dependencies(
+                                scan_id,
+                                finding.metadata.get("task_ids", []),
+                            ),
                         )
                         dependency_types = {item.dependency_type for item in dependencies}
                         graph_dependencies_complete = bool(
@@ -1906,6 +1963,15 @@ class SastPipeline:
                 "persistence_finding_error_type": persistence_finding_error_type,
                 "persistence_finding_error": persistence_finding_error,
                 "persistence_scan_finalized": persistence_scan_finalized,
+                "persistence_required_failure": bool(
+                    persistence_enabled
+                    and (
+                        not persistence_indexed
+                        or not persistence_scan_finalized
+                        or bool(persistence_error_type)
+                        or bool(persistence_finding_error_type)
+                    )
+                ),
             }
         )
         if checkpoint is not None:

@@ -397,7 +397,11 @@ Primary research references:
 
 ### Phase 3 — PostgreSQL ORM persistence
 
-Status: implemented and verified against the checked-in PostgreSQL migration.
+Status: implemented and verified against PostgreSQL 16, including migration
+replay, repository integration tests, tenant-scoped knowledge identity, and a
+disposable custom-format backup/restore drill. Configured persistence failures
+now make scan health unsuccessful, and production mode cannot silently use
+SQLite.
 
 - Establish SQLAlchemy models, scoped sessions, typed repositories, and unit of
   work boundaries for Code Scanning.
@@ -417,6 +421,11 @@ Exit: two scanner workers can safely process independent tasks against the same
 PostgreSQL database, retry without duplicates, and recover after interruption.
 
 ### Phase 4 — complete AI hunt and evidence lifecycle
+
+Status: core implementation and durable prompt/model/task/knowledge/source/
+Graphify lineage are in place. Explicit relational dependencies from findings
+to security-memory and threat-model records remain open; live seeded and
+multi-language acceptance evidence remains Phase 5 work.
 
 - Move to investigation-owned coverage with one bounded initial hunt, typed
   graph/source requests, and continuation only after new material evidence.

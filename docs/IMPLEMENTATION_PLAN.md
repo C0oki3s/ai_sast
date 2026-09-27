@@ -441,7 +441,7 @@ and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
   gap or mark required coverage incomplete; it must never treat missing
   precision as proof that the code is safe.
 
-## 3. PostgreSQL ORM persistence — implemented
+## 3. PostgreSQL ORM persistence — implemented and locally verified
 
 ### 3a. Typed production foundation — implemented
 
@@ -456,6 +456,10 @@ and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
   adapter and PostgreSQL and are safe to retry.
 - Covered by `tests/test_persistence.py` and the configured-persistence cases
   in `tests/test_pipeline.py`.
+- When a database session factory is configured, an indexing or finding-write
+  failure now makes the scan `UNSUCCESSFUL`; production mode also refuses the
+  local SQLite fallback when its PostgreSQL URL is missing or invalid. Local
+  development without production mode retains the explicitly local adapter.
 
 ### 3b. Context Fabric and knowledge runtime migration — implemented
 
@@ -470,6 +474,9 @@ and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
   path does not open or reconstruct a SQLite store, including the final
   context-recording step.
 - Knowledge usage and plan/task writes are content-addressed and idempotent.
+- PostgreSQL knowledge row IDs are tenant-scoped while content hashes remain
+  stable, preventing equal global knowledge content from colliding across
+  tenant primary keys.
   Context overlays persist as immutable child snapshots and reuse the same
   Security IR identity scheme as the scan pipeline.
 - Covered by `tests/test_persistence_adapters.py`,
@@ -483,6 +490,11 @@ and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
   expiration/reclaim, finding reconstruction, and full transaction rollback
   through `PLAIDNOX_TEST_DATABASE_URL`, which is intentionally separate from
   the production database variable.
+- The PostgreSQL 16 disposable service passed the integration suite after
+  migration `0011_model_invocation_identity`. A local custom-format
+  `pg_dump`/`pg_restore` drill restored scan findings, evidence, dependencies,
+  model invocations, and the new invocation identity column into a fresh
+  disposable database, then dropped that restore database.
 - The full ordinary test suite exercises the same repositories through an
   in-memory SQLite test adapter; PostgreSQL-only tests skip when their explicit
   test URL is absent.
@@ -490,9 +502,10 @@ and the source-policy cases in `tests/test_routing.py` and `tests/test_ai.py`.
 Exit condition: met. Concurrent workers lease safely, retries are idempotent,
 findings reconstruct with evidence and dependencies after interruption, and
 the production runtime uses PostgreSQL for Context Fabric and security
-knowledge whenever production persistence is configured.
+knowledge whenever production persistence is configured. A production/staging
+backup schedule and disaster-recovery exercise remain Phase 6 deployment gates.
 
-## 4. AI hunt completeness and remediation — implemented
+## 4. AI hunt completeness and remediation — implemented core, provenance verified
 
 - LLM search-plan creation from architecture, business context, threat context,
   hunt tasks, and current knowledge; query patterns are never hardcoded in code
@@ -625,12 +638,26 @@ knowledge whenever production persistence is configured.
   from `runtime/models.json`; there is no remote decision service. The scan-wide deep
   budget demotes the lowest-priority excess DEEP routes (`deep_budget_demotions` metric).
   Covered by `tests/test_routing.py`, `tests/test_knowledge.py` and `tests/test_pipeline.py`.
+- Each LiteLLM invocation now produces content-free durable audit metadata:
+  operation, selected model and tier, provider request ID, work identity,
+  outcome, prompt-manifest version, and a hash of the rendered system prompt,
+  user prompt, and output schema. Completed findings link to the exact
+  `security_review` invocation and prompt version. Finding dependencies also
+  include persisted hunt tasks and the cited knowledge entries used by those
+  tasks, alongside the existing symbol, source-file, and Graphify node/edge
+  dependencies. Migration `0011_model_invocation_identity.sql` and the
+  PostgreSQL integration test cover the invocation identity fields.
 
-Exit condition: every accepted or rejected candidate has a complete audit trail,
-and unresolved required canonical coverage can never produce a successful scan — met for the
-in-process pipeline (proven by `tests/test_pipeline.py`'s
+Exit condition: accepted candidates retain their reviewer result and durable
+prompt/model, hunt-task, knowledge, source, and graph lineage; unresolved
+required canonical coverage can never produce a successful scan — met for the
+implemented pipeline (proven by `tests/test_pipeline.py`'s
 `test_pipeline_marks_the_scan_incomplete_when_contextual_ai_discovery_fails`
-and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`); the
+and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`). A
+separate relational link from findings to security-memory and threat-model
+records is not yet emitted by the runtime; those records remain represented in
+the immutable evidence packet and model-input hash. Live seeded-vulnerability
+recall and multi-language acceptance remain Phase 5 evidence gates. The
 optional patch proposal/rescan verification stage is additive and does not
 change this exit condition.
 

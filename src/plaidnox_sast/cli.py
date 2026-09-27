@@ -299,7 +299,12 @@ def _run_scan_local(args: argparse.Namespace) -> int:
     try:
         database_settings = DatabaseSettings.from_environment()
         persistence_session_factory = build_session_factory(database_settings)
-    except DatabaseConfigurationError:
+    except DatabaseConfigurationError as exc:
+        production_mode_variable = str(
+            load_json("runtime/database.json")["production_mode_environment_variable"]
+        )
+        if os.environ.get(production_mode_variable, "").strip().lower() in {"1", "true", "yes", "on"}:
+            raise SystemExit(f"production persistence configuration is required: {exc}") from exc
         persistence_session_factory = None
 
     # A PostgreSQL context/knowledge backend replaces the transitional SQLite

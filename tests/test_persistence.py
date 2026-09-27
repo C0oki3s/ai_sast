@@ -24,9 +24,12 @@ from plaidnox_sast.persistence.repositories import (
     EdgeInput,
     FindingDependencyInput,
     FindingEvidenceInput,
+    ModelInvocationInput,
     HuntTaskInput,
+    KnowledgeInput,
     SourceFileInput,
     SymbolInput,
+    stable_id,
     _hash,
     security_ir_inputs,
     unit_of_work,
@@ -134,6 +137,85 @@ def test_repository_is_tenant_scoped_and_snapshot_creation_is_idempotent():
 
     assert first.snapshot_id == second.snapshot_id
     assert scan.snapshot_id == "snapshot-1"
+
+
+def test_model_invocation_provenance_is_persisted_idempotently_and_tenant_scoped():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    invocation = ModelInvocationInput(
+        invocation_id="invocation-1",
+        scan_id="scan-1",
+        stage="security_review",
+        model_tier="deep",
+        model_name="claude-sonnet",
+        work_identity="review:candidate:stable-key",
+        provider_request_id="req-123",
+        prompt_asset_version="2026-09-27.1",
+        input_hash="a" * 64,
+        state="completed",
+    )
+    with unit_of_work(factory, "tenant-a") as repository:
+        repository.add_codebase("codebase-1", "local/example", "Example")
+        snapshot = repository.add_snapshot("snapshot-1", "codebase-1", "revision-1", "tree-1", "context-v1")
+        repository.start_scan("scan-1", "codebase-1", snapshot.snapshot_id, "deep", "workflow-v1")
+        repository.record_model_invocation(invocation)
+        repository.record_model_invocation(invocation)
+
+    from sqlalchemy import select
+
+    from plaidnox_sast.persistence.models import ModelInvocationRecord
+
+    with factory() as session:
+        rows = session.scalars(select(ModelInvocationRecord)).all()
+    assert len(rows) == 1
+    assert rows[0].stage == "security_review"
+    assert rows[0].model_name == "claude-sonnet"
+    assert rows[0].work_identity == "review:candidate:stable-key"
+    assert rows[0].input_hash == "a" * 64
+    assert rows[0].state == "completed"
+
+
+def test_finding_context_dependencies_resolve_revision_scoped_hunt_tasks():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    tenant_id = "tenant-context-lineage"
+    codebase_id = "codebase-context-lineage"
+    with unit_of_work(factory, tenant_id) as repository:
+        repository.add_codebase(codebase_id, "local/context-lineage", "Context Lineage")
+        snapshot = repository.add_snapshot("snapshot-context", codebase_id, "rev-a", "tree-a", "context-v1")
+        context_scan_id = stable_id("scan", codebase_id, snapshot.snapshot_id)
+        context_scan = repository.start_scan(
+            context_scan_id, codebase_id, snapshot.snapshot_id, "deep", "workflow-v1"
+        )
+        plan = repository.ensure_hunt_plan(
+            stable_id("plan", context_scan.scan_id), context_scan.scan_id, "workflow-v1"
+        )
+        tasks = repository.create_hunt_tasks(
+            plan.plan_id,
+            [HuntTaskInput("auth-task", "Review auth", "Review verified identity usage", {"task_id": "auth-task"})],
+        )
+        knowledge = repository.upsert_knowledge(
+            KnowledgeInput(
+                "knowledge-context", "Auth guidance", "authorization", "python", "", "Use verified claims.",
+                "https://example.test/auth", "Auth guidance", "", "primary_documentation", 0.9,
+                "d" * 64, [],
+            )
+        )
+        repository.record_knowledge_usage(
+            "knowledge-usage-context", context_scan_id, tasks[0].task_id, knowledge.knowledge_id,
+            "verified identity", "use_database", 0.9, "Matches the middleware boundary.",
+        )
+        current_scan = repository.start_scan("scan-context-current", codebase_id, snapshot.snapshot_id, "deep", "workflow-v1")
+        dependencies = repository.finding_context_dependencies(current_scan.scan_id, ["auth-task"])
+
+    by_type = {item.dependency_type: item for item in dependencies}
+    assert set(by_type) == {"hunt_task", "knowledge"}
+    assert by_type["hunt_task"].dependency_key.startswith("task-")
+    assert by_type["knowledge"].dependency_key == "knowledge-context"
+    assert len(by_type["hunt_task"].dependency_hash) == 64
+    assert by_type["knowledge"].dependency_hash == "d" * 64
 
 
 def test_security_ir_persistence_is_idempotent_and_reveals_callers_via_reverse_dependencies():

@@ -180,6 +180,7 @@ class ScanResult:
             "checkpoint_units_pending",
         )
         incomplete = bool(self.metrics.get("ai_scan_incomplete", False))
+        incomplete = incomplete or bool(self.metrics.get("persistence_required_failure", False))
         if "ai_required_coverage_unresolved" not in self.metrics:
             # Compatibility for stored reports produced before global coverage
             # reconciliation was introduced.

@@ -1821,7 +1821,21 @@ def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_
     from plaidnox_sast.assets import load_json
 
     events = []
-    client = FakeClient(review_payload())
+    client = FakeClient(
+        {
+            "strategy": "Review externally reachable security behavior.",
+            "queries": [
+                {
+                    "query_id": "q1",
+                    "search_terms": ["route"],
+                    "include_globs": ["**/*.js"],
+                    "objective": "Locate route registrations.",
+                    "coverage_targets": ["entrypoints"],
+                }
+            ],
+            "coverage_notes": "Routes are included.",
+        }
+    )
     agent = PlaidNoxDeepHuntAgent(client, event_sink=events.append)
 
     agent._structured_response(
@@ -1839,6 +1853,12 @@ def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_
     assert started["operation"] == "recon_search_plan"
     assert started["timeout_seconds"] == policy["timeout_seconds"]
     assert completed["duration_milliseconds"] >= 0
+    invocation = agent.model_invocation_audit()[0]
+    assert invocation["stage"] == "recon_search_plan"
+    assert invocation["model_name"] == client.responses.kwargs["model"]
+    assert invocation["state"] == "completed"
+    assert len(invocation["input_hash"]) == 64
+    assert invocation["prompt_asset_version"]
 
 
 def test_structured_response_falls_back_to_low_effort_for_an_unlisted_operation(sample_repo, monkeypatch):
