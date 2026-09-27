@@ -134,6 +134,37 @@ def test_overlay_keeps_changed_code_and_revalidates_only_linked_finding(sample_r
     assert packet.cache["base_context_hit"] is True
 
 
+def test_active_security_context_returns_versioned_memory_and_threat_references(tmp_path):
+    store = ContextFabricStore(tmp_path / "context.sqlite")
+    memory = store.add_memory(
+        "owner/repo", "repository", "authorization", "Account reads require ownership scope.", "reviewed"
+    )
+    threat = store.add_threat_statement(
+        "owner/repo",
+        "asset",
+        "Account records contain customer financial data.",
+        "approved-threat-model",
+        "threat-model.md#assets",
+    )
+    revised_threat = store.add_threat_statement(
+        "owner/repo",
+        "asset",
+        "Account records contain customer financial and identity data.",
+        "approved-threat-model",
+        "threat-model.md#assets",
+    )
+
+    context = store.active_security_context("owner/repo", "all")
+
+    assert context["security_memories"][0]["reference_id"] == memory.memory_id
+    assert context["security_memories"][0]["content_hash"]
+    assert context["threat_statements"][0]["reference_id"] == threat.threat_statement_id
+    assert context["threat_statements"][0]["source_reference"] == "threat-model.md#assets"
+    assert context["threat_statements"][0]["content_hash"]
+    assert revised_threat.threat_statement_id == threat.threat_statement_id
+    assert revised_threat.version == 2
+
+
 def test_changed_callee_keeps_identity_and_revalidates_unchanged_caller(tmp_path):
     repository = tmp_path / "repository"
     repository.mkdir()

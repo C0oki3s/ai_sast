@@ -1422,19 +1422,28 @@ def test_ai_reuses_exact_persisted_repository_context_without_model_calls(tmp_pa
             },
         }
     )
-    agent = PlaidNoxDeepHuntAgent(
-        client,
-        context_store=ContextFabricStore(tmp_path / "context.sqlite"),
+    context_store = ContextFabricStore(tmp_path / "context.sqlite")
+    memory = context_store.add_memory(
+        "org/repo", "repository", "authorization", "Account reads require ownership validation.", "approved"
     )
+    threat = context_store.add_threat_statement(
+        "org/repo", "asset", "Accounts contain payment information.", "approved", "threat-model.md#assets"
+    )
+    agent = PlaidNoxDeepHuntAgent(client, context_store=context_store)
     graph = build_structural_graph(tmp_path)
     first = agent.build_repository_context(tmp_path, "org/repo", "revision-a", graph)
     request_count = len(client.responses.requests)
+    request_content = json.dumps(client.responses.requests, ensure_ascii=False)
 
     reused = agent.build_repository_context(tmp_path, "org/repo", "revision-a", graph)
 
     assert len(client.responses.requests) == request_count
     assert reused.architecture == first.architecture
     assert reused.context_fabric["reused"] is True
+    assert memory.memory_id == reused.context_fabric["security_memories"][0]["reference_id"]
+    assert threat.threat_statement_id == reused.context_fabric["threat_statements"][0]["reference_id"]
+    assert "Account reads require ownership validation." in request_content
+    assert "Accounts contain payment information." in request_content
 
 
 def test_ai_creates_open_ended_hunt_tasks_before_discovery(sample_repo):
@@ -1859,6 +1868,22 @@ def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_
     assert invocation["state"] == "completed"
     assert len(invocation["input_hash"]) == 64
     assert invocation["prompt_asset_version"]
+
+
+def test_context_reference_audit_keeps_only_versioned_security_records():
+    from plaidnox_sast.ai import _context_references_from_payload
+
+    memory = {"reference_type": "security_memory", "reference_id": "mem-1", "content_hash": "a" * 64}
+    threat = {
+        "reference_type": "threat_statement",
+        "reference_id": "threat-1",
+        "content_hash": "b" * 64,
+    }
+    result = _context_references_from_payload(
+        {"security_memories": [memory, memory], "threat_statements": [threat], "untrusted": {**memory, "content_hash": "bad"}}
+    )
+
+    assert result == [memory, threat]
 
 
 def test_structured_response_falls_back_to_low_effort_for_an_unlisted_operation(sample_repo, monkeypatch):

@@ -439,6 +439,21 @@ def _finding_dependencies(
                         dependencies[f"prompt-version:{prompt_version}"] = FindingDependencyInput(
                             "prompt_asset_version", prompt_version, prompt_hash
                         )
+                    for reference in invocation.get("context_references", []):
+                        if not isinstance(reference, dict):
+                            continue
+                        reference_type = str(reference.get("reference_type", ""))
+                        reference_id = str(reference.get("reference_id", ""))
+                        content_hash = str(reference.get("content_hash", ""))
+                        if (
+                            reference_type not in {"security_memory", "threat_statement"}
+                            or not reference_id
+                            or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
+                        ):
+                            continue
+                        dependencies[f"{reference_type}:{reference_id}"] = FindingDependencyInput(
+                            reference_type, reference_id, content_hash
+                        )
     if graph_snapshot is not None:
         nodes_by_id = {node.id: node for node in graph_snapshot.nodes}
         edges_by_id = {
@@ -1805,6 +1820,11 @@ class SastPipeline:
                                 prompt_asset_version=str(invocation.get("prompt_asset_version", "")),
                                 input_hash=input_hash,
                                 state=str(invocation.get("state", "invalid_response")),
+                                context_references=[
+                                    dict(item)
+                                    for item in invocation.get("context_references", [])
+                                    if isinstance(item, dict)
+                                ],
                             )
                         )
                         invocation_records.append(persisted_invocation)

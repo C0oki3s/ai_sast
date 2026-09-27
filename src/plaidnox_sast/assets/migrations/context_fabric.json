@@ -5,6 +5,7 @@
     "migrations/0004_hunt_plan_versions.sql",
     "migrations/0005_incremental_context.sql",
     "migrations/0006_symbol_summaries.sql",
-    "migrations/0007_overlay_symbol_summaries.sql"
+    "migrations/0007_overlay_symbol_summaries.sql",
+    "migrations/0008_threat_statements.sql"
   ]
 }

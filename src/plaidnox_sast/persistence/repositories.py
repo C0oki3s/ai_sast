@@ -46,6 +46,7 @@ from .models import (
     SnapshotRecord,
     SurfacePlanningRecord,
     SourceFileRecord,
+    ThreatStatementRecord,
     SymbolSummaryRecord,
     SymbolRecord,
     TenantControlRecord,
@@ -227,6 +228,18 @@ class SecurityMemoryValue:
 
 
 @dataclass(frozen=True, slots=True)
+class ThreatStatementValue:
+    threat_statement_id: str
+    codebase_id: str | None
+    category: str
+    statement: str
+    provenance: str
+    source_reference: str
+    version: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class EdgeInput:
     source_stable_key: str
     target_stable_key: str
@@ -331,6 +344,7 @@ class ModelInvocationInput:
     prompt_asset_version: str
     input_hash: str
     state: str
+    context_references: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1109,6 +1123,7 @@ class CodeScanningRepository:
                 model_tier=value.model_tier[:32],
                 model_name=value.model_name[:255],
                 work_identity=value.work_identity[:255],
+                context_references=redact_payload(value.context_references),
                 provider_request_id=value.provider_request_id[:255],
                 prompt_asset_version=value.prompt_asset_version[:64],
                 input_hash=value.input_hash,
@@ -1893,28 +1908,97 @@ class CodeScanningRepository:
         self,
         codebase_id: str,
         category: str,
+        limit: int | None = None,
     ) -> list[SecurityMemoryValue]:
-        rows = (
-            self.session.execute(
-                select(SecurityMemoryRecord)
-                .where(
-                    SecurityMemoryRecord.tenant_id == self.tenant_id,
-                    SecurityMemoryRecord.status == "active",
-                    or_(
-                        SecurityMemoryRecord.codebase_id == codebase_id,
-                        SecurityMemoryRecord.codebase_id.is_(None),
-                    ),
-                    or_(
-                        SecurityMemoryRecord.category == category,
-                        SecurityMemoryRecord.category == "all",
-                    ),
-                )
-                .order_by(SecurityMemoryRecord.memory_id)
-            )
-            .scalars()
-            .all()
+        query = select(SecurityMemoryRecord).where(
+            SecurityMemoryRecord.tenant_id == self.tenant_id,
+            SecurityMemoryRecord.status == "active",
+            or_(
+                SecurityMemoryRecord.codebase_id == codebase_id,
+                SecurityMemoryRecord.codebase_id.is_(None),
+            ),
         )
+        if category not in {"*", "all"}:
+            query = query.where(
+                or_(
+                    SecurityMemoryRecord.category == category,
+                    SecurityMemoryRecord.category == "all",
+                )
+            )
+        query = query.order_by(SecurityMemoryRecord.memory_id)
+        if limit is not None:
+            query = query.limit(max(0, limit))
+        rows = self.session.execute(query).scalars().all()
         return [_security_memory_value(row) for row in rows]
+
+    def upsert_threat_statement(
+        self,
+        threat_statement_id: str,
+        codebase_id: str,
+        category: str,
+        statement: str,
+        provenance: str,
+        source_reference: str = "",
+    ) -> ThreatStatementValue:
+        if self.get_codebase(codebase_id) is None:
+            raise PersistenceConflictError("threat statement codebase does not exist in the tenant scope")
+        record = self.session.scalar(
+            select(ThreatStatementRecord).where(
+                ThreatStatementRecord.threat_statement_id == threat_statement_id,
+                ThreatStatementRecord.tenant_id == self.tenant_id,
+            )
+        )
+        if record is None:
+            record = ThreatStatementRecord(
+                threat_statement_id=threat_statement_id,
+                tenant_id=self.tenant_id,
+                codebase_id=codebase_id,
+                category=category,
+                statement=statement,
+                provenance=provenance,
+                source_reference=source_reference,
+                version=1,
+                status="active",
+            )
+            self.session.add(record)
+        else:
+            content_changed = (
+                record.codebase_id != codebase_id
+                or record.category != category
+                or record.statement != statement
+                or record.provenance != provenance
+                or record.source_reference != source_reference
+            )
+            if content_changed:
+                record.codebase_id = codebase_id
+                record.category = category
+                record.statement = statement
+                record.provenance = provenance
+                record.source_reference = source_reference
+                record.version += 1
+            record.status = "active"
+        self.session.flush()
+        return _threat_statement_value(record)
+
+    def active_threat_statements(
+        self, codebase_id: str, limit: int | None = None
+    ) -> list[ThreatStatementValue]:
+        query = (
+            select(ThreatStatementRecord)
+            .where(
+                ThreatStatementRecord.tenant_id == self.tenant_id,
+                ThreatStatementRecord.status == "active",
+                or_(
+                    ThreatStatementRecord.codebase_id == codebase_id,
+                    ThreatStatementRecord.codebase_id.is_(None),
+                ),
+            )
+            .order_by(ThreatStatementRecord.category, ThreatStatementRecord.threat_statement_id)
+        )
+        if limit is not None:
+            query = query.limit(max(0, limit))
+        rows = self.session.execute(query).scalars().all()
+        return [_threat_statement_value(row) for row in rows]
 
     def link_finding_symbols(
         self,
@@ -3178,6 +3262,19 @@ def _security_memory_value(record: SecurityMemoryRecord) -> SecurityMemoryValue:
         provenance=record.provenance,
         status=record.status,
         version=record.version,
+    )
+
+
+def _threat_statement_value(record: ThreatStatementRecord) -> ThreatStatementValue:
+    return ThreatStatementValue(
+        threat_statement_id=record.threat_statement_id,
+        codebase_id=record.codebase_id,
+        category=record.category,
+        statement=record.statement,
+        provenance=record.provenance,
+        source_reference=record.source_reference,
+        version=record.version,
+        status=record.status,
     )
 
 

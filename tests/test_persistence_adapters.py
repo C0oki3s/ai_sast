@@ -275,6 +275,40 @@ def test_postgresql_context_identity_is_namespaced_by_tenant(tmp_path):
     assert tenant_a.context_id != tenant_b.context_id
 
 
+def test_postgresql_context_adapter_returns_tenant_scoped_memory_and_threat_references():
+    factory = _session_factory()
+    store = PostgresContextFabricStore(factory, "tenant-a")
+    memory = store.add_memory(
+        "owner/repo", "repository", "authorization", "Account reads require ownership scope.", "reviewed"
+    )
+    threat = store.add_threat_statement(
+        "owner/repo", "asset", "Account records contain financial data.", "approved", "model.md#assets"
+    )
+    revised_threat = store.add_threat_statement(
+        "owner/repo",
+        "asset",
+        "Account records contain financial and identity data.",
+        "approved",
+        "model.md#assets",
+    )
+
+    context = store.active_security_context("owner/repo", "all")
+    other_tenant_context = PostgresContextFabricStore(factory, "tenant-b").active_security_context(
+        "owner/repo", "all"
+    )
+    other_tenant_memory = PostgresContextFabricStore(factory, "tenant-b").add_memory(
+        "owner/repo", "repository", "authorization", "Account reads require ownership scope.", "reviewed"
+    )
+
+    assert context["security_memories"][0]["reference_id"] == memory.memory_id
+    assert context["threat_statements"][0]["reference_id"] == threat.threat_statement_id
+    assert context["threat_statements"][0]["source_reference"] == "model.md#assets"
+    assert revised_threat.threat_statement_id == threat.threat_statement_id
+    assert revised_threat.version == 2
+    assert other_tenant_memory.memory_id != memory.memory_id
+    assert other_tenant_context == {"security_memories": [], "threat_statements": []}
+
+
 def test_postgres_context_fabric_store_indexes_once_and_reuses_thereafter(sample_repo):
     factory = _session_factory()
     store = PostgresContextFabricStore(factory, "tenant-a")

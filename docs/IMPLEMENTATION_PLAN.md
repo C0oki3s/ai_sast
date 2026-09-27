@@ -646,18 +646,23 @@ backup schedule and disaster-recovery exercise remain Phase 6 deployment gates.
   include persisted hunt tasks and the cited knowledge entries used by those
   tasks, alongside the existing symbol, source-file, and Graphify node/edge
   dependencies. Migration `0011_model_invocation_identity.sql` and the
-  PostgreSQL integration test cover the invocation identity fields.
+  PostgreSQL integration test cover the invocation identity fields. Active
+  security memories and approved threat statements are now loaded from the
+  tenant-scoped Context Fabric, bounded by runtime configuration, and passed
+  into the hunt and independent review requests. Their IDs and hashes of the
+  exact redacted/bounded content are persisted on each invocation; findings
+  inherit direct dependencies on those records through their verifier call.
 
 Exit condition: accepted candidates retain their reviewer result and durable
-prompt/model, hunt-task, knowledge, source, and graph lineage; unresolved
+prompt/model, hunt-task, knowledge, security-memory, threat-statement, source,
+and graph lineage; unresolved
 required canonical coverage can never produce a successful scan — met for the
 implemented pipeline (proven by `tests/test_pipeline.py`'s
 `test_pipeline_marks_the_scan_incomplete_when_contextual_ai_discovery_fails`
-and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`). A
-separate relational link from findings to security-memory and threat-model
-records is not yet emitted by the runtime; those records remain represented in
-the immutable evidence packet and model-input hash. Live seeded-vulnerability
-recall and multi-language acceptance remain Phase 5 evidence gates. The
+and `test_pipeline_never_reports_a_candidate_without_an_ai_verdict`); memory
+and threat references are covered by Context Fabric, model-audit, and finding
+dependency tests. Live seeded-vulnerability recall and multi-language
+acceptance remain Phase 5 evidence gates. The
 optional patch proposal/rescan verification stage is additive and does not
 change this exit condition.
 

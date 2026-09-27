@@ -31,6 +31,8 @@ from ..context_fabric import (
     PreparedContext,
     SecurityContextPacket,
     SecurityMemory,
+    ThreatStatement,
+    context_reference,
 )
 from ..graph import StructuralGraph
 from ..knowledge import KnowledgeDecision, KnowledgeEntry
@@ -249,7 +251,7 @@ class PostgresContextFabricStore:
         source: str,
     ) -> SecurityMemory:
         codebase_id, _snapshot_id, _scan_id = _derive_ids(repository, "memory", self.tenant_id)
-        memory_id = stable_id("memory", repository, scope, category, statement)
+        memory_id = stable_id("memory", self.tenant_id, repository, scope, category, statement)
         with unit_of_work(self.session_factory, self.tenant_id) as repo:
             repo.add_codebase(codebase_id, external_key=repository, display_name=repository)
             value = repo.upsert_security_memory(
@@ -270,6 +272,78 @@ class PostgresContextFabricStore:
             status=value.status,
             version=value.version,
         )
+
+    def add_threat_statement(
+        self,
+        repository: str,
+        category: str,
+        statement: str,
+        provenance: str,
+        source_reference: str = "",
+    ) -> ThreatStatement:
+        if not source_reference.strip():
+            raise ValueError("threat statement source reference is required")
+        codebase_id, _snapshot_id, _scan_id = _derive_ids(repository, "threat-model", self.tenant_id)
+        threat_id = stable_id(
+            "threat", self.tenant_id, repository, category, source_reference
+        )
+        with unit_of_work(self.session_factory, self.tenant_id) as repo:
+            repo.add_codebase(codebase_id, external_key=repository, display_name=repository)
+            value = repo.upsert_threat_statement(
+                threat_id, codebase_id, category, statement, provenance, source_reference
+            )
+        return ThreatStatement(
+            threat_statement_id=value.threat_statement_id,
+            repository=repository,
+            category=value.category,
+            statement=value.statement,
+            provenance=value.provenance,
+            source_reference=value.source_reference,
+            version=value.version,
+        )
+
+    def active_security_context(
+        self, repository: str, profile: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        codebase_id, _snapshot_id, _scan_id = _derive_ids(repository, "context", self.tenant_id)
+        maximums = load_json("runtime/code_intelligence.json")
+        with unit_of_work(self.session_factory, self.tenant_id) as repo:
+            memories = repo.active_security_memories(
+                codebase_id, profile, int(maximums["maximum_security_memory_context_items"])
+            )
+            threats = repo.active_threat_statements(
+                codebase_id, int(maximums["maximum_threat_statement_context_items"])
+            )
+        return {
+            "security_memories": [
+                context_reference(
+                    "security_memory",
+                    item.memory_id,
+                    {
+                        "scope": item.scope,
+                        "category": item.category,
+                        "statement": item.statement,
+                        "provenance": item.provenance,
+                        "version": item.version,
+                    },
+                )
+                for item in memories[: int(maximums["maximum_security_memory_context_items"])]
+            ],
+            "threat_statements": [
+                context_reference(
+                    "threat_statement",
+                    item.threat_statement_id,
+                    {
+                        "category": item.category,
+                        "statement": item.statement,
+                        "provenance": item.provenance,
+                        "source_reference": item.source_reference,
+                        "version": item.version,
+                    },
+                )
+                for item in threats[: int(maximums["maximum_threat_statement_context_items"])]
+            ],
+        }
 
     def link_finding(
         self,

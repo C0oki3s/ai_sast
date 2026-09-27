@@ -1066,6 +1066,18 @@ def test_verified_finding_dependencies_include_its_deep_hunt_request(sample_repo
         "invocation_id": "invocation-verified",
         "input_hash": "a" * 64,
         "prompt_asset_version": "2026-09-27.1",
+        "context_references": [
+            {
+                "reference_type": "security_memory",
+                "reference_id": "memory-1",
+                "content_hash": "b" * 64,
+            },
+            {
+                "reference_type": "threat_statement",
+                "reference_id": "threat-1",
+                "content_hash": "c" * 64,
+            },
+        ],
     }
 
     dependencies = _finding_dependencies(finding, [], model_invocations=[invocation])
@@ -1078,6 +1090,10 @@ def test_verified_finding_dependencies_include_its_deep_hunt_request(sample_repo
         item.dependency_type == "prompt_asset_version" and item.dependency_key == "2026-09-27.1"
         for item in dependencies
     )
+    assert {item.dependency_type for item in dependencies} >= {
+        "security_memory",
+        "threat_statement",
+    }
 
 
 def test_pipeline_flags_a_finding_for_revalidation_once_its_dependency_changes_on_rescan(

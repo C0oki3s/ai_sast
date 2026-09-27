@@ -33,6 +33,7 @@ from plaidnox_sast.persistence import (
     HuntTaskInput,
     unit_of_work,
 )
+from plaidnox_sast.persistence.models import ModelInvocationRecord
 from plaidnox_sast.persistence.adapters import (
     PostgresContextFabricStore,
     PostgresKnowledgeStore,
@@ -235,7 +236,11 @@ def test_model_invocation_and_finding_lineage_persist_in_postgresql(pg_session_f
             "Keep identity claims from the verified principal.",
             {"evidence_packet": {"candidate_id": "candidate-lineage"}},
             [FindingEvidenceInput("source", "auth.js", 10, 12, "identity = header", "hash", "source_window")],
-            [FindingDependencyInput("symbol", "auth.js:authCheck", "b" * 64)],
+            [
+                FindingDependencyInput("symbol", "auth.js:authCheck", "b" * 64),
+                FindingDependencyInput("security_memory", "memory-lineage", "d" * 64),
+                FindingDependencyInput("threat_statement", "threat-lineage", "e" * 64),
+            ],
         )
         repository.record_model_invocation(
             ModelInvocationInput(
@@ -249,6 +254,13 @@ def test_model_invocation_and_finding_lineage_persist_in_postgresql(pg_session_f
                 prompt_asset_version="2026-09-27.1",
                 input_hash="c" * 64,
                 state="completed",
+                context_references=[
+                    {
+                        "reference_type": "security_memory",
+                        "reference_id": "memory-lineage",
+                        "content_hash": "d" * 64,
+                    }
+                ],
             )
         )
 
@@ -256,7 +268,15 @@ def test_model_invocation_and_finding_lineage_persist_in_postgresql(pg_session_f
         restored = repository.get_finding(finding_id)
     assert restored is not None
     assert len(restored.evidence) == 1
-    assert restored.dependencies[0].dependency_hash == "b" * 64
+    assert {item.dependency_type for item in restored.dependencies} >= {
+        "symbol",
+        "security_memory",
+        "threat_statement",
+    }
+    with pg_session_factory() as session:
+        invocation = session.get(ModelInvocationRecord, _id("invocation-pg-lineage"))
+    assert invocation is not None
+    assert invocation.context_references[0]["reference_id"] == "memory-lineage"
 
 
 def test_postgresql_cross_snapshot_reuse_requires_complete_graph_dependency_contract(

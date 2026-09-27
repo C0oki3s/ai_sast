@@ -17,11 +17,28 @@ from typing import Any, Protocol
 
 from .assets import load_json, load_text
 from .graph import StructuralGraph, Symbol, stable_symbol_id, stable_symbol_keys
+from .redaction import redact_payload
 from .worksets import security_summaries_from_graph, validate_security_contract
 
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def context_reference(kind: str, reference_id: str, attributes: dict[str, Any]) -> dict[str, Any]:
+    maximum = int(load_json("runtime/code_intelligence.json")["maximum_security_context_statement_characters"])
+    bounded = dict(attributes)
+    for field_name in ("statement", "provenance", "source_reference"):
+        if isinstance(bounded.get(field_name), str):
+            bounded[field_name] = bounded[field_name][:maximum]
+    stable_attributes = redact_payload(bounded)
+    digest = _sha256(json.dumps(stable_attributes, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    return {
+        "reference_type": kind,
+        "reference_id": reference_id,
+        "content_hash": digest,
+        **stable_attributes,
+    }
 
 
 def _persist_security_summaries(
@@ -144,6 +161,17 @@ class SecurityMemory:
 
 
 @dataclass(frozen=True, slots=True)
+class ThreatStatement:
+    threat_statement_id: str
+    repository: str
+    category: str
+    statement: str
+    provenance: str
+    source_reference: str = ""
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class SecurityContextPacket:
     profile: str
     changed_symbols: list[str]
@@ -200,6 +228,17 @@ class ContextFabric(Protocol):
         statement: str,
         source: str,
     ) -> SecurityMemory: ...
+
+    def add_threat_statement(
+        self,
+        repository: str,
+        category: str,
+        statement: str,
+        provenance: str,
+        source_reference: str = "",
+    ) -> ThreatStatement: ...
+
+    def active_security_context(self, repository: str, profile: str) -> dict[str, list[dict[str, Any]]]: ...
 
     def link_finding(
         self,
@@ -519,6 +558,92 @@ class ContextFabricStore:
                 (memory.memory_id, memory.repository, memory.scope, memory.category, memory.statement, memory.source, memory.status, memory.version),
             )
         return memory
+
+    def add_threat_statement(
+        self,
+        repository: str,
+        category: str,
+        statement: str,
+        provenance: str,
+        source_reference: str = "",
+    ) -> ThreatStatement:
+        normalized = tuple(value.strip() for value in (repository, category, statement, provenance))
+        if not all(normalized) or not source_reference.strip():
+            raise ValueError("repository, category, statement, provenance, and source reference are required")
+        repository, category, statement, provenance = normalized
+        statement_id = f"thr-{_sha256(':'.join((repository, category, source_reference.strip())))[:32]}"
+        value = ThreatStatement(
+            statement_id, repository, category, statement, provenance, source_reference.strip()
+        )
+        with self._connect() as conn:
+            conn.execute(
+                load_text("sql/context/upsert_threat_statement.sql"),
+                (
+                    value.threat_statement_id,
+                    repository,
+                    category,
+                    statement,
+                    provenance,
+                    value.source_reference,
+                ),
+            )
+            row = conn.execute(
+                "SELECT version FROM threat_statements WHERE threat_statement_id = ?",
+                (value.threat_statement_id,),
+            ).fetchone()
+        return ThreatStatement(
+            value.threat_statement_id,
+            value.repository,
+            value.category,
+            value.statement,
+            value.provenance,
+            value.source_reference,
+            int(row["version"]),
+        )
+
+    def active_security_context(
+        self, repository: str, profile: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        maximums = load_json("runtime/code_intelligence.json")
+        with self._connect() as conn:
+            memories = conn.execute(
+                load_text("sql/context/active_security_context_memories.sql"),
+                (repository, int(maximums["maximum_security_memory_context_items"])),
+            ).fetchall()
+            threats = conn.execute(
+                load_text("sql/context/active_threat_statements.sql"),
+                (repository, int(maximums["maximum_threat_statement_context_items"])),
+            ).fetchall()
+        return {
+            "security_memories": [
+                context_reference(
+                    "security_memory",
+                    str(item["memory_id"]),
+                    {
+                        "scope": str(item["scope"]),
+                        "category": str(item["category"]),
+                        "statement": str(item["statement"]),
+                        "provenance": str(item["source"]),
+                        "version": int(item["version"]),
+                    },
+                )
+                for item in memories
+            ],
+            "threat_statements": [
+                context_reference(
+                    "threat_statement",
+                    str(item["threat_statement_id"]),
+                    {
+                        "category": str(item["category"]),
+                        "statement": str(item["statement"]),
+                        "provenance": str(item["provenance"]),
+                        "source_reference": str(item["source_reference"]),
+                        "version": int(item["version"]),
+                    },
+                )
+                for item in threats
+            ],
+        }
 
     def link_finding(self, repository: str, fingerprint: str, context_id: str, symbol_ids: Iterable[str]) -> None:
         with self._connect() as conn:

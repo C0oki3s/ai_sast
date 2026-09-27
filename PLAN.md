@@ -423,9 +423,10 @@ PostgreSQL database, retry without duplicates, and recover after interruption.
 ### Phase 4 — complete AI hunt and evidence lifecycle
 
 Status: core implementation and durable prompt/model/task/knowledge/source/
-Graphify lineage are in place. Explicit relational dependencies from findings
-to security-memory and threat-model records remain open; live seeded and
-multi-language acceptance evidence remains Phase 5 work.
+Graphify/security-memory/threat-statement lineage are in place. Active memory
+and threat-model records enter bounded model context and are linked to findings
+through the exact review invocation. Live seeded and multi-language acceptance
+evidence remains Phase 5 work.
 
 - Move to investigation-owned coverage with one bounded initial hunt, typed
   graph/source requests, and continuation only after new material evidence.
@@ -446,7 +447,10 @@ multi-language acceptance evidence remains Phase 5 work.
   Deep Hunt.
 
 Exit: each finding can be reconstructed from immutable evidence and all context
-that influenced it; every rejected candidate has a falsification record.
+that influenced it; every rejected candidate has a falsification record. The
+runtime persists memory/threat statement IDs and versioned content hashes for
+records included in the independent review request. Phase 5 still owns cold,
+seeded-vulnerability and multi-language acceptance evidence.
 
 ### Phase 5 — end-to-end product validation
 

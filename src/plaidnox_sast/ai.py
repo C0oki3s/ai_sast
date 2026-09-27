@@ -290,6 +290,10 @@ class PlaidNoxDeepHuntAgent:
         self.discovery_error_types: list[str] = []
         self.discovery_errors: list[str] = []
         self.security_graph: StructuralGraph | None = None
+        self._active_security_context_references: dict[str, list[dict[str, Any]]] = {
+            "security_memories": [],
+            "threat_statements": [],
+        }
         self.source_excludes: list[str] = []
         self.max_file_bytes: int | None = None
         self._model_input_audit: list[dict[str, Any]] = []
@@ -391,6 +395,10 @@ class PlaidNoxDeepHuntAgent:
         self._model_input_audit.clear()
         self._model_invocation_audit.clear()
         self._model_execution_routes.clear()
+        self._active_security_context_references = {
+            "security_memories": [],
+            "threat_statements": [],
+        }
         self.rate_limit_waits = 0
 
     def reset_search_query_errors(self) -> None:
@@ -530,6 +538,7 @@ class PlaidNoxDeepHuntAgent:
             "graph_path": candidate.evidence.graph_path,
             "discovery_evidence_basis": candidate.metadata.get("evidence_basis", {}),
             "candidate_evidence_packet": candidate.metadata.get("evidence_packet", {}),
+            "security_context_references": self._active_security_context_references,
             "security_ir_context": {} if metadata_only else _security_ir_context(
                 self.security_graph,
                 candidate.evidence.path,
@@ -811,6 +820,11 @@ class PlaidNoxDeepHuntAgent:
                 ),
                 "reused": preparation.reused,
             }
+            active_context = getattr(self.context_store, "active_security_context", None)
+            if callable(active_context):
+                profile = str(load_json("runtime/code_intelligence.json")["security_context_profile"])
+                self._active_security_context_references = active_context(codebase, profile)
+                context_fabric.update(self._active_security_context_references)
             if preparation.reused and preparation.previous_repository_context is not None:
                 context = _repository_context_from_saved(
                     preparation.previous_repository_context,
@@ -2282,6 +2296,7 @@ class PlaidNoxDeepHuntAgent:
         reasoning_effort_override: str | None = None,
     ) -> Any:
         safe_payload = redact_payload(payload)
+        context_references = _context_references_from_payload(safe_payload)
         serialized_payload = json.dumps(safe_payload, sort_keys=True, ensure_ascii=False)
         runtime = load_json("runtime/code_intelligence.json")
         source_keys = {str(item) for item in runtime["audited_source_payload_keys"]}
@@ -2338,6 +2353,7 @@ class PlaidNoxDeepHuntAgent:
                         "work_identity": checkpoint_work_identity,
                         "state": "replayed",
                         "provider_request_id": "",
+                        "context_references": context_references,
                     }
                 )
                 self._emit(
@@ -2394,6 +2410,7 @@ class PlaidNoxDeepHuntAgent:
             "work_identity": checkpoint_work_identity,
             "state": "running",
             "provider_request_id": "",
+            "context_references": context_references,
         }
         self._model_invocation_audit.append(invocation)
         request_policy = _model_request_policy(agent_runtime, prompt_operation)
@@ -4246,6 +4263,35 @@ def _contains_repository_wide_context(value: Any) -> bool:
     if isinstance(value, list):
         return any(_contains_repository_wide_context(item) for item in value)
     return False
+
+
+def _context_references_from_payload(value: Any) -> list[dict[str, str]]:
+    """Collect versioned memory/threat records included in a model request."""
+    references: dict[tuple[str, str], dict[str, str]] = {}
+
+    def walk(item: Any) -> None:
+        if isinstance(item, Mapping):
+            reference_type = str(item.get("reference_type", ""))
+            reference_id = str(item.get("reference_id", ""))
+            content_hash = str(item.get("content_hash", ""))
+            if (
+                reference_type in {"security_memory", "threat_statement"}
+                and reference_id
+                and re.fullmatch(r"[0-9a-f]{64}", content_hash)
+            ):
+                references[(reference_type, reference_id)] = {
+                    "reference_type": reference_type,
+                    "reference_id": reference_id,
+                    "content_hash": content_hash,
+                }
+            for nested in item.values():
+                walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(value)
+    return [references[key] for key in sorted(references)]
 
 
 def _query_budget(runtime: Mapping[str, Any], file_count: int, task_count: int) -> int:
