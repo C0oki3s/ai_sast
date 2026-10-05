@@ -16,6 +16,7 @@ from plaidnox_sast.ai import (
     _bounded_prompt_security_ir,
     _execute_recon_search_plan,
     _ground_repository_annotations,
+    _deep_hunt_result_from_response,
     _mapping_items,
     _resolve_context_request,
     _security_workset_review_units,
@@ -54,6 +55,16 @@ def test_prompt_security_ir_is_bounded_and_balanced_across_areas():
 def test_mapping_items_ignores_malformed_scalar_annotations():
     assert _mapping_items([{"name": "valid"}, "x", 3, None]) == [{"name": "valid"}]
     assert _mapping_items("not-a-list") == []
+
+
+def test_deep_hunt_response_accepts_omitted_classification_references():
+    payload = review_payload()
+    del payload["classification_references"]
+
+    result = _deep_hunt_result_from_response(FakeResponse(payload))
+
+    assert result.classification_references == []
+    assert result.supported is True
 
 
 def review_payload(**overrides):

@@ -2853,7 +2853,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             business_impact=str(payload["business_impact"]),
             classification_references=[
                 {str(key): str(value) for key, value in item.items()}
-                for item in payload["classification_references"]
+                for item in payload.get("classification_references", [])
             ],
             falsification_attempts=[str(item) for item in payload["falsification_attempts"]],
             required_preconditions=[str(item) for item in payload["required_preconditions"]],
