@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_sast.redaction import redact
@@ -35,6 +37,7 @@ from .assets import load_json
 from .baseline import FindingBaselineClassification
 from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
+from .models import ActivityEventRecord, InstallationTenantRecord, WebhookDeliveryRecord
 from .policy import evaluate_merge_policy
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
@@ -119,7 +122,7 @@ class ReviewService:
 
     def run(self, request: ReviewRequest) -> ReviewResponse:
         review_id = _review_id(request)
-        tenant_id = _tenant_id(request)
+        tenant_id = self.resolve_tenant(request.provider, request.installation_id)
         codebase_id = f"{request.provider}:repository:{request.repository_id}"
         runtime = load_json("runtime/review.json")
         lease_owner = uuid4().hex
@@ -186,7 +189,7 @@ class ReviewService:
         finally:
             heartbeat.stop()
 
-        response = _response(request, result)
+        response = _response(request, result, tenant_id)
         with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
             completed = repository.complete(
                 review_id,
@@ -205,6 +208,182 @@ class ReviewService:
                 f"review {review_id} lease was lost before completion"
             )
         return response
+
+    def claim_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        provider: str,
+        installation_id: int,
+        repository_id: int,
+        event_name: str,
+        action: str | None,
+        pull_number: int | None = None,
+        head_sha: str | None = None,
+    ) -> tuple[bool, str]:
+        """Persist a verified delivery before the bot acknowledges it to GitHub."""
+        tenant_id = self.resolve_tenant(provider, installation_id)
+        with self.session_factory.begin() as session:
+            inserted = False
+            try:
+                with session.begin_nested():
+                    session.add(
+                        WebhookDeliveryRecord(
+                            delivery_id=delivery_id,
+                            provider=provider,
+                            installation_id=installation_id,
+                            repository_id=repository_id,
+                            event_name=event_name,
+                            action=action,
+                            tenant_id=tenant_id,
+                            state="accepted",
+                        )
+                    )
+                    session.flush()
+                inserted = True
+            except IntegrityError:
+                session.expire_all()
+
+            existing = session.scalar(
+                select(WebhookDeliveryRecord)
+                .where(WebhookDeliveryRecord.delivery_id == delivery_id)
+                .with_for_update()
+            )
+            if existing is None:
+                raise RuntimeError("webhook delivery claim disappeared during insert")
+            identity = (
+                existing.provider,
+                existing.installation_id,
+                existing.repository_id,
+                existing.event_name,
+                existing.action,
+                existing.tenant_id,
+            )
+            expected_identity = (
+                provider,
+                installation_id,
+                repository_id,
+                event_name,
+                action,
+                tenant_id,
+            )
+            if identity != expected_identity:
+                raise PermissionError("delivery identifier is already bound to a different event")
+
+            if inserted and event_name == "pull_request":
+                event_type = _pr_activity_type(action)
+                if event_type:
+                    session.add(
+                        _activity_record(
+                            tenant_id=tenant_id,
+                            provider=provider,
+                            repository_id=repository_id,
+                            installation_id=installation_id,
+                            pull_number=pull_number,
+                            head_sha=head_sha,
+                            event_type=event_type,
+                            idempotency_key=f"github:{delivery_id}:{event_type}",
+                        )
+                    )
+            accepted = inserted or existing.state != "queued"
+        return accepted, tenant_id
+
+    def mark_webhook_delivery_queued(self, delivery_id: str) -> bool:
+        with self.session_factory.begin() as session:
+            row = session.get(WebhookDeliveryRecord, delivery_id)
+            if row is None:
+                return False
+            row.state = "queued"
+            if row.event_name == "pull_request" and row.action in {
+                "opened",
+                "reopened",
+                "ready_for_review",
+                "synchronize",
+            }:
+                source = session.scalar(
+                    select(ActivityEventRecord)
+                    .where(
+                        ActivityEventRecord.idempotency_key.in_(
+                            [
+                                f"github:{delivery_id}:pr_opened",
+                                f"github:{delivery_id}:pr_updated",
+                            ]
+                        )
+                    )
+                    .limit(1)
+                )
+                session.add(
+                    _activity_record(
+                        tenant_id=row.tenant_id,
+                        provider=row.provider,
+                        repository_id=row.repository_id,
+                        installation_id=row.installation_id,
+                        pull_number=source.pull_number if source else None,
+                        head_sha=source.head_sha if source else None,
+                        event_type="review_queued",
+                        idempotency_key=f"github:{delivery_id}:review_queued",
+                    )
+                )
+        return True
+
+    def update_installation_status(self, *, provider: str, installation_id: int, active: bool) -> bool:
+        with self.session_factory.begin() as session:
+            mapping = session.get(InstallationTenantRecord, (provider, installation_id))
+            if mapping is None:
+                return False
+            mapping.active = active
+        return True
+
+    def record_review_superseded(
+        self,
+        *,
+        provider: str,
+        installation_id: int,
+        repository_id: int,
+        review_number: int,
+        review_id: str,
+        head_sha: str,
+    ) -> None:
+        tenant_id = self.resolve_tenant(provider, installation_id)
+        with self.session_factory.begin() as session:
+            session.merge(
+                _activity_record(
+                    tenant_id=tenant_id,
+                    provider=provider,
+                    repository_id=repository_id,
+                    installation_id=installation_id,
+                    pull_number=review_number,
+                    review_id=review_id,
+                    head_sha=head_sha,
+                    event_type="review_superseded",
+                    idempotency_key=f"{review_id}:superseded",
+                )
+            )
+
+    def record_review_failed(self, request: ReviewRequest) -> None:
+        tenant_id = self.resolve_tenant(request.provider, request.installation_id)
+        review_id = _review_id(request)
+        with self.session_factory.begin() as session:
+            session.merge(
+                _activity_record(
+                    tenant_id=tenant_id,
+                    provider=request.provider,
+                    repository_id=request.repository_id,
+                    installation_id=request.installation_id,
+                    pull_number=request.review_number,
+                    review_id=review_id,
+                    head_sha=request.head_sha,
+                    event_type="review_failed",
+                    idempotency_key=f"{review_id}:failed",
+                )
+            )
+
+    def resolve_tenant(self, provider: str, installation_id: int) -> str:
+        with self.session_factory() as session:
+            mapping = session.get(InstallationTenantRecord, (provider, installation_id))
+        if mapping is None or not mapping.active:
+            raise PermissionError("GitHub installation is not linked to an active product organization")
+        return mapping.tenant_id
 
     def promote_to_baseline(self, review_id: str, merge_revision: str) -> PromoteBaselineResponse | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
@@ -366,7 +545,7 @@ def _replay_response(attempt: attempts.ReviewAttempt) -> ReviewResponse:
     )
 
 
-def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
+def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> ReviewResponse:
     candidate_by_id = {item.candidate_id: item for item in result.candidates}
     verification_by_id = {item.candidate_id: item for item in result.verifications}
     findings: list[ReviewFinding] = []
@@ -434,7 +613,7 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                 regression_test_expectation=regression_test,
                 category=classification.vulnerability_class,
                 baseline_relationship=classification.relationship.lower(),
-                tenant_id=_tenant_id(request),
+                tenant_id=tenant_id,
                 repository_id=request.repository_id,
                 base_revision=request.base_sha,
                 head_revision=request.head_sha,
@@ -503,6 +682,59 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
 
 def _tenant_id(request: ReviewRequest) -> str:
     return f"{request.provider}:installation:{request.installation_id}"
+
+
+def _pr_activity_type(action: str | None) -> str | None:
+    if action == "opened":
+        return "pr_opened"
+    if action == "merged":
+        return "pr_merged"
+    if action == "closed":
+        return "pr_closed"
+    if action in {"reopened", "ready_for_review", "synchronize", "edited", "converted_to_draft"}:
+        return "pr_updated"
+    return None
+
+
+def _activity_record(
+    *,
+    tenant_id: str,
+    provider: str,
+    repository_id: int,
+    installation_id: int,
+    event_type: str,
+    idempotency_key: str,
+    pull_number: int | None = None,
+    review_id: str | None = None,
+    head_sha: str | None = None,
+) -> ActivityEventRecord:
+    labels = {
+        "pr_opened": "Pull request opened",
+        "pr_updated": "Pull request updated",
+        "pr_closed": "Pull request closed",
+        "pr_merged": "Pull request merged",
+        "review_queued": "Security review queued",
+        "review_superseded": "Security review superseded",
+        "review_failed": "Security review failed",
+    }
+    summary = labels[event_type]
+    if pull_number is not None:
+        summary = f"{summary} for PR #{pull_number}"
+    return ActivityEventRecord(
+        event_id=hashlib.sha256(idempotency_key.encode()).hexdigest()[:32],
+        tenant_id=tenant_id,
+        codebase_id=f"{provider}:repository:{repository_id}",
+        provider=provider,
+        repository_id=repository_id,
+        installation_id=installation_id,
+        pull_number=pull_number,
+        review_id=review_id,
+        head_sha=head_sha,
+        event_type=event_type,
+        summary=summary,
+        metadata_json={},
+        idempotency_key=idempotency_key[:255],
+    )
 
 
 def _optional_verification_text(verification: object, attribute: str) -> str | None:

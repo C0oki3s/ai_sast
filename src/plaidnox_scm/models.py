@@ -11,12 +11,68 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, JSON, DateTime, Float, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class InstallationTenantRecord(Base):
+    """Product tenant bound to a GitHub App installation."""
+
+    __tablename__ = "scm_installation_tenants"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    installation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class WebhookDeliveryRecord(Base):
+    """Durable, tenant-scoped GitHub delivery deduplication ledger."""
+
+    __tablename__ = "scm_webhook_deliveries"
+
+    delivery_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    repository_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str | None] = mapped_column(String(64))
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="accepted")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ActivityEventRecord(Base):
+    """Small allowlisted SCM lifecycle records for the product dashboard."""
+
+    __tablename__ = "scm_activity_events"
+    __table_args__ = (
+        Index("ix_scm_activity_tenant_time", "tenant_id", "created_at"),
+        Index("ix_scm_activity_tenant_codebase_time", "tenant_id", "codebase_id", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    codebase_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    repository_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pull_number: Mapped[int | None] = mapped_column(Integer)
+    review_id: Mapped[str | None] = mapped_column(String(64))
+    head_sha: Mapped[str | None] = mapped_column(String(64))
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    summary: Mapped[str] = mapped_column(String(255), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class ApplicationContextRecord(Base):

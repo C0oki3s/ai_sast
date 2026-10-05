@@ -40,6 +40,40 @@ class ReviewRequest(BaseModel):
     source_bundle_url: str | None = Field(default=None, max_length=4096)
 
 
+class WebhookDeliveryClaim(BaseModel):
+    """Verified GitHub delivery identity forwarded by the webhook adapter."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    delivery_id: str = Field(min_length=1, max_length=255)
+    provider: str = Field(default="github", min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
+    installation_id: int = Field(gt=0)
+    repository_id: int = Field(gt=0)
+    event_name: str = Field(min_length=1, max_length=64)
+    action: str | None = Field(default=None, max_length=64)
+    pull_number: int | None = Field(default=None, gt=0)
+    head_sha: str | None = Field(default=None, min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
+
+
+class InstallationStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    provider: str = Field(default="github", min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
+    installation_id: int = Field(gt=0)
+    active: bool
+
+
+class ReviewSupersededRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    provider: str = Field(default="github", min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
+    installation_id: int = Field(gt=0)
+    repository_id: int = Field(gt=0)
+    review_number: int = Field(gt=0)
+    review_id: str = Field(min_length=1, max_length=64)
+    head_sha: str = Field(min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
+
+
 class FindingEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

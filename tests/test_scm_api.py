@@ -16,7 +16,7 @@ from plaidnox_scm.api_models import ReviewRequest
 from plaidnox_scm.api_service import ReviewService, _review_id
 from plaidnox_scm.attempts import unit_of_work as attempts_unit_of_work
 from plaidnox_scm.evidence import EvidenceRole
-from plaidnox_scm.models import Base
+from plaidnox_scm.models import Base, InstallationTenantRecord
 from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource, SourceBrokerError
 
 
@@ -63,7 +63,46 @@ def _factory():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory.begin() as session:
+        session.add(
+            InstallationTenantRecord(
+                provider="github",
+                installation_id=12345,
+                tenant_id="test-tenant",
+                active=True,
+            )
+        )
+    return factory
+
+
+def test_webhook_delivery_claim_is_authenticated_tenant_scoped_and_idempotent() -> None:
+    factory = _factory()
+    service = ReviewService(RepositoryMirrorBroker(Path("/tmp/plaidnox-test-mirrors")), factory, lambda: None)
+    app = create_app(service, api_token="scanner-token")
+    payload = {
+        "delivery_id": "gh-delivery-123",
+        "provider": "github",
+        "installation_id": 12345,
+        "repository_id": 899377752,
+        "event_name": "pull_request",
+        "action": "synchronize",
+        "pull_number": 7,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    }
+    routes = {getattr(route, "path", "") for route in app.routes}
+    assert "/v1/webhook-deliveries/claim" in routes
+    assert "/v1/webhook-deliveries/{delivery_id}/queued" in routes
+
+    first, tenant_id = service.claim_webhook_delivery(**payload)
+    assert (first, tenant_id) == (True, "test-tenant")
+    assert service.mark_webhook_delivery_queued("gh-delivery-123") is True
+    duplicate, tenant_id = service.claim_webhook_delivery(**payload)
+    assert (duplicate, tenant_id) == (False, "test-tenant")
+
+    conflicting = {**payload, "repository_id": 987654321}
+    with pytest.raises(PermissionError):
+        service.claim_webhook_delivery(**conflicting)
 
 
 def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Path) -> None:
@@ -199,7 +238,7 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         "regression_test_expectation": "Reject any request whose JWT signature does not verify.",
         "category": "CWE-347",
         "baseline_relationship": "introduced",
-        "tenant_id": "github:installation:12345",
+        "tenant_id": "test-tenant",
         "repository_id": 899377752,
         "base_revision": base,
         "head_revision": head,
