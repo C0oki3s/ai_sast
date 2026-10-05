@@ -3962,7 +3962,7 @@ def _bounded_prompt_security_ir(
 
     sampled, _ = _balanced_area_sample(items, file_limit, lambda item: str(item["path"]))
     selected: list[dict[str, Any]] = []
-    used = 0
+    used = 2  # JSON list brackets
     for item in sampled:
         compact: dict[str, Any] = {
             "path": str(item["path"])[:512],
@@ -3980,7 +3980,7 @@ def _bounded_prompt_security_ir(
             ]
             if len(values) > entry_limit:
                 compact[f"omitted_{field}"] = len(values) - entry_limit
-        size = len(json.dumps(compact, ensure_ascii=False))
+        size = len(json.dumps(compact)) + (2 if selected else 0)
         if used + size > character_limit:
             continue
         selected.append(compact)
