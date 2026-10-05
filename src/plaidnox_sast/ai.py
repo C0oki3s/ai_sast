@@ -2546,7 +2546,7 @@ class PlaidNoxDeepHuntAgent:
                 invocation["error_type"] = f"incomplete:{reason}"
                 retry_limit = int(retry_limits.get(model_execution.model_tier.value, 0))
                 if (
-                    reason == "max_output_tokens"
+                    reason in {"max_output_tokens", "unknown"}
                     and output_retry_count < max_output_retries
                     and retry_limit > effective_max_output_tokens
                 ):
@@ -2563,11 +2563,12 @@ class PlaidNoxDeepHuntAgent:
                             checkpoint_execution,
                         )
                     self._emit(
-                        "model_output_truncation_retry",
+                        "model_incomplete_response_retry",
                         operation=prompt_operation,
                         model_tier=model_execution.model_tier.value,
                         retry=output_retry_count,
                         max_output_tokens=retry_limit,
+                        incomplete_reason=reason,
                     )
                     continue
                 raise AIResponseError(f"AI request was incomplete: {reason}")

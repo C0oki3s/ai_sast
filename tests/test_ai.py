@@ -727,6 +727,32 @@ def test_repository_context_retries_when_gateway_omits_truncation_reason():
     assert [request["max_output_tokens"] for request in requests] == [9000, 9500]
 
 
+def test_security_review_retries_unknown_incomplete_reason_once():
+    requests = []
+    responses = [
+        type("IncompleteResponse", (), {
+            "status": "incomplete", "incomplete_details": None,
+            "output_text": "", "usage": {},
+        })(),
+        FakeResponse({"ok": True}),
+    ]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+    result = agent._structured_response(
+        "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
+    )
+
+    assert json.loads(result.output_text) == {"ok": True}
+    assert [request["max_output_tokens"] for request in requests] == [9000, 14000]
+
+
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
     (sample_repo / "app.js").write_text(
         "const express = require('express');\n"
