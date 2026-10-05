@@ -7,12 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from plaidnox_scm.change_relevance import classify
 from plaidnox_scm.context_store import ApplicationContext
 from plaidnox_scm.diffing import compute_diff
-from plaidnox_scm.l1_review import L1ReviewError, LiteLLMChangedFileReviewer
+from plaidnox_scm.l1_review import LiteLLMChangedFileReviewer
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -132,14 +130,31 @@ def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -
     assert result.candidates[0].requested_expansion == ()
 
 
-def test_l1_review_rejects_candidate_not_anchored_to_changed_lines(tmp_path: Path) -> None:
+def test_l1_review_marks_unanchored_candidate_as_incomplete(tmp_path: Path) -> None:
     repo, base, head = _repo(tmp_path)
     diff = compute_diff(repo, base, head)
 
-    with pytest.raises(L1ReviewError, match="changed line range"):
-        LiteLLMChangedFileReviewer(_Client(_payload(start_line=99))).review(
-            repo, diff, classify(diff), _context(base)
-        )
+    result = LiteLLMChangedFileReviewer(_Client(_payload(start_line=99))).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.candidates == ()
+    assert result.coverage_complete is False
+    assert "invalid candidate" in result.coverage_gaps[0]
+
+
+def test_l1_review_marks_missing_coverage_status_as_incomplete(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+    payload = _payload()
+    del payload["coverage_complete"]
+
+    result = LiteLLMChangedFileReviewer(_Client(payload)).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.coverage_complete is False
+    assert "omitted coverage status" in result.coverage_gaps[0]
 
 
 def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(

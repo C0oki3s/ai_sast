@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from plaidnox_sast.assets import load_json as load_sast_json
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
@@ -128,7 +128,7 @@ class LiteLLMChangedFileReviewer:
                         {"role": "user", "content": user_prompt},
                     ],
                     text={
-                        "verbosity": "low",
+                        "verbosity": "medium",
                         "format": {
                             "type": "json_schema",
                             "name": "plaidnox_scm_changed_file_review",
@@ -140,7 +140,9 @@ class LiteLLMChangedFileReviewer:
                 )
                 model_calls += 1
                 if getattr(response, "status", "completed") != "completed":
-                    raise L1ReviewError(f"L1 review was incomplete for {changed_file.path}")
+                    coverage_complete = False
+                    coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")
+                    continue
                 result = _parse_response(response, changed_file)
                 candidates.extend(result[0])
                 coverage_complete = coverage_complete and result[1]
@@ -219,11 +221,27 @@ def _parse_response(
 ) -> tuple[list[L1Candidate], bool, list[str]]:
     try:
         payload = response_json(response)
-        raw_candidates = list(payload["candidates"])
-        coverage_complete = bool(payload["coverage_complete"])
-        coverage_gaps = [str(item) for item in payload["coverage_gaps"]]
-    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise L1ReviewError(f"L1 response did not match the schema for {changed_file.path}") from exc
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return [], False, [f"Model returned invalid structured output for {changed_file.path}"]
+    if not isinstance(payload, Mapping):
+        return [], False, [f"Model returned invalid structured output for {changed_file.path}"]
+
+    coverage_complete = payload.get("coverage_complete") is True
+    raw_gaps = payload.get("coverage_gaps", [])
+    coverage_gaps = [str(item) for item in raw_gaps] if isinstance(raw_gaps, list) else []
+    if "coverage_complete" not in payload:
+        coverage_gaps.append(f"Model omitted coverage status for {changed_file.path}")
+    if not isinstance(raw_gaps, list):
+        coverage_complete = False
+        coverage_gaps.append(f"Model returned invalid coverage gaps for {changed_file.path}")
+    raw_candidates = payload.get("candidates", [])
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+        coverage_complete = False
+        coverage_gaps.append(f"Model returned invalid candidates for {changed_file.path}")
+    if "candidates" not in payload:
+        coverage_complete = False
+        coverage_gaps.append(f"Model omitted candidates for {changed_file.path}")
 
     candidates: list[L1Candidate] = []
     for item in raw_candidates:
@@ -256,8 +274,9 @@ def _parse_response(
                     ),
                 )
             )
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            raise L1ReviewError(f"L1 candidate did not match the schema for {changed_file.path}") from exc
+        except (AttributeError, KeyError, TypeError, ValueError, L1ReviewError):
+            coverage_complete = False
+            coverage_gaps.append(f"Model returned an invalid candidate for {changed_file.path}")
     return candidates, coverage_complete, coverage_gaps
 
 
