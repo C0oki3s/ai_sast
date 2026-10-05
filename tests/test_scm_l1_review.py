@@ -113,6 +113,19 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
 
 
+def test_l1_review_uses_explicit_scm_model_and_cache_key(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+    client = _Client(_payload())
+
+    LiteLLMChangedFileReviewer(client, model="gpt-5.4").review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert client.responses.calls[0]["model"] == "gpt-5.4"
+    assert client.responses.calls[0]["prompt_cache_key"] == "plaidnox-scm:changed_file_review"
+
+
 def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -> None:
     repo, base, head = _repo(tmp_path)
     payload = _payload()

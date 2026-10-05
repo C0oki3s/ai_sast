@@ -81,8 +81,9 @@ class ChangedFileReviewer(Protocol):
 class LiteLLMChangedFileReviewer:
     """One structured LiteLLM review call per changed runtime/configuration file."""
 
-    def __init__(self, client: ResponsesClient) -> None:
+    def __init__(self, client: ResponsesClient, model: str | None = None) -> None:
         self._client = client
+        self._model = model
 
     def review(
         self,
@@ -94,7 +95,7 @@ class LiteLLMChangedFileReviewer:
         runtime = load_json("runtime/review.json")
         schema = load_json("schemas/changed_file_review.json")
         model_tier = str(runtime["l1_model_tier"])
-        model = str(load_sast_json("runtime/models.json")["agent_model_by_tier"][model_tier])
+        model = self._model or str(load_sast_json("runtime/models.json")["agent_model_by_tier"][model_tier])
         candidates: list[L1Candidate] = []
         reviewed_paths: list[str] = []
         coverage_gaps: list[str] = []
@@ -139,6 +140,7 @@ class LiteLLMChangedFileReviewer:
                             },
                         },
                         max_output_tokens=int(runtime["l1_max_output_tokens"]),
+                        prompt_cache_key="plaidnox-scm:changed_file_review",
                     )
                 except Exception:
                     # A provider or gateway error means this file was not reviewed.
