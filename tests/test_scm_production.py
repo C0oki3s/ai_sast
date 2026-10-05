@@ -13,6 +13,7 @@ def test_scm_production_routes_models_to_gpt(monkeypatch):
     router = agent.model_execution_router
 
     assert agent.model == "gpt-5.4-mini"
+    assert agent.strict_output_schema is False
     assert agent.model_by_tier["deep"] == "gpt-5.4"
     assert router.fallback_by_tier[ModelTier.FAST] == "gpt-5.4-mini"
     assert router.fallback_by_tier[ModelTier.DEEP] == "gpt-5.4"

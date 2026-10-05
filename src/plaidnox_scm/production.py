@@ -47,6 +47,9 @@ def dependencies_from_environment() -> ReviewDependencies:
         review_models["repository_context"]
     )
     agent = OptimizedPlaidNoxDeepHuntAgent(client, model=model, model_execution_router=router)
+    # Existing SCM schemas contain optional fields. OpenAI strict mode requires
+    # every object property to be required; local parsing still validates output.
+    agent.strict_output_schema = False
     agent.model_by_tier = {tier.value: str(review_models[tier.value]) for tier in ModelTier}
     return ReviewDependencies(
         context_builder=SastApplicationContextBuilder(agent),

@@ -135,7 +135,7 @@ class LiteLLMChangedFileReviewer:
                             "format": {
                                 "type": "json_schema",
                                 "name": "plaidnox_scm_changed_file_review",
-                                "strict": True,
+                            "strict": not model.startswith("gpt-"),
                                 "schema": schema,
                             },
                         },

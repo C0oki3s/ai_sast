@@ -2449,7 +2449,12 @@ class PlaidNoxDeepHuntAgent:
             ],
             "text": {
                 "verbosity": "low",
-                "format": {"type": "json_schema", "name": name, "strict": True, "schema": schema},
+                "format": {
+                    "type": "json_schema",
+                    "name": name,
+                    "strict": getattr(self, "strict_output_schema", True),
+                    "schema": schema,
+                },
             },
             "timeout": request_policy["timeout_seconds"],
             "max_retries": request_policy["max_retries"],

@@ -124,6 +124,7 @@ def test_l1_review_uses_explicit_scm_model_and_cache_key(tmp_path: Path) -> None
 
     assert client.responses.calls[0]["model"] == "gpt-5.4"
     assert client.responses.calls[0]["prompt_cache_key"] == "plaidnox-scm:changed_file_review"
+    assert client.responses.calls[0]["text"]["format"]["strict"] is False
 
 
 def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -> None:
