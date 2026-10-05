@@ -16,7 +16,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates ripgrep \
+    && apt-get install --yes --no-install-recommends ca-certificates git ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 plaidnox \
     && useradd --uid 10001 --gid plaidnox --create-home --shell /usr/sbin/nologin plaidnox \

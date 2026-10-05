@@ -36,6 +36,8 @@ class ReviewRequest(BaseModel):
     base_ref: str = Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x20\x7f]+$")
     head_ref: str = Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x20\x7f]+$")
     delivery_id: str = Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x20\x7f]+$")
+    # Short-lived, installation-scoped S3 URL uploaded by the trusted GitHub bot.
+    source_bundle_url: str | None = Field(default=None, max_length=4096)
 
 
 class FindingEvidence(BaseModel):

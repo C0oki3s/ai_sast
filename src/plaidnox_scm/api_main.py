@@ -33,6 +33,8 @@ def build_app():
             mirror_root,
             sync_retry_attempts=int(runtime["mirror_sync_retry_attempts"]),
             sync_retry_interval_seconds=float(runtime["mirror_sync_retry_interval_seconds"]),
+            source_bundle_bucket=os.environ.get("PLAIDNOX_SCM_BUNDLE_BUCKET") or None,
+            source_bundle_region=os.environ.get("PLAIDNOX_SCM_BUNDLE_REGION", os.environ.get("AWS_REGION", "us-east-1")),
         ),
         session_factory=factory,
         dependencies_factory=dependencies_from_environment,

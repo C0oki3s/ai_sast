@@ -233,6 +233,53 @@ def test_repository_mirror_broker_requires_exact_requested_revisions(tmp_path: P
         assert source == RepositorySource(mirror.resolve(), base, head)
 
 
+def test_repository_mirror_broker_materializes_trusted_s3_bundle(monkeypatch, tmp_path: Path) -> None:
+    staging = tmp_path / "source"
+    base, head = _repository(staging)
+    bundle = tmp_path / "repo.bundle"
+    _git(staging, "bundle", "create", str(bundle), "--all")
+    bucket = "plaidnox-scm-review-bundles-341860778390-us-east-1"
+    bundle_url = (
+        f"https://{bucket}.s3.us-east-1.amazonaws.com/reviews/12345/899377752/review.bundle"
+        "?X-Amz-Signature=fixture"
+    )
+    request = ReviewRequest.model_validate(
+        {**_request(base, head), "source_bundle_url": bundle_url}
+    )
+    broker = RepositoryMirrorBroker(
+        tmp_path / "unused-mirror",
+        source_bundle_bucket=bucket,
+        source_bundle_region="us-east-1",
+    )
+    monkeypatch.setattr(
+        broker,
+        "_download_source_bundle",
+        lambda _request, destination: shutil.copyfile(bundle, destination),
+    )
+
+    with broker.materialize(request) as source:
+        assert source.base_revision == base
+        assert source.head_revision == head
+        assert _git(source.repo_path, "show", f"{head}:README.md") == "# Fixture\n\nDocumentation."
+
+
+def test_source_bundle_broker_rejects_urls_outside_installation_and_repository_scope(tmp_path: Path) -> None:
+    request = ReviewRequest.model_validate(
+        {
+            **_request("a" * 40, "b" * 40),
+            "source_bundle_url": "https://attacker.example/reviews/12345/899377752/review.bundle",
+        }
+    )
+    broker = RepositoryMirrorBroker(
+        tmp_path / "unused-mirror",
+        source_bundle_bucket="plaidnox-scm-review-bundles-341860778390-us-east-1",
+        source_bundle_region="us-east-1",
+    )
+
+    with pytest.raises(SourceBrokerError, match="outside the configured S3 repository scope"):
+        broker._download_source_bundle(request, tmp_path / "source.bundle")
+
+
 def test_repository_mirror_broker_retries_a_not_yet_synced_mirror(monkeypatch, tmp_path: Path) -> None:
     """Wave 11: tolerates the race between webhook delivery and mirror sync.
 
