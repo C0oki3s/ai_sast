@@ -621,7 +621,7 @@ def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
     assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
     assert client.responses.kwargs["model"] != "test-model"
-    assert client.responses.kwargs["max_output_tokens"] == 12000
+    assert client.responses.kwargs["max_output_tokens"] == 9000
     assert client.responses.kwargs["reasoning"]["effort"] == "high"
 
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
@@ -1227,9 +1227,7 @@ app.get("/users/:id", async (req, res) => {
         "security_surface_inventory"
     ]["total"]
     assert "security_surfaces" in recon_manifest["repository_context_coverage"]
-    assert client.responses.requests[1]["max_output_tokens"] == load_json("runtime/agent.json")[
-        "model_output_token_limit_by_operation"
-    ]["repository_context"]
+    assert client.responses.requests[1]["max_output_tokens"] == 9000
     assert client.responses.requests[2]["text"]["format"]["name"] == "plaidnox_search_query_plan"
     assert client.responses.requests[3]["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
     discovery_payload = json.loads(client.responses.requests[3]["input"][1]["content"])
@@ -1843,6 +1841,22 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
         "reasoning_effort_by_operation_by_tier"
     ]["security_review"]["standard"]
     assert client.responses.kwargs["reasoning"]["effort"] == expected
+
+
+def test_structured_response_caps_bedrock_output_tokens_for_provider_limit(sample_repo):
+    from plaidnox_sast.assets import load_json
+
+    client = FakeClient(review_payload())
+    agent = PlaidNoxDeepHuntAgent(client, model="bedrock-nova-pro")
+
+    agent._structured_response(
+        "plaidnox_repository_context",
+        load_json("schemas/repository_context.json"),
+        "repository_context",
+        {"source_tree": ["app.py"]},
+    )
+
+    assert client.responses.kwargs["max_output_tokens"] == 9000
 
 
 def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_repo):

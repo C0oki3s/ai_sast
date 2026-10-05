@@ -273,6 +273,10 @@ class PlaidNoxDeepHuntAgent:
             for tier, name in model_runtime["agent_fallback_model_by_tier"].items()
         }
         configured_output_limit = int(model_runtime["agent_default_max_output_tokens"])
+        self.model_output_token_limit_by_model_prefix = {
+            str(prefix): int(limit)
+            for prefix, limit in model_runtime.get("agent_max_output_tokens_by_model_prefix", {}).items()
+        }
         self.max_output_tokens = (
             int(max_output_tokens) if max_output_tokens is not None else configured_output_limit
         )
@@ -2433,6 +2437,9 @@ class PlaidNoxDeepHuntAgent:
                 )
             )
         )
+        for model_prefix, output_limit in self.model_output_token_limit_by_model_prefix.items():
+            if model_execution.model_name.startswith(model_prefix):
+                effective_max_output_tokens = min(effective_max_output_tokens, output_limit)
         request_kwargs: dict[str, Any] = {
             "model": model_execution.model_name,
             "reasoning": {"effort": effort},

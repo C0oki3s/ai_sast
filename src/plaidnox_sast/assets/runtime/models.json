@@ -1,6 +1,9 @@
 {
   "agent_default_model": "bedrock-nova-2-lite",
   "agent_default_max_output_tokens": 10000,
+  "agent_max_output_tokens_by_model_prefix": {
+    "bedrock-": 9000
+  },
   "agent_fallback_model_by_tier": {
     "fast": "bedrock-nova-2-lite",
     "standard": "bedrock-nova-2-lite",
