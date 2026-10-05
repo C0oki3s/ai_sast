@@ -227,31 +227,37 @@ def _parse_response(
 
     candidates: list[L1Candidate] = []
     for item in raw_candidates:
-        if str(item["changed_path"]) != changed_file.path:
-            raise L1ReviewError("L1 candidate path was not the file under review")
-        start = int(item["changed_lines"]["start"])
-        end = int(item["changed_lines"]["end"])
-        if end < start or not _intersects_changed_lines(changed_file, start, end):
-            raise L1ReviewError("L1 candidate was not anchored to a changed line range")
-        candidates.append(
-            L1Candidate(
-                candidate_id=str(item["candidate_id"]),
-                changed_path=changed_file.path,
-                changed_symbol=str(item["changed_symbol"]),
-                changed_lines=ChangedLines(start, end),
-                behavior_before=str(item["behavior_before"]),
-                behavior_after=str(item["behavior_after"]),
-                security_role=str(item["security_role"]),
-                suspected_broken_invariant=str(item["suspected_broken_invariant"]),
-                provisional_attacker_capability=str(item["provisional_attacker_capability"]),
-                context_facts_used=tuple(str(value) for value in item["context_facts_used"]),
-                context_gaps=tuple(str(value) for value in item["context_gaps"]),
-                requested_expansion=tuple(
-                    ExpansionRequest(str(value["kind"]), str(value["target"]), str(value["reason"]))
-                    for value in item["requested_expansion"]
-                ),
+        try:
+            if str(item["changed_path"]) != changed_file.path:
+                raise L1ReviewError("L1 candidate path was not the file under review")
+            start = int(item["changed_lines"]["start"])
+            end = int(item["changed_lines"]["end"])
+            if end < start or not _intersects_changed_lines(changed_file, start, end):
+                raise L1ReviewError("L1 candidate was not anchored to a changed line range")
+            # LiteLLM providers can omit empty arrays despite the requested JSON schema.
+            # These are annotations; absence must not turn an otherwise valid candidate
+            # into a server error or fabricate security evidence.
+            candidates.append(
+                L1Candidate(
+                    candidate_id=str(item["candidate_id"]),
+                    changed_path=changed_file.path,
+                    changed_symbol=str(item["changed_symbol"]),
+                    changed_lines=ChangedLines(start, end),
+                    behavior_before=str(item["behavior_before"]),
+                    behavior_after=str(item["behavior_after"]),
+                    security_role=str(item["security_role"]),
+                    suspected_broken_invariant=str(item["suspected_broken_invariant"]),
+                    provisional_attacker_capability=str(item["provisional_attacker_capability"]),
+                    context_facts_used=tuple(str(value) for value in item.get("context_facts_used", [])),
+                    context_gaps=tuple(str(value) for value in item.get("context_gaps", [])),
+                    requested_expansion=tuple(
+                        ExpansionRequest(str(value["kind"]), str(value["target"]), str(value["reason"]))
+                        for value in item.get("requested_expansion", [])
+                    ),
+                )
             )
-        )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise L1ReviewError(f"L1 candidate did not match the schema for {changed_file.path}") from exc
     return candidates, coverage_complete, coverage_gaps
 
 

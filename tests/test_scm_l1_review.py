@@ -115,6 +115,23 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
 
 
+def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    payload = _payload()
+    candidate = payload["candidates"][0]
+    for field in ("context_facts_used", "context_gaps", "requested_expansion"):
+        candidate.pop(field)
+    diff = compute_diff(repo, base, head)
+
+    result = LiteLLMChangedFileReviewer(_Client(payload)).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.candidates[0].context_facts_used == ()
+    assert result.candidates[0].context_gaps == ()
+    assert result.candidates[0].requested_expansion == ()
+
+
 def test_l1_review_rejects_candidate_not_anchored_to_changed_lines(tmp_path: Path) -> None:
     repo, base, head = _repo(tmp_path)
     diff = compute_diff(repo, base, head)
