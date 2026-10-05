@@ -882,16 +882,8 @@ class PlaidNoxDeepHuntAgent:
             if incremental
             else full_security_ir
         )
-        manifest = {
-            "codebase": codebase,
-            "revision": revision,
-            "routes": [
-                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_routes
-            ],
-            "symbols": [
-                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_symbols
-            ],
-            "security_ir": [
+        prompt_ir = _bounded_prompt_security_ir(
+            [
                 {
                     "path": item.path,
                     "language": item.language,
@@ -913,6 +905,18 @@ class PlaidNoxDeepHuntAgent:
                 }
                 for item in sampled_files
             ],
+            runtime,
+        )
+        manifest = {
+            "codebase": codebase,
+            "revision": revision,
+            "routes": [
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_routes
+            ],
+            "symbols": [
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_symbols
+            ],
+            "security_ir": prompt_ir,
             "business_context": _redact(
                 business_context[: int(runtime["business_context_characters"])]
             ),
@@ -931,10 +935,11 @@ class PlaidNoxDeepHuntAgent:
                     "areas_with_omitted_context": truncated_symbol_areas,
                 },
                 "security_ir_files": {
-                    "included": len(sampled_files),
+                    "included": len(prompt_ir),
                     "total": len(graph.files),
-                    "truncated": len(sampled_files) < len(graph.files),
+                    "truncated": len(prompt_ir) < len(graph.files),
                     "areas_with_omitted_context": truncated_file_areas,
+                    "entries_per_file_limited": True,
                 },
                 "security_surfaces": {
                     key: value
@@ -948,7 +953,7 @@ class PlaidNoxDeepHuntAgent:
             manifest.pop("security_ir", None)
             manifest["changed_source_inventory"] = manifest_inventory
             manifest["analysis_scope_tree"] = manifest_tree
-            manifest["security_ir_slice"] = manifest_ir
+            manifest["security_ir_slice"] = _bounded_prompt_security_ir(manifest_ir, runtime)
             manifest["previous_repository_context"] = _compact_repository_context_value(
                 preparation.previous_repository_context or {},
                 "",
@@ -3943,6 +3948,44 @@ def _repository_security_ir(
         }
         for item in graph.files[: int(runtime["repository_ir_file_limit"])]
     ]
+
+
+def _bounded_prompt_security_ir(
+    items: list[dict[str, Any]], runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Keep structural navigation broad while bounding the model request payload."""
+    file_limit = int(runtime["repository_prompt_ir_file_limit"])
+    entry_limit = int(runtime["repository_prompt_ir_entries_per_list"])
+    character_limit = int(runtime["repository_prompt_ir_characters"])
+    if min(file_limit, entry_limit, character_limit) < 1:
+        raise ValueError("repository prompt IR limits must be positive")
+
+    sampled, _ = _balanced_area_sample(items, file_limit, lambda item: str(item["path"]))
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for item in sampled:
+        compact: dict[str, Any] = {
+            "path": str(item["path"])[:512],
+            "language": str(item.get("language", ""))[:80],
+        }
+        for field in ("symbols", "imports", "calls", "references"):
+            values = item.get(field, [])
+            if not isinstance(values, list):
+                continue
+            compact[field] = [
+                {str(key): str(value)[:200] if isinstance(value, str) else value
+                 for key, value in entry.items()}
+                if isinstance(entry, dict) else str(entry)[:200]
+                for entry in values[:entry_limit]
+            ]
+            if len(values) > entry_limit:
+                compact[f"omitted_{field}"] = len(values) - entry_limit
+        size = len(json.dumps(compact, ensure_ascii=False))
+        if used + size > character_limit:
+            continue
+        selected.append(compact)
+        used += size
+    return selected
 
 
 def _analysis_scope_paths(

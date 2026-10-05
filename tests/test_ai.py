@@ -13,6 +13,7 @@ from plaidnox_sast.ai import (
     HuntPlan,
     HuntTask,
     PlaidNoxDeepHuntAgent,
+    _bounded_prompt_security_ir,
     _execute_recon_search_plan,
     _ground_repository_annotations,
     _resolve_context_request,
@@ -29,6 +30,24 @@ from plaidnox_sast.models import (
     ModelTier,
     Severity,
 )
+
+
+def test_prompt_security_ir_is_bounded_and_balanced_across_areas():
+    items = [
+        {"path": path, "language": "python", "symbols": [{"name": "x" * 1000}] * 40}
+        for path in ("api/a.py", "api/b.py", "web/a.py")
+    ]
+    runtime = {
+        "repository_prompt_ir_file_limit": 2,
+        "repository_prompt_ir_entries_per_list": 2,
+        "repository_prompt_ir_characters": 1500,
+    }
+
+    selected = _bounded_prompt_security_ir(items, runtime)
+
+    assert [item["path"] for item in selected] == ["api/a.py", "web/a.py"]
+    assert all(item["omitted_symbols"] == 38 for item in selected)
+    assert len(json.dumps(selected)) <= 1500
 
 
 def review_payload(**overrides):
