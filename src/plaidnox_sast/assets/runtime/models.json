@@ -6,7 +6,9 @@
     "standard": "bedrock-nova-2-lite",
     "deep": "bedrock-nova-pro"
   },
-  "agent_model_override_by_operation": {},
+  "agent_model_override_by_operation": {
+    "repository_context": "bedrock-nova-pro"
+  },
   "agent_models": [
     {
       "name": "bedrock-nova-2-lite",
