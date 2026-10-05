@@ -9,7 +9,7 @@
   "maximum_application_context_characters": 24000,
   "review_attempt_lease_seconds": 180,
   "review_attempt_heartbeat_seconds": 45,
-  "review_attempt_max_attempts": 3,
+  "review_attempt_max_attempts": 4,
   "mirror_sync_retry_attempts": 5,
   "mirror_sync_retry_interval_seconds": 2.0,
   "context_broker": {
