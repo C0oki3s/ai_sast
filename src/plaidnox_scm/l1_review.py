@@ -120,25 +120,32 @@ class LiteLLMChangedFileReviewer:
                     int(runtime["maximum_application_context_characters"]),
                 )
                 system_prompt, user_prompt = render_operation("changed_file_review", redact_payload(payload))
-                response = self._client.responses.create(
-                    model=model,
-                    reasoning={"effort": str(runtime["l1_reasoning_effort"])},
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    text={
-                        "verbosity": "medium",
-                        "format": {
-                            "type": "json_schema",
-                            "name": "plaidnox_scm_changed_file_review",
-                            "strict": True,
-                            "schema": schema,
-                        },
-                    },
-                    max_output_tokens=int(runtime["l1_max_output_tokens"]),
-                )
                 model_calls += 1
+                try:
+                    response = self._client.responses.create(
+                        model=model,
+                        reasoning={"effort": str(runtime["l1_reasoning_effort"])},
+                        input=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        text={
+                            "verbosity": "medium",
+                            "format": {
+                                "type": "json_schema",
+                                "name": "plaidnox_scm_changed_file_review",
+                                "strict": True,
+                                "schema": schema,
+                            },
+                        },
+                        max_output_tokens=int(runtime["l1_max_output_tokens"]),
+                    )
+                except Exception:
+                    # A provider or gateway error means this file was not reviewed.
+                    # Keep the PR check incomplete instead of returning HTTP 500.
+                    coverage_complete = False
+                    coverage_gaps.append(f"Model request failed for {changed_file.path}")
+                    continue
                 if getattr(response, "status", "completed") != "completed":
                     coverage_complete = False
                     coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")

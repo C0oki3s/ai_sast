@@ -157,6 +157,22 @@ def test_l1_review_marks_missing_coverage_status_as_incomplete(tmp_path: Path) -
     assert "omitted coverage status" in result.coverage_gaps[0]
 
 
+def test_l1_review_marks_provider_failure_as_incomplete(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+
+    def fail(**_kwargs):
+        raise RuntimeError("gateway unavailable")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=fail))
+    result = LiteLLMChangedFileReviewer(client).review(repo, diff, classify(diff), _context(base))
+
+    assert result.model_calls == 1
+    assert result.candidates == ()
+    assert result.coverage_complete is False
+    assert result.coverage_gaps == ("Model request failed for middleware.js",)
+
+
 def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(
     tmp_path: Path,
 ) -> None:

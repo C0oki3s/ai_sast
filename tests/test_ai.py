@@ -679,6 +679,7 @@ def test_security_review_retries_max_output_truncation_once_with_larger_budget(s
 
     client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
     agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
 
     result = agent.review(sample_repo, deep_candidate(), finding())
 
@@ -708,6 +709,7 @@ def test_repository_context_retries_when_gateway_omits_truncation_reason():
 
     client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
     agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
     schema = {
         "type": "object",
         "properties": {"ok": {"type": "boolean"}},
@@ -720,6 +722,7 @@ def test_repository_context_retries_when_gateway_omits_truncation_reason():
         schema,
         "repository_context",
         {},
+        max_output_tokens=9000,
         model_tier=ModelTier.DEEP,
     )
 
@@ -743,6 +746,7 @@ def test_security_review_retries_unknown_incomplete_reason_once():
 
     client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
     agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
     schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
 
     result = agent._structured_response(
@@ -750,7 +754,31 @@ def test_security_review_retries_unknown_incomplete_reason_once():
     )
 
     assert json.loads(result.output_text) == {"ok": True}
-    assert [request["max_output_tokens"] for request in requests] == [9000, 14000]
+    assert [request["max_output_tokens"] for request in requests] == [12000, 14000]
+
+
+def test_bedrock_incomplete_retry_never_exceeds_model_output_limit():
+    requests = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return type("IncompleteResponse", (), {
+            "status": "incomplete",
+            "incomplete_details": type("Details", (), {"reason": "max_output_tokens"})(),
+            "output_text": "",
+            "usage": {},
+        })()
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+    with pytest.raises(AIResponseError, match="incomplete"):
+        agent._structured_response(
+            "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
+        )
+
+    assert [request["max_output_tokens"] for request in requests] == [9000]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):

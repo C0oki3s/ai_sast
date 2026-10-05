@@ -2545,6 +2545,9 @@ class PlaidNoxDeepHuntAgent:
                 invocation["state"] = "incomplete"
                 invocation["error_type"] = f"incomplete:{reason}"
                 retry_limit = int(retry_limits.get(model_execution.model_tier.value, 0))
+                for model_prefix, output_limit in self.model_output_token_limit_by_model_prefix.items():
+                    if model_execution.model_name.startswith(model_prefix):
+                        retry_limit = min(retry_limit, output_limit)
                 if (
                     reason in {"max_output_tokens", "unknown"}
                     and output_retry_count < max_output_retries
