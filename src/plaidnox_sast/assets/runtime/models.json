@@ -1,13 +1,27 @@
 {
-  "agent_default_model": "gpt-5.4-mini",
+  "agent_default_model": "bedrock-nova-2-lite",
   "agent_default_max_output_tokens": 10000,
   "agent_fallback_model_by_tier": {
-    "fast": "gpt-5.4-mini",
-    "standard": "gpt-5.4-mini",
-    "deep": "gpt-5.4"
+    "fast": "bedrock-nova-2-lite",
+    "standard": "bedrock-nova-2-lite",
+    "deep": "bedrock-nova-pro"
   },
   "agent_model_override_by_operation": {},
   "agent_models": [
+    {
+      "name": "bedrock-nova-2-lite",
+      "tier": "fast",
+      "latency": "low",
+      "cost": "low",
+      "guidance": "AWS Bedrock model for bounded code analysis and planning."
+    },
+    {
+      "name": "bedrock-nova-pro",
+      "tier": "deep",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "AWS Bedrock model for deep code security reasoning."
+    },
     {
       "name": "claude-haiku-4.5",
       "tier": "fast",
@@ -107,13 +121,13 @@
       "guidance": "OpenAI model for deep code-security reasoning and adversarial verification."
     }
   ],
-  "saist_detection_model": "glm-5.3-flash",
-  "saist_validation_model": "kimi-k2.7-code",
+  "saist_detection_model": "bedrock-nova-2-lite",
+  "saist_validation_model": "bedrock-nova-pro",
   "saist_request_timeout_seconds": 60,
   "saist_process_timeout_seconds": 900,
   "agent_model_by_tier": {
-    "fast": "gpt-5.4-mini",
-    "standard": "gpt-5.4-mini",
-    "deep": "gpt-5.4"
+    "fast": "bedrock-nova-2-lite",
+    "standard": "bedrock-nova-2-lite",
+    "deep": "bedrock-nova-pro"
   }
 }
