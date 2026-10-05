@@ -16,6 +16,7 @@ from plaidnox_sast.ai import (
     _bounded_prompt_security_ir,
     _execute_recon_search_plan,
     _ground_repository_annotations,
+    _mapping_items,
     _resolve_context_request,
     _security_workset_review_units,
     _search_segments,
@@ -48,6 +49,11 @@ def test_prompt_security_ir_is_bounded_and_balanced_across_areas():
     assert [item["path"] for item in selected] == ["api/a.py", "web/a.py"]
     assert all(item["omitted_symbols"] == 38 for item in selected)
     assert len(json.dumps(selected)) <= 1500
+
+
+def test_mapping_items_ignores_malformed_scalar_annotations():
+    assert _mapping_items([{"name": "valid"}, "x", 3, None]) == [{"name": "valid"}]
+    assert _mapping_items("not-a-list") == []
 
 
 def review_payload(**overrides):
@@ -667,6 +673,47 @@ def test_security_review_retries_max_output_truncation_once_with_larger_budget(s
 
     assert result.supported is True
     assert [request["max_output_tokens"] for request in requests] == [8000, 10000]
+
+
+def test_repository_context_retries_when_gateway_omits_truncation_reason():
+    requests = []
+    responses = [
+        type(
+            "IncompleteResponse",
+            (),
+            {
+                "status": "incomplete",
+                "incomplete_details": None,
+                "output_text": "",
+                "usage": {"output_tokens": 9000},
+            },
+        )(),
+        FakeResponse({"ok": True}),
+    ]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    result = agent._structured_response(
+        "repository_context_fixture",
+        schema,
+        "repository_context",
+        {},
+        model_tier=ModelTier.DEEP,
+    )
+
+    assert json.loads(result.output_text) == {"ok": True}
+    assert [request["max_output_tokens"] for request in requests] == [9000, 9500]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):

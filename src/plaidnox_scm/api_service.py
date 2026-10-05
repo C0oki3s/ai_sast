@@ -144,6 +144,15 @@ class ReviewService:
         if attempt.state == "completed":
             return _replay_response(attempt)
 
+        _record_review_activity(
+            self.session_factory,
+            tenant_id=tenant_id,
+            request=request,
+            review_id=review_id,
+            event_type="review_started",
+            idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:started",
+        )
+
         heartbeat = _LeaseHeartbeat(
             self.session_factory,
             tenant_id,
@@ -185,6 +194,14 @@ class ReviewService:
                         error_type=type(exc).__name__,
                         error_message=redact(str(exc)),
                     )
+                _record_review_activity(
+                    self.session_factory,
+                    tenant_id=tenant_id,
+                    request=request,
+                    review_id=review_id,
+                    event_type="review_failed",
+                    idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:failed",
+                )
                 raise
         finally:
             heartbeat.stop()
@@ -203,6 +220,15 @@ class ReviewService:
             )
         if completed:
             self._record_fix_validations(tenant_id, review_id, result)
+            event_type = "review_incomplete" if response.action is PolicyAction.INCOMPLETE else "review_completed"
+            _record_review_activity(
+                self.session_factory,
+                tenant_id=tenant_id,
+                request=request,
+                review_id=review_id,
+                event_type=event_type,
+                idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:{event_type}",
+            )
         if not completed:
             raise attempts.ReviewAttemptConflictError(
                 f"review {review_id} lease was lost before completion"
@@ -714,6 +740,9 @@ def _activity_record(
         "pr_closed": "Pull request closed",
         "pr_merged": "Pull request merged",
         "review_queued": "Security review queued",
+        "review_started": "Security review started",
+        "review_completed": "Security review completed",
+        "review_incomplete": "Security review incomplete",
         "review_superseded": "Security review superseded",
         "review_failed": "Security review failed",
     }
@@ -735,6 +764,31 @@ def _activity_record(
         metadata_json={},
         idempotency_key=idempotency_key[:255],
     )
+
+
+def _record_review_activity(
+    factory: sessionmaker[Session],
+    *,
+    tenant_id: str,
+    request: ReviewRequest,
+    review_id: str,
+    event_type: str,
+    idempotency_key: str,
+) -> None:
+    with factory.begin() as session:
+        session.merge(
+            _activity_record(
+                tenant_id=tenant_id,
+                provider=request.provider,
+                repository_id=request.repository_id,
+                installation_id=request.installation_id,
+                pull_number=request.review_number,
+                review_id=review_id,
+                head_sha=request.head_sha,
+                event_type=event_type,
+                idempotency_key=idempotency_key,
+            )
+        )
 
 
 def _optional_verification_text(verification: object, attribute: str) -> str | None:

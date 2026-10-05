@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -16,7 +16,7 @@ from plaidnox_scm.api_models import ReviewRequest
 from plaidnox_scm.api_service import ReviewService, _review_id
 from plaidnox_scm.attempts import unit_of_work as attempts_unit_of_work
 from plaidnox_scm.evidence import EvidenceRole
-from plaidnox_scm.models import Base, InstallationTenantRecord
+from plaidnox_scm.models import ActivityEventRecord, Base, InstallationTenantRecord
 from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource, SourceBrokerError
 
 
@@ -115,7 +115,8 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
         dependency_calls += 1
         raise AssertionError("docs-only review must not construct AI dependencies")
 
-    service = ReviewService(RepositoryMirrorBroker(tmp_path / "mirrors"), _factory(), dependencies)
+    factory = _factory()
+    service = ReviewService(RepositoryMirrorBroker(tmp_path / "mirrors"), factory, dependencies)
     client = TestClient(create_app(service, api_token="scanner-token"))
 
     unauthorized = client.post("/v1/reviews", json=_request(base, head))
@@ -138,6 +139,9 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
     }
     assert response.json()["review_id"].startswith("review_")
     assert dependency_calls == 0
+    with factory() as session:
+        event_types = set(session.scalars(select(ActivityEventRecord.event_type)))
+    assert {"review_started", "review_completed"}.issubset(event_types)
 
 
 def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_path: Path) -> None:
