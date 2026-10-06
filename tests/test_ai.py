@@ -638,7 +638,7 @@ def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
     assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
     assert client.responses.kwargs["model"] != "test-model"
-    assert client.responses.kwargs["max_output_tokens"] == 20000
+    assert client.responses.kwargs["max_output_tokens"] == 30000
     assert client.responses.kwargs["reasoning"]["effort"] == "high"
 
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
@@ -753,7 +753,7 @@ def test_security_review_retries_unknown_incomplete_reason_once():
     )
 
     assert json.loads(result.output_text) == {"ok": True}
-    assert [request["max_output_tokens"] for request in requests] == [20000, 30000]
+    assert [request["max_output_tokens"] for request in requests] == [30000, 50000]
 
 
 def test_gpt_deep_review_uses_its_configured_output_retry_budget():
@@ -777,7 +777,7 @@ def test_gpt_deep_review_uses_its_configured_output_retry_budget():
             "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
         )
 
-    assert [request["max_output_tokens"] for request in requests] == [20000, 30000]
+    assert [request["max_output_tokens"] for request in requests] == [30000, 50000]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
