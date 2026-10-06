@@ -108,7 +108,7 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert result.candidates[0].suspected_broken_invariant.startswith("Only authentic")
     assert result.candidates[0].requested_expansion[0].kind == "route"
     request = client.responses.calls[0]
-    assert request["model"] == "gpt-4o"
+    assert request["model"] == "glm-5.3-flash"
     assert request["text"]["format"]["type"] == "json_schema"
     assert "reasoning" not in request
     assert "verbosity" not in request["text"]
