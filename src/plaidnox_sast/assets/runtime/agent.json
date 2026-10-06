@@ -157,7 +157,7 @@
   "model_output_token_limit_by_operation_by_tier": {
     "security_review": {
       "standard": 8000,
-      "deep": 12000
+      "deep": 30000
     },
     "capability_chain": {
       "standard": 10000,
@@ -176,7 +176,7 @@
       "max_retries": 1,
       "retry_output_tokens_by_tier": {
         "standard": 10000,
-        "deep": 14000
+        "deep": 50000
       }
     },
     "capability_chain": {
