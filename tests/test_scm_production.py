@@ -18,4 +18,4 @@ def test_scm_production_routes_models_to_gpt(monkeypatch):
     assert router.fallback_by_tier[ModelTier.FAST] == "gpt-5.4-mini"
     assert router.fallback_by_tier[ModelTier.DEEP] == "gpt-5.4"
     assert router.model_override_by_operation["repository_context"] == "gpt-5.4"
-    assert dependencies.l1_reviewer._model == "gpt-5.4"
+    assert dependencies.l1_reviewer._model == "gpt-5.4-mini"

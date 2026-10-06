@@ -109,6 +109,8 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert result.candidates[0].requested_expansion[0].kind == "route"
     request = client.responses.calls[0]
     assert request["text"]["format"]["type"] == "json_schema"
+    assert request["reasoning"] == {"effort": "medium"}
+    assert request["max_output_tokens"] == 12000
     candidate_fields = {item.name for item in fields(result.candidates[0])}
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
 
