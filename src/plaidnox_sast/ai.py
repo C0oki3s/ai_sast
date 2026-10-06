@@ -2493,6 +2493,7 @@ class PlaidNoxDeepHuntAgent:
         max_output_retries = int(truncation_policy.get("max_retries", 0))
         retry_limits = truncation_policy.get("retry_output_tokens_by_tier", {})
         output_retry_count = 0
+        shape_retry_count = 0
         total_attempts = int(shape_retries) + max_output_retries + 1
         best: Any = None
         for attempt in range(total_attempts):
@@ -2601,6 +2602,10 @@ class PlaidNoxDeepHuntAgent:
                 attempt=attempt + 1,
                 decodable=payload is not None,
             )
+            if shape_retry_count < shape_retries:
+                shape_retry_count += 1
+                continue
+            break
         # Out of retries: hand callers the closest reshaped answer (or the raw
         # one when nothing decoded) so their own schema check raises the
         # stage-specific AIResponseError.

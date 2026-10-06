@@ -94,7 +94,7 @@
     }
   },
   "model_output_token_limit_by_operation": {
-    "repository_context": 18000,
+    "repository_context": 30000,
     "hunt_plan": 16000,
     "finding_consolidation": 12000,
     "finding_group_narratives": 12000,
@@ -168,7 +168,8 @@
     "repository_context": {
       "max_retries": 1,
       "retry_output_tokens_by_tier": {
-        "deep": 9500
+        "standard": 40000,
+        "deep": 48000
       }
     },
     "security_review": {

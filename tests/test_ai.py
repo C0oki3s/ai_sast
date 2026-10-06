@@ -638,7 +638,7 @@ def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
     assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
     assert client.responses.kwargs["model"] != "test-model"
-    assert client.responses.kwargs["max_output_tokens"] == 9000
+    assert client.responses.kwargs["max_output_tokens"] == 12000
     assert client.responses.kwargs["reasoning"]["effort"] == "high"
 
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
@@ -697,7 +697,7 @@ def test_repository_context_retries_when_gateway_omits_truncation_reason():
                 "status": "incomplete",
                 "incomplete_details": None,
                 "output_text": "",
-                "usage": {"output_tokens": 9000},
+                "usage": {"output_tokens": 30000},
             },
         )(),
         FakeResponse({"ok": True}),
@@ -722,12 +722,11 @@ def test_repository_context_retries_when_gateway_omits_truncation_reason():
         schema,
         "repository_context",
         {},
-        max_output_tokens=9000,
         model_tier=ModelTier.DEEP,
     )
 
     assert json.loads(result.output_text) == {"ok": True}
-    assert [request["max_output_tokens"] for request in requests] == [9000, 9500]
+    assert [request["max_output_tokens"] for request in requests] == [30000, 48000]
 
 
 def test_security_review_retries_unknown_incomplete_reason_once():
@@ -757,7 +756,7 @@ def test_security_review_retries_unknown_incomplete_reason_once():
     assert [request["max_output_tokens"] for request in requests] == [12000, 14000]
 
 
-def test_bedrock_incomplete_retry_never_exceeds_model_output_limit():
+def test_gpt_deep_review_uses_its_configured_output_retry_budget():
     requests = []
 
     def create(**kwargs):
@@ -778,7 +777,7 @@ def test_bedrock_incomplete_retry_never_exceeds_model_output_limit():
             "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
         )
 
-    assert [request["max_output_tokens"] for request in requests] == [9000]
+    assert [request["max_output_tokens"] for request in requests] == [12000, 14000]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
@@ -1339,7 +1338,7 @@ app.get("/users/:id", async (req, res) => {
         "security_surface_inventory"
     ]["total"]
     assert "security_surfaces" in recon_manifest["repository_context_coverage"]
-    assert client.responses.requests[1]["max_output_tokens"] == 9000
+    assert client.responses.requests[1]["max_output_tokens"] == 30000
     assert client.responses.requests[2]["text"]["format"]["name"] == "plaidnox_search_query_plan"
     assert client.responses.requests[3]["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
     discovery_payload = json.loads(client.responses.requests[3]["input"][1]["content"])
@@ -1955,7 +1954,7 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
     assert client.responses.kwargs["reasoning"]["effort"] == expected
 
 
-def test_structured_response_caps_bedrock_output_tokens_for_provider_limit(sample_repo):
+def test_repository_context_uses_the_configured_gpt_budget(sample_repo):
     from plaidnox_sast.assets import load_json
 
     client = FakeClient(review_payload())
@@ -1968,7 +1967,8 @@ def test_structured_response_caps_bedrock_output_tokens_for_provider_limit(sampl
         {"source_tree": ["app.py"]},
     )
 
-    assert client.responses.kwargs["max_output_tokens"] == 9000
+    assert client.responses.kwargs["model"] == "gpt-5.4-mini"
+    assert client.responses.kwargs["max_output_tokens"] == 30000
 
 
 def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_repo):

@@ -13,6 +13,8 @@ from typing import Literal
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from plaidnox_sast.ai import AIResponseError
+
 from .application_context import ApplicationContextBuilder
 from .assets import load_json
 from .baseline import FindingBaselineClassification, classify_against_baseline
@@ -184,17 +186,60 @@ def review_pull_request(
 
     assert context_builder is not None and l1_reviewer is not None and candidate_verifier is not None
     runtime = load_json("runtime/review.json")
-    with unit_of_work(session_factory, tenant_id) as repository:
-        application_context = repository.get_or_compute(
+    try:
+        with unit_of_work(session_factory, tenant_id) as repository:
+            application_context = repository.get_or_compute(
+                codebase_id,
+                base_revision,
+                lambda: context_builder.build(repo_path, base_revision, codebase_id, tenant_id),
+                builder_version=str(runtime["context_builder_version"]),
+                context_version=str(runtime["context_version"]),
+            )
+            baseline_findings: tuple[BaselineFinding, ...] = repository.list_baseline_findings(
+                codebase_id,
+                base_revision,
+            )
+    except AIResponseError as exc:
+        with unit_of_work(session_factory, tenant_id) as repository:
+            baseline_findings = repository.list_baseline_findings(codebase_id, base_revision)
+        gap = f"Application context generation failed after bounded retries: {type(exc).__name__}."
+        baseline_classifications = classify_against_baseline(
             codebase_id,
-            base_revision,
-            lambda: context_builder.build(repo_path, base_revision, codebase_id, tenant_id),
-            builder_version=str(runtime["context_builder_version"]),
-            context_version=str(runtime["context_version"]),
+            diff,
+            (),
+            (),
+            baseline_findings,
+            (),
+            coverage_complete=False,
         )
-        baseline_findings: tuple[BaselineFinding, ...] = repository.list_baseline_findings(
-            codebase_id,
-            base_revision,
+        policy = evaluate_merge_policy(
+            baseline_classifications,
+            coverage_complete=False,
+            triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
+        )
+        return ReviewResult(
+            outcome="review_incomplete",
+            relevance=relevance,
+            diff=diff,
+            candidate_count=0,
+            ai_review_invoked=True,
+            application_context=None,
+            candidates=(),
+            verifications=(),
+            counters=replace(
+                _counters(
+                    L1ReviewBatch((), (), False, (gap,), 1),
+                    (),
+                    baseline_classifications,
+                    policy,
+                ),
+                unresolved=1,
+            ),
+            coverage_complete=False,
+            coverage_gaps=(gap,),
+            baseline_classifications=baseline_classifications,
+            policy=policy,
+            detail=gap,
         )
     if baseline_findings:
         application_context = replace(

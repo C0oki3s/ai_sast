@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_sast.redaction import redact
+from plaidnox_sast.llm import tenant_cache_namespace
 
 from . import attempts, context_store, triage
 from .api_models import (
@@ -164,7 +165,10 @@ class ReviewService:
         heartbeat.start()
         try:
             try:
-                with self.source_broker.materialize(request) as source:
+                with (
+                    tenant_cache_namespace(tenant_id),
+                    self.source_broker.materialize(request) as source,
+                ):
                     result = review_pull_request(
                         source.repo_path,
                         source.base_revision,
@@ -207,6 +211,19 @@ class ReviewService:
             heartbeat.stop()
 
         response = _response(request, result, tenant_id)
+        application_context = getattr(result, "application_context", None)
+        if application_context is not None:
+            _record_review_activity(
+                self.session_factory,
+                tenant_id=tenant_id,
+                request=request,
+                review_id=review_id,
+                event_type="context_indexed",
+                idempotency_key=(
+                    f"context:{codebase_id}:{application_context.baseline_revision}:"
+                    f"{application_context.source_tree_hash}"
+                ),
+            )
         with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
             completed = repository.complete(
                 review_id,
@@ -745,6 +762,7 @@ def _activity_record(
         "review_incomplete": "Security review incomplete",
         "review_superseded": "Security review superseded",
         "review_failed": "Security review failed",
+        "context_indexed": "Application context indexed",
     }
     summary = labels[event_type]
     if pull_number is not None:
