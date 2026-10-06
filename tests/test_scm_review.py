@@ -8,6 +8,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from plaidnox_sast.ai import AIResponseError
 from plaidnox_sast.models import Depth, ModelTier, RouteDecision
 from plaidnox_scm import triage
 from plaidnox_scm.cli import main as scm_main
@@ -69,6 +70,11 @@ class _ContextBuilder:
     def build(self, repo_path, baseline_revision, codebase_id, tenant_id):
         self.calls += 1
         return _context(codebase_id, tenant_id, baseline_revision)
+
+
+class _TruncatedContextBuilder:
+    def build(self, repo_path, baseline_revision, codebase_id, tenant_id):
+        raise AIResponseError("AI request was incomplete: max_output_tokens")
 
 
 class _L1Reviewer:
@@ -341,6 +347,40 @@ def test_zero_verified_is_incomplete_when_l1_coverage_is_unresolved(tmp_path: Pa
     assert result.counters.verified == 0
     assert result.coverage_complete is False
     assert result.coverage_gaps
+
+
+def test_context_output_truncation_is_persistable_incomplete_review(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "app.py").write_text("def run():\n    return 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "app.py").write_text("def run():\n    return request.value\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    result = review_pull_request(
+        repo,
+        base,
+        head,
+        "codebase-1",
+        "tenant-a",
+        _factory(),
+        context_builder=_TruncatedContextBuilder(),
+        l1_reviewer=_IncompleteReviewer(),
+        candidate_verifier=_VerifierMustNotRun(),
+    )
+
+    assert result.outcome == "review_incomplete"
+    assert result.policy.decision == "INCOMPLETE"
+    assert result.ai_review_invoked is True
+    assert result.application_context is None
+    assert result.counters.unresolved == 1
+    assert result.coverage_gaps == (
+        "Application context generation failed after bounded retries: AIResponseError.",
+    )
 
 
 def test_cli_reports_configuration_required_without_litellm_instead_of_crashing(

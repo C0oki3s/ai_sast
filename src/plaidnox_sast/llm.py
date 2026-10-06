@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +17,20 @@ from .assets import load_json
 
 class LiteLLMConfigurationError(RuntimeError):
     """Raised when neither a LiteLLM gateway nor an allowed provider key is configured."""
+
+
+_cache_namespace: ContextVar[str | None] = ContextVar("plaidnox_litellm_cache_namespace", default=None)
+
+
+@contextmanager
+def tenant_cache_namespace(tenant_id: str) -> Iterator[None]:
+    """Scope LiteLLM response-cache entries to one tenant without exposing its ID."""
+    digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:32]
+    token = _cache_namespace.set(f"tenant:{digest}")
+    try:
+        yield
+    finally:
+        _cache_namespace.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +109,13 @@ class _LiteLLMResponses:
 
     def create(self, **kwargs: Any) -> LiteLLMResponse:
         request = {**kwargs, "api_key": self.settings.api_key}
+        namespace = _cache_namespace.get()
+        if namespace:
+            metadata = request.get("metadata")
+            request["metadata"] = {
+                **(metadata if isinstance(metadata, dict) else {}),
+                "redis_namespace": namespace,
+            }
         # Callers may apply a tighter operation-specific policy. The client
         # settings remain the transport fallback rather than silently
         # overwriting that policy with the global timeout/retry budget.
