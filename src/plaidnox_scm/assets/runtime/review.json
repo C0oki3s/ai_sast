@@ -3,10 +3,10 @@
   "context_version": "2",
   "context_builder_version": "sast-repository-context-v2-gpt",
   "models": {
-    "fast": "gpt-5.4-mini",
-    "standard": "gpt-5.4-mini",
-    "deep": "gpt-5.4",
-    "repository_context": "gpt-5.4"
+    "fast": "gpt-4o",
+    "standard": "gpt-4o",
+    "deep": "gpt-4o",
+    "repository_context": "gpt-4o"
   },
   "l1_model_tier": "standard",
   "l1_reasoning_effort": "medium",

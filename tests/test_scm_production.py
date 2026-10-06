@@ -12,10 +12,10 @@ def test_scm_production_routes_models_to_gpt(monkeypatch):
     agent = dependencies.context_builder._agent
     router = agent.model_execution_router
 
-    assert agent.model == "gpt-5.4-mini"
+    assert agent.model == "gpt-4o"
     assert agent.strict_output_schema is False
-    assert agent.model_by_tier["deep"] == "gpt-5.4"
-    assert router.fallback_by_tier[ModelTier.FAST] == "gpt-5.4-mini"
-    assert router.fallback_by_tier[ModelTier.DEEP] == "gpt-5.4"
-    assert router.model_override_by_operation["repository_context"] == "gpt-5.4"
-    assert dependencies.l1_reviewer._model == "gpt-5.4-mini"
+    assert agent.model_by_tier["deep"] == "gpt-4o"
+    assert router.fallback_by_tier[ModelTier.FAST] == "gpt-4o"
+    assert router.fallback_by_tier[ModelTier.DEEP] == "gpt-4o"
+    assert router.model_override_by_operation["repository_context"] == "gpt-4o"
+    assert dependencies.l1_reviewer._model == "gpt-4o"

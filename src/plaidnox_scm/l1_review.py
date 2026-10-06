@@ -7,9 +7,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from plaidnox_sast.assets import load_json as load_sast_json
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
 from plaidnox_sast.llm import response_json
+from plaidnox_sast.model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from plaidnox_sast.redaction import redact_payload
 
 from .assets import load_json
@@ -95,7 +95,7 @@ class LiteLLMChangedFileReviewer:
         runtime = load_json("runtime/review.json")
         schema = load_json("schemas/changed_file_review.json")
         model_tier = str(runtime["l1_model_tier"])
-        model = self._model or str(load_sast_json("runtime/models.json")["agent_model_by_tier"][model_tier])
+        model = self._model or str(runtime["models"][model_tier])
         candidates: list[L1Candidate] = []
         reviewed_paths: list[str] = []
         coverage_gaps: list[str] = []
@@ -122,31 +122,37 @@ class LiteLLMChangedFileReviewer:
                 )
                 system_prompt, user_prompt = render_operation("changed_file_review", redact_payload(payload))
                 model_calls += 1
+                text_config: dict[str, Any] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "plaidnox_scm_changed_file_review",
+                        "strict": not model.startswith("gpt-"),
+                        "schema": schema,
+                    }
+                }
+                if supports_text_verbosity(model):
+                    text_config["verbosity"] = "medium"
+                request: dict[str, Any] = {
+                    "model": model,
+                    "input": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "text": text_config,
+                    "max_output_tokens": int(runtime["l1_max_output_tokens"]),
+                    "prompt_cache_key": "plaidnox-scm:changed_file_review",
+                }
+                if supports_reasoning_effort(model):
+                    request["reasoning"] = {"effort": str(runtime["l1_reasoning_effort"])}
                 try:
-                    response = self._client.responses.create(
-                        model=model,
-                        reasoning={"effort": str(runtime["l1_reasoning_effort"])},
-                        input=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        text={
-                            "verbosity": "medium",
-                            "format": {
-                                "type": "json_schema",
-                                "name": "plaidnox_scm_changed_file_review",
-                            "strict": not model.startswith("gpt-"),
-                                "schema": schema,
-                            },
-                        },
-                        max_output_tokens=int(runtime["l1_max_output_tokens"]),
-                        prompt_cache_key="plaidnox-scm:changed_file_review",
-                    )
-                except Exception:
+                    response = self._client.responses.create(**request)
+                except Exception as exc:
                     # A provider or gateway error means this file was not reviewed.
                     # Keep the PR check incomplete instead of returning HTTP 500.
                     coverage_complete = False
-                    coverage_gaps.append(f"Model request failed for {changed_file.path}")
+                    coverage_gaps.append(
+                        f"Model request failed for {changed_file.path} ({type(exc).__name__})"
+                    )
                     continue
                 if getattr(response, "status", "completed") != "completed":
                     coverage_complete = False

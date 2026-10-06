@@ -108,8 +108,10 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert result.candidates[0].suspected_broken_invariant.startswith("Only authentic")
     assert result.candidates[0].requested_expansion[0].kind == "route"
     request = client.responses.calls[0]
+    assert request["model"] == "gpt-4o"
     assert request["text"]["format"]["type"] == "json_schema"
-    assert request["reasoning"] == {"effort": "medium"}
+    assert "reasoning" not in request
+    assert "verbosity" not in request["text"]
     assert request["max_output_tokens"] == 12000
     candidate_fields = {item.name for item in fields(result.candidates[0])}
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
@@ -127,6 +129,8 @@ def test_l1_review_uses_explicit_scm_model_and_cache_key(tmp_path: Path) -> None
     assert client.responses.calls[0]["model"] == "gpt-5.4"
     assert client.responses.calls[0]["prompt_cache_key"] == "plaidnox-scm:changed_file_review"
     assert client.responses.calls[0]["text"]["format"]["strict"] is False
+    assert client.responses.calls[0]["reasoning"] == {"effort": "medium"}
+    assert client.responses.calls[0]["text"]["verbosity"] == "medium"
 
 
 def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -> None:
@@ -186,7 +190,7 @@ def test_l1_review_marks_provider_failure_as_incomplete(tmp_path: Path) -> None:
     assert result.model_calls == 1
     assert result.candidates == ()
     assert result.coverage_complete is False
-    assert result.coverage_gaps == ("Model request failed for middleware.js",)
+    assert result.coverage_gaps == ("Model request failed for middleware.js (RuntimeError)",)
 
 
 def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(

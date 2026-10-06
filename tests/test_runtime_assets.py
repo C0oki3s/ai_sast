@@ -20,7 +20,7 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     assert all(item["cost"] != "high" for item in models["agent_models"])
     configured_model_names = {item["name"] for item in models["agent_models"]}
     assert "claude-opus-5" not in configured_model_names
-    assert {"gpt-5.4-mini", "gpt-5.4"}.issubset(configured_model_names)
+    assert {"gpt-4o", "gpt-5.4-mini", "gpt-5.4"}.issubset(configured_model_names)
     assert models["agent_default_model"] == "gpt-5.4-mini"
     assert all(
         name.startswith(("claude-haiku-", "claude-sonnet-", "deepseek-", "glm-", "gpt-", "kimi-", "llama-", "qwen"))
