@@ -1954,6 +1954,20 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
     assert client.responses.kwargs["reasoning"]["effort"] == expected
 
 
+def test_structured_response_omits_unsupported_gpt4_reasoning_and_verbosity(sample_repo):
+    client = FakeClient(review_payload())
+    agent = PlaidNoxDeepHuntAgent(client, model="gpt-4o")
+    agent.model_by_tier["standard"] = "gpt-4o"
+    agent.model_execution_router.fallback_by_tier[ModelTier.STANDARD] = "gpt-4o"
+
+    agent.review(sample_repo, deep_candidate(), finding())
+
+    assert client.responses.kwargs["model"] == "gpt-4o"
+    assert "reasoning" not in client.responses.kwargs
+    assert "verbosity" not in client.responses.kwargs["text"]
+    assert client.responses.kwargs["text"]["format"]["type"] == "json_schema"
+
+
 def test_repository_context_uses_the_configured_gpt_budget(sample_repo):
     from plaidnox_sast.assets import load_json
 

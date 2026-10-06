@@ -62,6 +62,7 @@ from .llm import (
     response_text,
 )
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
+from .model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from .prompts import render_operation
 from .redaction import redact as _redact
 from .redaction import redact_payload
@@ -2440,25 +2441,28 @@ class PlaidNoxDeepHuntAgent:
         for model_prefix, output_limit in self.model_output_token_limit_by_model_prefix.items():
             if model_execution.model_name.startswith(model_prefix):
                 effective_max_output_tokens = min(effective_max_output_tokens, output_limit)
+        text_config: dict[str, Any] = {
+            "format": {
+                "type": "json_schema",
+                "name": name,
+                "strict": getattr(self, "strict_output_schema", True),
+                "schema": schema,
+            }
+        }
+        if supports_text_verbosity(model_execution.model_name):
+            text_config["verbosity"] = "low"
         request_kwargs: dict[str, Any] = {
             "model": model_execution.model_name,
-            "reasoning": {"effort": effort},
             "input": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "text": {
-                "verbosity": "low",
-                "format": {
-                    "type": "json_schema",
-                    "name": name,
-                    "strict": getattr(self, "strict_output_schema", True),
-                    "schema": schema,
-                },
-            },
+            "text": text_config,
             "timeout": request_policy["timeout_seconds"],
             "max_retries": request_policy["max_retries"],
         }
+        if supports_reasoning_effort(model_execution.model_name):
+            request_kwargs["reasoning"] = {"effort": effort}
         if model_execution.model_name.startswith("gpt-"):
             # Routes requests sharing this stable prefix to the same cache shard.
             request_kwargs["prompt_cache_key"] = (

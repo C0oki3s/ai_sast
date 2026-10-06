@@ -10,6 +10,10 @@
     "deep": "gpt-5.4"
   },
   "agent_model_override_by_operation": {},
+  "request_capabilities": {
+    "reasoning_effort_model_prefixes": ["gpt-5", "gpt-oss", "o3"],
+    "text_verbosity_model_prefixes": ["gpt-5"]
+  },
   "agent_models": [
     {
       "name": "claude-haiku-4.5",
@@ -94,6 +98,13 @@
       "latency": "standard",
       "cost": "low",
       "guidance": "Broad code reasoning and multilingual repository analysis."
+    },
+    {
+      "name": "gpt-4o",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "Full OpenAI GPT-4 class model for SCM review and structured code-security analysis."
     },
     {
       "name": "gpt-5.4-mini",
