@@ -290,3 +290,37 @@ def test_stage_events_belong_to_the_run_and_keep_safe_metadata():
     assert record.review_id == "review_abc"
     assert record.summary == "Changed files analyzed"
     assert record.metadata_json == {"files_changed": 5, "added": 0, "review_depth": "DEEP", "docs_only": False}
+
+
+def test_a_script_written_with_html_line_breaks_keeps_every_line_after_redaction() -> None:
+    from types import SimpleNamespace
+
+    from plaidnox_sast.redaction import redact
+    from plaidnox_scm.api_service import _optional_verification_text, _repair_line_breaks
+
+    model_output = (
+        "`#!/usr/bin/env bash</n># Preconditions: TARGET_URL is the deployed application origin.</n>"
+        "# AUTH_TOKEN is any credential accepted by authCheck</n>"
+        "curl -fsS -H 'Cookie: idToken=<accessToken>' \"$TARGET_URL/api/admin\"</n>"
+        "echo done`"
+    )
+    script = redact(_repair_line_breaks(model_output))
+
+    lines = script.splitlines()
+    assert lines[0] == "#!/usr/bin/env bash"
+    assert lines[-1] == "echo done"  # the credential redaction stopped at its own line
+    assert len(lines) == 5 and "</n>" not in script and "`" not in script
+    assert "<redacted-credential>" in lines[3]
+
+    poc = _client_proof_of_concept("1. Sign in.<br>2. Call the endpoint.", script)
+    assert poc.endswith("```bash\n" + script + "\n```")
+    plan = _optional_verification_text(SimpleNamespace(proof_plan="1. Sign in.</n>2. Call it."), "proof_plan")
+    assert plan == "1. Sign in.\n2. Call it."
+
+
+def test_line_break_repair_leaves_ordinary_text_alone() -> None:
+    from plaidnox_scm.api_service import _repair_line_breaks
+
+    assert _repair_line_breaks("printf 'a\\nb'") == "printf 'a\\nb'"  # one-line command keeps literal \n
+    assert _repair_line_breaks("```bash\necho hi\n```") == "```bash\necho hi\n```"
+    assert _repair_line_breaks("#!/bin/sh\\necho hi") == "#!/bin/sh\necho hi"
