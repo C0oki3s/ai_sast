@@ -286,7 +286,7 @@ def test_review_reports_every_stage_in_order_with_its_details(tmp_path: Path) ->
 
     assert [name for name, _ in stages] == [
         "changes_analyzed", "context_ready", "candidates_generated",
-        "verification_complete", "baseline_compared", "policy_evaluated",
+        "verification_complete", "known_findings_checked", "baseline_compared", "policy_evaluated",
     ]
     details = dict(stages)
     assert details["changes_analyzed"]["files_changed"] == 1

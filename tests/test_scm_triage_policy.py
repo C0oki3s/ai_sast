@@ -197,12 +197,23 @@ def _apply(factory, command: str, reason: str | None = None) -> None:
         repository.apply_command("finding-1", REVIEW, command, actor="reviewer", reason=reason)
 
 
-def test_resolved_classification_validates_a_pending_fix(tmp_path: Path) -> None:
+def test_resolved_classification_validates_a_pending_fix_when_the_pr_merges(tmp_path: Path) -> None:
     factory = _factory()
     _apply(factory, "valid")
     _apply(factory, "fixed")
+    service = _service(factory, tmp_path)
+    resolved = _classification(relationship="RESOLVED", verification_state="baseline")
+    result = SimpleNamespace(baseline_classifications=(resolved,), known_outcomes=())
+    request = SimpleNamespace(review_number=4, head_sha="c" * 40)
 
-    _validate(factory, tmp_path, _classification(relationship="RESOLVED", verification_state="baseline"))
+    # At review time the fix only exists on the PR branch: the finding is not resolved yet.
+    service._record_fix_validations(TENANT, "review_later", result)  # type: ignore[arg-type]
+    service._record_occurrences(TENANT, "github:repository:1", request, "review_later",  # type: ignore[arg-type]
+                                SimpleNamespace(findings=[]), result)
+    with triage.unit_of_work(factory, TENANT) as repository:
+        assert repository.get("finding-1").state == "fix_pending"
+
+    service.close_pull_request(TENANT, "github:repository:1", 4, merged=True, head_sha="c" * 40)
 
     with triage.unit_of_work(factory, TENANT) as repository:
         assert repository.get("finding-1").state == "resolved"
@@ -244,3 +255,24 @@ def test_reverified_confirmed_finding_records_no_event(tmp_path: Path) -> None:
     with triage.unit_of_work(factory, TENANT) as repository:
         assert repository.get("finding-1").state == "confirmed"
         assert len(repository.list_events("finding-1")) == 1
+
+
+def test_scanner_proof_alone_never_resolves_an_unclaimed_finding() -> None:
+    factory = _factory()
+    with triage.unit_of_work(factory, TENANT) as repository:
+        assert repository.confirm_claimed_fix("finding-1", "review_later") is None
+        repository.apply_command("finding-1", REVIEW, "valid", actor="reviewer", reason=None)
+        assert repository.confirm_claimed_fix("finding-1", "review_later") is None
+        assert repository.get("finding-1").state == "confirmed"
+
+
+def test_regression_reopens_only_resolved_findings() -> None:
+    factory = _factory()
+    _apply(factory, "fixed")
+    with triage.unit_of_work(factory, TENANT) as repository:
+        assert repository.record_regression("finding-1", "r2") is None  # fix_pending: not resolved yet
+        repository.confirm_claimed_fix("finding-1", "r2")
+        assert repository.get("finding-1").state == "resolved"
+        outcome = repository.record_regression("finding-1", "r3")
+        assert outcome is not None and outcome.triage.state == "open"
+        assert repository.list_events("finding-1")[-1].command == "fix_regressed"

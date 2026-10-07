@@ -102,6 +102,24 @@ class ReviewAttemptRepository:
         )
         return tuple(finding for row in rows for finding in (row.findings or ()))
 
+    def previous_runs(
+        self, codebase_id: str, review_number: int, *, exclude_review_id: str, limit: int = 20
+    ) -> tuple[tuple[str, Any], ...]:
+        """(head sha, finding) for earlier completed runs of one pull request, newest run first."""
+        rows = self._session.scalars(
+            select(ReviewAttemptRecord)
+            .where(
+                ReviewAttemptRecord.tenant_id == self._tenant_id,
+                ReviewAttemptRecord.codebase_id == codebase_id,
+                ReviewAttemptRecord.review_number == review_number,
+                ReviewAttemptRecord.state == "completed",
+                ReviewAttemptRecord.review_id != exclude_review_id,
+            )
+            .order_by(ReviewAttemptRecord.started_at.desc())
+            .limit(limit)
+        )
+        return tuple((row.head_sha, finding) for row in rows for finding in (row.findings or ()))
+
     def claim(
         self,
         review_id: str,

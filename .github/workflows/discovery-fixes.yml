@@ -51,12 +51,14 @@ jobs:
             src/plaidnox_scm/trace.py \
             src/plaidnox_scm/api_models.py \
             src/plaidnox_scm/api_service.py \
+            src/plaidnox_scm/occurrences.py \
             src/plaidnox_scm/backfill.py \
             src/plaidnox_scm/dedupe.py \
             tests/test_optimized_discovery.py \
             tests/test_root_cause_semantics.py \
             tests/test_scm_trace.py \
-            tests/test_scm_trace_api.py
+            tests/test_scm_trace_api.py \
+            tests/test_scm_lifecycle.py
           ruff check tests/test_scm_backfill.py tests/test_scm_dedupe.py
       - name: Run focused regression tests
         run: |
@@ -70,4 +72,6 @@ jobs:
             tests/test_scm_api.py \
             tests/test_scm_backfill.py \
             tests/test_scm_dedupe.py \
-            tests/test_scm_attempts.py
+            tests/test_scm_attempts.py \
+            tests/test_scm_lifecycle.py \
+            tests/test_scm_triage_policy.py
