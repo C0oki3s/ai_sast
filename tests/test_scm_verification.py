@@ -52,6 +52,7 @@ class _Agent:
                 {"path": "middleware.js", "start_line": 2, "end_line": 2, "role": "defense"}
             ],
             proof_plan="Submit a forged token in an isolated test.",
+            proof_of_concept='curl -fsS -H "Authorization: Bearer $AUTH_TOKEN" "$TARGET_URL/protected"',
             regression_test="Reject a token with an invalid signature.",
             context_requests=[],
         )
@@ -146,6 +147,7 @@ def test_sast_verifier_uses_head_snapshot_and_enforces_change_minimum_depth(tmp_
     # too, so they must survive onto `CandidateVerification` rather than
     # being dropped at this boundary.
     assert results[0].proof_plan == "Submit a forged token in an isolated test."
+    assert results[0].proof_of_concept.startswith("curl -fsS")
     assert results[0].regression_test == "Reject a token with an invalid signature."
 
 

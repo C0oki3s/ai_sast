@@ -108,6 +108,7 @@ class DeepHuntResult:
     gate_results: list[dict[str, Any]] = field(default_factory=list)
     evidence_locations: list[dict[str, Any]] = field(default_factory=list)
     proof_plan: str = ""
+    proof_of_concept: str = ""
     regression_test: str = ""
     context_requests: list[dict[str, Any]] = field(default_factory=list)
 
@@ -2882,6 +2883,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             gate_results=[dict(item) for item in payload["gate_results"]],
             evidence_locations=[dict(item) for item in payload["evidence_locations"]],
             proof_plan=str(payload["proof_plan"]),
+            proof_of_concept=str(payload["proof_of_concept"]),
             regression_test=str(payload["regression_test"]),
             context_requests=[dict(item) for item in payload["context_requests"]],
         )

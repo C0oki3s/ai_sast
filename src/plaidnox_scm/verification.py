@@ -58,6 +58,7 @@ class CandidateVerification:
     regression_test: str = ""
     vulnerable_snippet: VulnerableSnippet | None = None
     evidence_trace: EvidenceTrace | None = None
+    proof_of_concept: str = ""
 
 
 class CandidateVerifier(Protocol):
@@ -200,6 +201,7 @@ class SastDeepHuntVerifier:
                         evidence=review_evidence,
                         context_expansion=expansion,
                         proof_plan=review.proof_plan,
+                        proof_of_concept=review.proof_of_concept,
                         regression_test=review.regression_test,
                         vulnerable_snippet=build_vulnerable_snippet(root, hypothesis),
                         evidence_trace=build_evidence_trace(

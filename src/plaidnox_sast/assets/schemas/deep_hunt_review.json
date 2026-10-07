@@ -172,6 +172,10 @@
       "type": "string",
       "maxLength": 800
     },
+    "proof_of_concept": {
+      "type": "string",
+      "maxLength": 4000
+    },
     "regression_test": {
       "type": "string",
       "maxLength": 800
@@ -308,6 +312,7 @@
     "gate_results",
     "evidence_locations",
     "proof_plan",
+    "proof_of_concept",
     "regression_test",
     "context_requests"
   ]

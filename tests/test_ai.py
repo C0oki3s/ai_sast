@@ -65,6 +65,7 @@ def test_deep_hunt_response_accepts_omitted_classification_references():
 
     assert result.classification_references == []
     assert result.supported is True
+    assert result.proof_of_concept.startswith("TARGET_URL=")
 
 
 def review_payload(**overrides):
@@ -110,6 +111,7 @@ def review_payload(**overrides):
                 {"path": "app.js", "start_line": 2, "end_line": 4, "role": "propagation"}
             ],
             "proof_plan": "Submit controlled content and observe the renderer request boundary.",
+            "proof_of_concept": "TARGET_URL=${TARGET_URL:?set TARGET_URL}\\ncurl -fsS \"$TARGET_URL/report?url=https://example.invalid/marker\"",
             "regression_test": "Assert remote resources are rejected for attacker-controlled report content.",
             "context_requests": [],
         }
