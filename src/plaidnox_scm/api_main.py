@@ -12,7 +12,7 @@ from plaidnox_sast.persistence import DatabaseSettings
 
 from .api import create_app
 from .api_service import ReviewService
-from .assets import load_json
+from .assets import load_json, load_text
 from .production import dependencies_from_environment
 from .source_broker import RepositoryMirrorBroker
 
@@ -43,12 +43,25 @@ def build_app():
 
 
 def main() -> None:
+    if os.environ.get("PLAIDNOX_SCM_MIGRATE_ONLY", "").strip().lower() == "true":
+        _apply_deployment_migrations()
+        return
+
     uvicorn.run(
         build_app(),
         host=os.environ.get("PLAIDNOX_SCM_API_HOST", "0.0.0.0"),
         port=int(os.environ.get("PLAIDNOX_SCM_API_PORT", "9000")),
         proxy_headers=True,
     )
+
+
+def _apply_deployment_migrations() -> None:
+    """Apply the pending idempotent SCM schema migration in a one-off ECS task."""
+    engine = DatabaseSettings.from_environment().create_engine()
+    migration = load_text("migrations/postgresql/0008_scm_review_attempt_pr_metadata.sql")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(migration)
+    print("Applied SCM migration 0008_scm_review_attempt_pr_metadata", flush=True)
 
 
 def _required_environment(name: str) -> str:
