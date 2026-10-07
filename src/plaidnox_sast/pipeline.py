@@ -202,7 +202,7 @@ def _finding_report_data(
         "affected_file": finding.evidence.path[:2048],
         "affected_code": redact_sensitive_values(finding.evidence.snippet)[:8000],
         "root_cause_symbol": str(finding.metadata.get("root_cause_symbol", ""))[:1000],
-        "proof_of_concept": redact_sensitive_values(str(finding.metadata.get("proof_of_concept", "")))[:8000],
+        "proof_of_concept": redact_sensitive_values(str(finding.metadata.get("proof_of_concept") or deep_hunt.get("proof_of_concept", "")))[:8000],
         "proof_plan": redact_sensitive_values(str(deep_hunt.get("proof_plan", "")))[:4000],
         "regression_test_expectation": redact_sensitive_values(str(deep_hunt.get("regression_test", "")))[:4000],
         "security_invariant": redact_sensitive_values(str(deep_hunt.get("security_invariant", "")))[:4000],
@@ -270,6 +270,7 @@ def _finding_from_saved_report(report: dict[str, Any], codebase: str) -> Finding
     ]
     deep_hunt = {
         "proof_plan": report.get("proof_plan", ""),
+        "proof_of_concept": report.get("proof_of_concept", ""),
         "regression_test": report.get("regression_test_expectation", ""),
         "security_invariant": report.get("security_invariant", ""),
         "gained_capability": report.get("gained_capability", ""),

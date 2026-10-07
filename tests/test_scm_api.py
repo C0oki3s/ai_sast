@@ -161,6 +161,7 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         security_invariant="Only cryptographically signed claims may authenticate a request.",
         gained_capability="Forge an unsigned session claim.",
         proof_plan="Send a request with an unsigned JWT and observe it is accepted.",
+        proof_of_concept="curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"",
         regression_test="Reject any request whose JWT signature does not verify.",
         evidence_gaps=(),
         evidence=(
@@ -235,7 +236,7 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         "root_cause_start_line": 12,
         "root_cause_end_line": 12,
         "root_cause_changed_in_pr": True,
-        "proof_of_concept": None,
+        "proof_of_concept": "curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"",
         "remediation": "Restore cryptographic JWT verification.",
         "remediation_invariant": "Only cryptographically signed claims may authenticate a request.",
         "proof_plan": "Send a request with an unsigned JWT and observe it is accepted.",

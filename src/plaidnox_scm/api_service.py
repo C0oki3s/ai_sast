@@ -649,7 +649,7 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                     if rich_evidence and (proof_plan or regression_test)
                     else None
                 ),
-                proof_of_concept=None,
+                proof_of_concept=(redact(str(getattr(verification, "proof_of_concept", "")).strip()) or None),
                 remediation=redact(verification.remediation.strip()) or None,
                 remediation_invariant=security_invariant,
                 proof_plan=proof_plan,
