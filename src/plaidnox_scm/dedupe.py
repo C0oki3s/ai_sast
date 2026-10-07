@@ -89,8 +89,8 @@ def signature(
 ) -> IssueSignature:
     start = max(1, int(start_line or 1))
     return IssueSignature(
-        path=path.replace("\\", "/").strip().lstrip("./").lower(),
-        symbol="".join(symbol.lower().split()).strip(),
+        path=path.replace("\\", "/").strip().lstrip("./"),
+        symbol="".join(symbol.split()).strip(),
         start=start,
         end=max(start, int(end_line or start)),
         cwes=cwe_ids(references, title, vulnerability_class),

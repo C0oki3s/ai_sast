@@ -72,6 +72,13 @@ def test_same_cwe_at_one_line_with_different_security_invariants_stays_separate(
     assert len({item.finding_fingerprint for item in classifications}) == 2
 
 
+def test_case_distinct_paths_are_not_the_same_repository_file() -> None:
+    upper = signature(path="src/Auth.py", symbol="check", start_line=10, end_line=10,
+                      title="Signature bypass", vulnerability_class="authentication bypass")
+    lower = replace(upper, path="src/auth.py")
+    assert not same_issue(upper, lower)
+
+
 def test_same_bug_on_later_commit_reuses_id_only_with_unchanged_evidence() -> None:
     candidate = _candidate("first", 10)
     first = classify_against_baseline("repo", _diff(), (candidate,), (_verified("first"),), (), (), coverage_complete=True)[0]

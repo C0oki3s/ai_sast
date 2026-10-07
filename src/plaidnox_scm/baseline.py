@@ -323,7 +323,7 @@ def _path_changed(diff: Diff, path: str) -> bool:
 
 
 def _normalise_path(value: str) -> str:
-    return value.replace("\\", "/").strip().lstrip("./").lower()
+    return value.replace("\\", "/").strip().lstrip("./")
 
 
 def _normalise_text(value: str) -> str:
