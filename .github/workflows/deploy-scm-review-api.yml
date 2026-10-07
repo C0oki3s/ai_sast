@@ -52,7 +52,16 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Load current task definition
-        run: aws ecs describe-task-definition --task-definition plaidnox-scm-review-api --query taskDefinition --output json > task-definition.json
+        run: |
+          service_definition=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$service_definition" --query taskDefinition --output json > task-definition-base.json
+          jq --arg container "$ECS_CONTAINER" '
+            .containerDefinitions |= map(
+              if .name == $container then
+                .environment = ((.environment // []) | map(select(.name != "PLAIDNOX_SCM_MIGRATE_ONLY")))
+              else . end
+            )
+          ' task-definition-base.json > task-definition.json
 
       - name: Render task definition
         id: task-def
