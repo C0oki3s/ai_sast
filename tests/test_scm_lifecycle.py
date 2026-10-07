@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from test_scm_review import _ContextBuilder, _factory, _git, _init_repo
 
 from plaidnox_sast.models import Depth, ModelTier, RouteDecision
@@ -700,6 +702,30 @@ def test_a_review_that_finishes_after_the_pr_merged_does_not_touch_the_pr_or_the
     service.run(_push(tmp_path, request, "d2"))
 
     assert _pr_rows(factory) == {"pr:7": "merged", "branch": "open"}
+
+
+@pytest.mark.parametrize("action", ("closed", "merged"))
+def test_a_late_review_does_not_change_fix_pending_triage_after_close_or_merge(tmp_path: Path, action: str) -> None:
+    holder: dict = {}
+    service, factory, request = _jwt_service(
+        tmp_path, during_verify=lambda: holder["close"]() if "close" in holder else None
+    )
+    first = service.run(request)
+    [finding] = first.findings
+    with triage.unit_of_work(factory, "test-tenant") as repository:
+        repository.apply_command(finding.finding_id, first.review_id, "fixed", actor="reviewer", reason=None)
+        event_count = len(repository.list_events(finding.finding_id))
+        assert repository.get(finding.finding_id).state == triage.FIX_PENDING
+
+    # The second push is verified against its own commit after the PR has closed or merged.
+    holder["close"] = lambda: (_deliver(service, action, f"{action}-1"), holder.pop("close"))
+    late = service.run(_push(tmp_path, request, f"d2-{action}"))
+
+    assert [item.finding_id for item in late.findings] == [finding.finding_id]
+    with triage.unit_of_work(factory, "test-tenant") as repository:
+        assert repository.get(finding.finding_id).state == triage.FIX_PENDING
+        assert len(repository.list_events(finding.finding_id)) == event_count
+    assert _pr_rows(factory)["pr:7"] == action
 
 
 def test_a_reopened_pr_tracks_its_findings_again(tmp_path: Path) -> None:
