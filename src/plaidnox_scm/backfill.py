@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
