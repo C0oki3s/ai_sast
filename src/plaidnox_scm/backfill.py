@@ -44,6 +44,7 @@ class BackfillReport:
     unreadable_files: int = 0
     invalid_after_update: int = 0
     bundles_downloaded: int = 0
+    bundle_access_denied: int = 0
     review_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -145,7 +146,14 @@ def _source_repository(
         try:
             size = int(client.head_object(Bucket=bundle_bucket, Key=key)["ContentLength"])
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                continue
+            # S3 returns 403 for an absent key when the task can GetObject but
+            # cannot ListBucket. Record it separately so a broken role policy
+            # remains visible in the dry-run report.
+            if code in {"403", "AccessDenied"}:
+                report.bundle_access_denied += 1
                 continue
             raise
         if size < 1 or size > MAX_BACKFILL_BUNDLE_BYTES:

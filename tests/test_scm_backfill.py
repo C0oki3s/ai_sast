@@ -6,6 +6,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+from botocore.exceptions import ClientError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -110,3 +111,22 @@ def test_backfill_recovers_the_exact_review_bundle_from_s3(tmp_path: Path) -> No
     )
     assert report.bundles_downloaded == 1 and report.findings_updated == 1
     assert _stored(factory)["vulnerable_snippet"]["code"] == "line 20"
+
+
+def test_inaccessible_bundle_is_reported_without_aborting_other_reviews(tmp_path: Path) -> None:
+    factory = _setup(tmp_path)
+    (tmp_path / "github" / "42" / ".git").rename(tmp_path / "unavailable-git")
+    with factory.begin() as session:
+        session.add(WebhookDeliveryRecord(
+            delivery_id="delivery-1", provider="github", installation_id=123, repository_id=42,
+            event_name="pull_request", tenant_id="tenant-a", state="accepted",
+        ))
+
+    class FakeS3:
+        def head_object(self, *, Bucket: str, Key: str):
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "HeadObject")
+
+    report = backfill_trace_code(factory, tmp_path, apply=True, bundle_bucket="review-bundles", s3_client=FakeS3())
+    assert report.bundle_access_denied == 1 and report.missing_snapshots == 1
+    assert report.findings_updated == 0
+    assert "vulnerable_snippet" not in _stored(factory)
