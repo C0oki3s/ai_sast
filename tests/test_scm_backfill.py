@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from plaidnox_scm.api_models import ReviewFinding
 from plaidnox_scm.backfill import REBUILT_GAP, backfill_trace_code
-from plaidnox_scm.models import Base, ReviewAttemptRecord
+from plaidnox_scm.models import Base, ReviewAttemptRecord, WebhookDeliveryRecord
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -78,3 +80,33 @@ def test_missing_snapshot_is_reported_without_writing(tmp_path: Path) -> None:
     report = backfill_trace_code(factory, tmp_path, apply=True)
     assert report.missing_snapshots == 1 and report.findings_updated == 0
     assert "vulnerable_snippet" not in _stored(factory)
+
+
+def test_backfill_recovers_the_exact_review_bundle_from_s3(tmp_path: Path) -> None:
+    factory = _setup(tmp_path)
+    mirror = tmp_path / "github" / "42"
+    bundle = tmp_path / "review.bundle"
+    _git(mirror, "bundle", "create", str(bundle), "--all")
+    data = bundle.read_bytes()
+    key = f"reviews/123/42/{hashlib.sha256(b'delivery-1').hexdigest()}.bundle"
+    with factory.begin() as session:
+        session.add(WebhookDeliveryRecord(
+            delivery_id="delivery-1", provider="github", installation_id=123, repository_id=42,
+            event_name="pull_request", tenant_id="tenant-a", state="accepted",
+        ))
+    (mirror / ".git").rename(tmp_path / "unavailable-git")
+
+    class FakeS3:
+        def head_object(self, *, Bucket: str, Key: str):
+            assert (Bucket, Key) == ("review-bundles", key)
+            return {"ContentLength": len(data)}
+
+        def get_object(self, *, Bucket: str, Key: str):
+            assert (Bucket, Key) == ("review-bundles", key)
+            return {"Body": io.BytesIO(data)}
+
+    report = backfill_trace_code(
+        factory, tmp_path, apply=True, bundle_bucket="review-bundles", s3_client=FakeS3()
+    )
+    assert report.bundles_downloaded == 1 and report.findings_updated == 1
+    assert _stored(factory)["vulnerable_snippet"]["code"] == "line 20"

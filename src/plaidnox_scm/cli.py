@@ -42,6 +42,8 @@ def _parser() -> argparse.ArgumentParser:
     backfill.add_argument("--repository-root", type=Path, default=os.environ.get("PLAIDNOX_SCM_REPOSITORY_ROOT"))
     backfill.add_argument("--tenant")
     backfill.add_argument("--limit", type=int)
+    backfill.add_argument("--bundle-bucket", default=os.environ.get("PLAIDNOX_SCM_BUNDLE_BUCKET"))
+    backfill.add_argument("--bundle-region", default=os.environ.get("AWS_REGION", "us-east-1"))
     backfill.add_argument("--apply", action="store_true", help="write validated changes; default is dry run")
     return parser
 
@@ -54,7 +56,8 @@ def _backfill(args: argparse.Namespace) -> int:
         engine = DatabaseSettings.from_environment().create_engine()
         factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
         report = backfill_trace_code(
-            factory, Path(args.repository_root), apply=args.apply, tenant_id=args.tenant, limit=args.limit
+            factory, Path(args.repository_root), apply=args.apply, tenant_id=args.tenant, limit=args.limit,
+            bundle_bucket=args.bundle_bucket, bundle_region=args.bundle_region,
         )
     except (DatabaseConfigurationError, ValueError) as exc:
         sys.stderr.write(f"{exc}\n")

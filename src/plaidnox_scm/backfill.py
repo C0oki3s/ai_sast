@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import tempfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import boto3
+from botocore.exceptions import ClientError
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,11 +22,12 @@ from plaidnox_sast.redaction import redact
 
 from .api_models import ReviewFinding
 from .evidence import EvidenceRole
-from .models import ReviewAttemptRecord
+from .models import InstallationTenantRecord, ReviewAttemptRecord, WebhookDeliveryRecord
 from .snapshots import SnapshotError, read_blob, resolve_revision
 from .trace import _NODE_KIND, _ROLE_LAYER, _code_window, _label
 
 MAX_FILE_BYTES = 2_000_000
+MAX_BACKFILL_BUNDLE_BYTES = 512 * 1024 * 1024
 REBUILT_GAP = "Trace rebuilt from stored locations; transitions were not machine-checked."
 BlobReader = Callable[[Path, str, str], str | None]
 
@@ -37,6 +43,7 @@ class BackfillReport:
     missing_snapshots: int = 0
     unreadable_files: int = 0
     invalid_after_update: int = 0
+    bundles_downloaded: int = 0
     review_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -53,6 +60,7 @@ class _Changes:
 def backfill_trace_code(
     session_factory: sessionmaker[Session], repository_root: Path, *, apply: bool = False,
     tenant_id: str | None = None, limit: int | None = None, read: BlobReader | None = None,
+    bundle_bucket: str | None = None, bundle_region: str = "us-east-1", s3_client: Any | None = None,
 ) -> BackfillReport:
     """Read the exact reviewed commit. Never invent links or semantic explanations."""
     if limit is not None and limit < 1:
@@ -72,41 +80,125 @@ def backfill_trace_code(
             if not record.findings:
                 continue
             report.attempts_scanned += 1
-            mirror = (root / record.provider / str(record.repository_id)).resolve()
-            if root not in mirror.parents or not mirror.is_dir() or not _has_commit(mirror, record.head_sha):
-                report.missing_snapshots += 1
-                continue
-            cache: dict[str, list[str] | None] = {}
-            lines_of = partial(_read_lines, cache, reader, mirror, record.head_sha, report)
-
-            updated: list[Any] = []
-            changed = False
-            for finding in record.findings:
-                if not isinstance(finding, dict):
-                    updated.append(finding)
+            with _source_repository(
+                session, root, record, bundle_bucket=bundle_bucket, bundle_region=bundle_region,
+                s3_client=s3_client, report=report,
+            ) as mirror:
+                if mirror is None:
+                    report.missing_snapshots += 1
                     continue
-                proposed, counts = _backfill_finding(finding, lines_of)
-                if proposed is None:
-                    updated.append(finding)
-                    continue
-                try:
-                    ReviewFinding.model_validate(proposed)
-                except ValidationError:
-                    report.invalid_after_update += 1
-                    updated.append(finding)
-                    continue
-                updated.append(proposed)
-                report.findings_updated += 1
-                report.nodes_filled += counts.nodes
-                report.traces_rebuilt += counts.trace
-                report.snippets_filled += counts.snippet
-                changed = True
-            if changed:
-                report.attempts_updated += 1
-                report.review_ids.append(record.review_id)
-                if apply:
-                    record.findings = updated
+                _backfill_record(record, mirror, reader, report, apply)
     return report
+
+
+def _backfill_record(
+    record: ReviewAttemptRecord, mirror: Path, reader: BlobReader, report: BackfillReport, apply: bool,
+) -> None:
+    cache: dict[str, list[str] | None] = {}
+    lines_of = partial(_read_lines, cache, reader, mirror, record.head_sha, report)
+    updated: list[Any] = []
+    changed = False
+    for finding in record.findings:
+        if not isinstance(finding, dict):
+            updated.append(finding)
+            continue
+        proposed, counts = _backfill_finding(finding, lines_of)
+        if proposed is None:
+            updated.append(finding)
+            continue
+        try:
+            ReviewFinding.model_validate(proposed)
+        except ValidationError:
+            report.invalid_after_update += 1
+            updated.append(finding)
+            continue
+        updated.append(proposed)
+        report.findings_updated += 1
+        report.nodes_filled += counts.nodes
+        report.traces_rebuilt += counts.trace
+        report.snippets_filled += counts.snippet
+        changed = True
+    if changed:
+        report.attempts_updated += 1
+        report.review_ids.append(record.review_id)
+        if apply:
+            record.findings = updated
+
+
+@contextmanager
+def _source_repository(
+    session: Session, root: Path, record: ReviewAttemptRecord, *, bundle_bucket: str | None,
+    bundle_region: str, s3_client: Any | None, report: BackfillReport,
+) -> Iterator[Path | None]:
+    mirror = (root / record.provider / str(record.repository_id)).resolve()
+    if root in mirror.parents and mirror.is_dir() and _has_commit(mirror, record.head_sha):
+        yield mirror
+        return
+    if not bundle_bucket:
+        yield None
+        return
+    client = s3_client or boto3.client("s3", region_name=bundle_region)
+    digest = hashlib.sha256(record.delivery_id.encode()).hexdigest()
+    installation_ids = _installation_ids(session, record)
+    for installation_id in installation_ids:
+        key = f"reviews/{installation_id}/{record.repository_id}/{digest}.bundle"
+        try:
+            size = int(client.head_object(Bucket=bundle_bucket, Key=key)["ContentLength"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                continue
+            raise
+        if size < 1 or size > MAX_BACKFILL_BUNDLE_BYTES:
+            continue
+        with tempfile.TemporaryDirectory(prefix="plaidnox-scm-backfill-") as directory:
+            bundle = Path(directory) / "source.bundle"
+            repository = Path(directory) / "repository.git"
+            response = client.get_object(Bucket=bundle_bucket, Key=key)
+            written = 0
+            try:
+                with bundle.open("wb") as output:
+                    while chunk := response["Body"].read(1024 * 1024):
+                        written += len(chunk)
+                        if written > MAX_BACKFILL_BUNDLE_BYTES:
+                            raise ValueError("review bundle exceeds the backfill size limit")
+                        output.write(chunk)
+            finally:
+                response["Body"].close()
+            if written != size:
+                raise ValueError("review bundle size changed during backfill download")
+            try:
+                subprocess.run(
+                    ["git", "clone", "--bare", str(bundle), str(repository)],
+                    check=True, capture_output=True, timeout=300,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise ValueError("stored review bundle could not be materialized") from exc
+            if not _has_commit(repository, record.head_sha):
+                continue
+            report.bundles_downloaded += 1
+            yield repository
+            return
+    yield None
+
+
+def _installation_ids(session: Session, record: ReviewAttemptRecord) -> tuple[int, ...]:
+    delivery = session.get(WebhookDeliveryRecord, record.delivery_id)
+    if (delivery is not None and delivery.tenant_id == record.tenant_id
+            and delivery.provider == record.provider and delivery.repository_id == record.repository_id):
+        return (delivery.installation_id,)
+    rows = session.scalars(
+        select(InstallationTenantRecord.installation_id).where(
+            InstallationTenantRecord.tenant_id == record.tenant_id,
+            InstallationTenantRecord.provider == record.provider,
+        )
+    )
+    mapped = tuple(rows)
+    if mapped:
+        return mapped
+    # Historical rows may predate the product tenant mapping.
+    prefix = f"{record.provider}:installation:"
+    suffix = record.tenant_id.removeprefix(prefix)
+    return (int(suffix),) if record.tenant_id.startswith(prefix) and suffix.isdigit() else ()
 
 
 def _read_lines(

@@ -4,10 +4,10 @@ from dataclasses import replace
 
 from plaidnox_sast.models import Depth, ModelTier, RouteDecision
 from plaidnox_scm.baseline import classify_against_baseline, prior_findings_from_stored
+from plaidnox_scm.context_broker import CandidateContextExpansion
 from plaidnox_scm.dedupe import consolidate_verified, same_issue, signature
 from plaidnox_scm.diffing import ChangedFile, Diff
 from plaidnox_scm.evidence import build_review_evidence
-from plaidnox_scm.context_broker import CandidateContextExpansion
 from plaidnox_scm.l1_review import ChangedLines, L1Candidate
 from plaidnox_scm.trace import VulnerableSnippet
 from plaidnox_scm.verification import CandidateVerification
