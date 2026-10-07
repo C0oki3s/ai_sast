@@ -3,6 +3,7 @@ import sqlite3
 from plaidnox_sast.assets import load_json
 from plaidnox_sast.context_fabric import ContextFabricStore
 from plaidnox_sast.prompts import render_operation, render_prompt
+from plaidnox_scm.assets import load_json as load_scm_json
 
 
 def test_model_prompts_and_schemas_are_versioned_runtime_assets():
@@ -21,7 +22,23 @@ def test_model_prompts_and_schemas_are_versioned_runtime_assets():
     configured_model_names = {item["name"] for item in models["agent_models"]}
     assert "claude-opus-5" not in configured_model_names
     assert {"gpt-4o", "gpt-5.4-mini", "gpt-5.4"}.issubset(configured_model_names)
-    assert models["agent_default_model"] == "gpt-5.4-mini"
+    assert models["agent_default_model"] == "glm-5.3-flash"
+    assert models["agent_fallback_model_by_tier"] == {
+        "fast": "glm-5.3-flash",
+        "standard": "glm-5.3-flash",
+        "deep": "glm-5.3",
+    }
+    review_runtime = load_scm_json("runtime/review.json")
+    assert review_runtime["l1_max_output_tokens"] == 20000
+    assert review_runtime["l1_retry_max_output_tokens"] == 50000
+    agent_runtime = load_json("runtime/agent.json")
+    assert agent_runtime["model_output_token_limit_by_operation_by_tier"]["security_review"] == {
+        "standard": 20000,
+        "deep": 30000,
+    }
+    assert agent_runtime["output_truncation_retry_by_operation"]["security_review"][
+        "retry_output_tokens_by_tier"
+    ] == {"standard": 30000, "deep": 50000}
     assert all(
         name.startswith(("claude-haiku-", "claude-sonnet-", "deepseek-", "glm-", "gpt-", "kimi-", "llama-", "qwen"))
         for name in configured_model_names

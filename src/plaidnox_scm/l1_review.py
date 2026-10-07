@@ -155,9 +155,30 @@ class LiteLLMChangedFileReviewer:
                     )
                     continue
                 if getattr(response, "status", "completed") != "completed":
-                    coverage_complete = False
-                    coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")
-                    continue
+                    details = getattr(response, "incomplete_details", None)
+                    reason = getattr(details, "reason", None) if details else None
+                    retry_limit = int(runtime.get("l1_retry_max_output_tokens", 0))
+                    output_tokens = _response_output_tokens(response)
+                    # GLM/OpenRouter may omit `incomplete_details`; only retry when
+                    # the first response appears budget-bound or gives no reason.
+                    if (
+                        retry_limit > request["max_output_tokens"]
+                        and reason in {None, "", "max_output_tokens"}
+                        and (not output_tokens or output_tokens >= request["max_output_tokens"])
+                    ):
+                        request["max_output_tokens"] = retry_limit
+                        try:
+                            response = self._client.responses.create(**request)
+                        except Exception as exc:
+                            coverage_complete = False
+                            coverage_gaps.append(
+                                f"Model retry failed for {changed_file.path} ({type(exc).__name__})"
+                            )
+                            continue
+                    if getattr(response, "status", "completed") != "completed":
+                        coverage_complete = False
+                        coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")
+                        continue
                 result = _parse_response(response, changed_file)
                 candidates.extend(result[0])
                 coverage_complete = coverage_complete and result[1]
@@ -170,6 +191,15 @@ class LiteLLMChangedFileReviewer:
             coverage_gaps=tuple(coverage_gaps),
             model_calls=model_calls,
         )
+
+
+def _response_output_tokens(response: Any) -> int:
+    usage = getattr(response, "usage", None)
+    value = usage.get("output_tokens", 0) if isinstance(usage, Mapping) else getattr(usage, "output_tokens", 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _review_payload(

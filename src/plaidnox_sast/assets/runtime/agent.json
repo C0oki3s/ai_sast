@@ -99,7 +99,7 @@
     "finding_consolidation": 12000,
     "finding_group_narratives": 12000,
     "vulnerability_discovery": 16000,
-    "security_review": 8000
+    "security_review": 20000
   },
   "consolidation_max_output_tokens": 12000,
   "research_max_output_tokens": 8000,
@@ -156,7 +156,7 @@
   },
   "model_output_token_limit_by_operation_by_tier": {
     "security_review": {
-      "standard": 8000,
+      "standard": 20000,
       "deep": 30000
     },
     "capability_chain": {
@@ -175,7 +175,7 @@
     "security_review": {
       "max_retries": 1,
       "retry_output_tokens_by_tier": {
-        "standard": 10000,
+        "standard": 30000,
         "deep": 50000
       }
     },

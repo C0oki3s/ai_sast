@@ -112,7 +112,7 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert request["text"]["format"]["type"] == "json_schema"
     assert "reasoning" not in request
     assert "verbosity" not in request["text"]
-    assert request["max_output_tokens"] == 12000
+    assert request["max_output_tokens"] == 20000
     candidate_fields = {item.name for item in fields(result.candidates[0])}
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
 
@@ -191,6 +191,33 @@ def test_l1_review_marks_provider_failure_as_incomplete(tmp_path: Path) -> None:
     assert result.candidates == ()
     assert result.coverage_complete is False
     assert result.coverage_gaps == ("Model request failed for middleware.js (RuntimeError)",)
+
+
+def test_l1_review_retries_budget_incomplete_response_with_larger_limit(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+
+    class IncompleteThenComplete(_Responses):
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    usage=SimpleNamespace(output_tokens=20000),
+                )
+            return SimpleNamespace(status="completed", output_text=json.dumps(self.payload))
+
+    responses = IncompleteThenComplete(_payload())
+    result = LiteLLMChangedFileReviewer(
+        SimpleNamespace(responses=responses)
+    ).review(repo, diff, classify(diff), _context(base))
+
+    assert len(responses.calls) == 2
+    assert responses.calls[0]["max_output_tokens"] == 20000
+    assert responses.calls[1]["max_output_tokens"] == 50000
+    assert result.coverage_complete is True
+    assert result.candidates
 
 
 def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(

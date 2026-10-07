@@ -1,13 +1,13 @@
 {
-  "agent_default_model": "gpt-5.4-mini",
-  "agent_default_max_output_tokens": 10000,
+  "agent_default_model": "glm-5.3-flash",
+  "agent_default_max_output_tokens": 20000,
   "agent_max_output_tokens_by_model_prefix": {
     "bedrock-": 9000
   },
   "agent_fallback_model_by_tier": {
-    "fast": "gpt-5.4-mini",
-    "standard": "gpt-5.4-mini",
-    "deep": "gpt-5.4"
+    "fast": "glm-5.3-flash",
+    "standard": "glm-5.3-flash",
+    "deep": "glm-5.3"
   },
   "agent_model_override_by_operation": {},
   "request_capabilities": {
@@ -121,13 +121,13 @@
       "guidance": "OpenAI model for deep code-security reasoning and adversarial verification."
     }
   ],
-  "saist_detection_model": "gpt-5.4-mini",
-  "saist_validation_model": "gpt-5.4",
+  "saist_detection_model": "glm-5.3-flash",
+  "saist_validation_model": "glm-5.3",
   "saist_request_timeout_seconds": 60,
   "saist_process_timeout_seconds": 900,
   "agent_model_by_tier": {
-    "fast": "gpt-5.4-mini",
-    "standard": "gpt-5.4-mini",
-    "deep": "gpt-5.4"
+    "fast": "glm-5.3-flash",
+    "standard": "glm-5.3-flash",
+    "deep": "glm-5.3"
   }
 }
