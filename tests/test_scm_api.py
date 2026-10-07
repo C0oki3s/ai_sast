@@ -160,7 +160,7 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         remediation="Restore cryptographic JWT verification.",
         security_invariant="Only cryptographically signed claims may authenticate a request.",
         gained_capability="Forge an unsigned session claim.",
-        proof_plan="Send a request with an unsigned JWT and observe it is accepted.",
+        proof_plan="1. Send a request with an unsigned JWT.\n2. Observe that the protected route accepts it.",
         proof_of_concept="curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"",
         regression_test="Reject any request whose JWT signature does not verify.",
         evidence_gaps=(),
@@ -236,10 +236,17 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         "root_cause_start_line": 12,
         "root_cause_end_line": 12,
         "root_cause_changed_in_pr": True,
-        "proof_of_concept": "curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"",
+        "proof_of_concept": (
+            "### Steps to Reproduce\n\n"
+            "1. Send a request with an unsigned JWT.\n"
+            "2. Observe that the protected route accepts it.\n\n"
+            "```bash\n"
+            "curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"\n"
+            "```"
+        ),
         "remediation": "Restore cryptographic JWT verification.",
         "remediation_invariant": "Only cryptographically signed claims may authenticate a request.",
-        "proof_plan": "Send a request with an unsigned JWT and observe it is accepted.",
+        "proof_plan": "1. Send a request with an unsigned JWT.\n2. Observe that the protected route accepts it.",
         "regression_test_expectation": "Reject any request whose JWT signature does not verify.",
         "category": "CWE-347",
         "baseline_relationship": "introduced",

@@ -233,7 +233,7 @@ class ReviewService:
                 summary=response.summary,
                 incomplete_reason=response.incomplete_reason,
                 counters=_counters_dict(result.counters),
-                findings=[finding.model_dump(mode="json") for finding in response.findings],
+                findings=[_stored_finding(finding) for finding in response.findings],
             )
         if completed:
             self._record_fix_validations(tenant_id, review_id, result)
@@ -649,7 +649,10 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                     if rich_evidence and (proof_plan or regression_test)
                     else None
                 ),
-                proof_of_concept=(redact(str(getattr(verification, "proof_of_concept", "")).strip()) or None),
+                proof_of_concept=_client_proof_of_concept(
+                    proof_plan,
+                    redact(str(getattr(verification, "proof_of_concept", "")).strip()) or None,
+                ),
                 remediation=redact(verification.remediation.strip()) or None,
                 remediation_invariant=security_invariant,
                 proof_plan=proof_plan,
@@ -815,6 +818,57 @@ def _optional_verification_text(verification: object, attribute: str) -> str | N
         return None
     text = str(value).strip()
     return redact(text) or None if text else None
+
+
+def _client_proof_of_concept(proof_plan: str | None, script: str | None) -> str | None:
+    """Build one display-ready PoC without asking the model to repeat itself."""
+
+    if not script:
+        return None
+    lines = script.strip().splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        lines = lines[1:-1]
+    fenced = "\n".join(lines).strip()
+    steps = f"{proof_plan.strip()}\n\n" if proof_plan and proof_plan.strip() else ""
+    return f"### Steps to Reproduce\n\n{steps}```bash\n{fenced}\n```"
+
+
+_REDUNDANT_STORED_FINDING_KEYS = frozenset({
+    "root_cause",
+    "reproduction",
+    "proof_plan",
+    "security_invariant",
+    "gained_capability",
+})
+
+
+def _compact_json(value: object) -> object:
+    """Remove JSONB noise while preserving meaningful false and zero values."""
+
+    if isinstance(value, dict):
+        compacted: dict[str, object] = {}
+        for key, item in value.items():
+            if item is None:
+                continue
+            compact = _compact_json(item)
+            if compact not in ([], {}):
+                compacted[key] = compact
+        return compacted
+    if isinstance(value, list):
+        return [_compact_json(item) for item in value if item is not None]
+    return value
+
+
+def _stored_finding(finding: ReviewFinding) -> dict[str, object]:
+    """Canonical compact payload persisted in ``scm_review_attempts.findings``."""
+
+    payload = finding.model_dump(mode="json")
+    for key in _REDUNDANT_STORED_FINDING_KEYS:
+        payload.pop(key, None)
+    snippet = payload.get("vulnerable_snippet")
+    if isinstance(snippet, dict) and snippet.get("content") == snippet.get("code"):
+        snippet.pop("content", None)
+    return dict(_compact_json(payload))
 
 
 def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
