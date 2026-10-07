@@ -88,14 +88,14 @@ def _coverage_observations(state: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _discovery_workset_units(
-    regions: list["DiscoveryRegion"],
+    regions: list[DiscoveryRegion],
     *,
     root: Path | None = None,
     graph: StructuralGraph | None = None,
     source_excludes: list[str] | None = None,
     max_file_bytes: int | None = None,
     indexed_worksets: list[SecurityWorkset] | None = None,
-) -> tuple[list["DiscoveryRegion"], dict[str, int]]:
+) -> tuple[list[DiscoveryRegion], dict[str, int]]:
     """Convert source-window regions into bounded live discovery worksets.
 
     The adapter is deliberately evidence-preserving: every batch maps back to
@@ -179,7 +179,7 @@ def _discovery_workset_units(
     }
 
 
-def _attach_surface_review_obligation(unit: "DiscoveryRegion") -> None:
+def _attach_surface_review_obligation(unit: DiscoveryRegion) -> None:
     """Give each selected workset batch an explicit required review ledger entry."""
     workset = unit.security_workset
     if not workset:
@@ -208,8 +208,8 @@ def _attach_surface_review_obligation(unit: "DiscoveryRegion") -> None:
 
 
 def _discovery_unit_from_batch(
-    members: list["DiscoveryRegion"], serialized_workset: dict[str, Any]
-) -> "DiscoveryRegion":
+    members: list[DiscoveryRegion], serialized_workset: dict[str, Any]
+) -> DiscoveryRegion:
     representative = min(members, key=lambda item: (item.path, item.start_line, item.end_line))
     slices = list(serialized_workset.get("slices", []))
     source_hashes = sorted(
@@ -251,12 +251,12 @@ def _discovery_unit_from_batch(
 def _graph_discovery_units(
     root: Path,
     graph: StructuralGraph,
-    regions: list["DiscoveryRegion"],
+    regions: list[DiscoveryRegion],
     *,
     source_excludes: list[str],
     max_file_bytes: int | None,
     indexed_worksets: list[SecurityWorkset] | None = None,
-) -> tuple[list["DiscoveryRegion"], list["DiscoveryRegion"], dict[str, int]]:
+) -> tuple[list[DiscoveryRegion], list[DiscoveryRegion], dict[str, int]]:
     """Attach an exact route/registration anchor to indexed cross-file evidence."""
     graph_worksets = indexed_worksets if indexed_worksets is not None else security_worksets_from_graph(root, graph)
     routes_by_surface: dict[str, list[SecurityWorkset]] = {}
@@ -339,7 +339,7 @@ def _graph_discovery_units(
 
 
 def _preserve_region_evidence(
-    workset: SecurityWorkset, members: list["DiscoveryRegion"]
+    workset: SecurityWorkset, members: list[DiscoveryRegion]
 ) -> SecurityWorkset:
     """Keep the whole discovered source region alongside indexed relationships."""
     primary_slices: list[SecuritySlice] = []
@@ -393,7 +393,7 @@ def _preserve_region_evidence(
 
 
 def _workset_primary_matches_region(
-    workset: SecurityWorkset, region: "DiscoveryRegion"
+    workset: SecurityWorkset, region: DiscoveryRegion
 ) -> bool:
     if workset.surface_type == "http_route":
         if region.anchor_type != "route" or workset.surface_id != _region_surface_id(region):
@@ -414,7 +414,7 @@ def _workset_primary_matches_region(
     )
 
 
-def _region_surface_id(region: "DiscoveryRegion") -> str:
+def _region_surface_id(region: DiscoveryRegion) -> str:
     anchor_id = region.anchor_id.strip() or f"{region.start_line}:{region.end_line}"
     surface_id = f"{region.path}::{anchor_id}"
     if region.anchor_type == "line_range":
@@ -438,7 +438,7 @@ class DiscoveryRegion:
     query_ids: set[str] = field(default_factory=set)
     coverage_refs: set[str] = field(default_factory=set)
     obligations: set[str] = field(default_factory=set)
-    obligation_specs: dict[str, "DiscoveryObligation"] = field(default_factory=dict)
+    obligation_specs: dict[str, DiscoveryObligation] = field(default_factory=dict)
     vulnerability_themes: set[str] = field(default_factory=set)
     security_ir_slice: dict[str, Any] = field(default_factory=dict)
     source_slices: list[dict[str, Any]] = field(default_factory=list)
@@ -1541,7 +1541,7 @@ def _add_context_source_windows(
 
 
 def _resolve_discovery_context_request(
-    agent: "OptimizedPlaidNoxDeepHuntAgent",
+    agent: OptimizedPlaidNoxDeepHuntAgent,
     root: Path,
     request: dict[str, Any],
 ) -> dict[str, Any]:

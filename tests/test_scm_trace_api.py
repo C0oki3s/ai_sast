@@ -1,7 +1,12 @@
 from datetime import UTC, datetime
 
 from plaidnox_scm.api_models import FindingRootCause, ReviewFinding
-from plaidnox_scm.api_service import _api_evidence_trace, _api_vulnerable_snippet
+from plaidnox_scm.api_service import (
+    _api_evidence_trace,
+    _api_vulnerable_snippet,
+    _client_proof_of_concept,
+    _stored_finding,
+)
 from plaidnox_scm.evidence import EvidenceRole
 from plaidnox_scm.trace import (
     EvidenceTrace,
@@ -45,6 +50,38 @@ def test_review_finding_omits_new_grouped_fields_when_verifier_has_none():
     assert "security_invariant" not in payload
     assert "gained_capability" not in payload
     assert "reproduction" not in payload
+
+
+def test_stored_finding_keeps_poc_without_duplicate_or_empty_fields():
+    payload = _stored_finding(_finding(
+        proof_of_concept="### Steps to Reproduce\n\n1. Run a local request.\n\n```bash\ncurl http://127.0.0.1/test\n```",
+        proof_plan="duplicate proof plan",
+        root_cause=FindingRootCause(
+            path="middleware/ValidateToken.js", symbol="authCheck",
+            start_line=54, end_line=60, changed_in_pr=True,
+        ),
+        context_facts=[], evidence_gaps=[],
+    ))
+
+    assert payload["proof_of_concept"].startswith("### Steps to Reproduce")
+    assert payload["root_cause_path"] == "middleware/ValidateToken.js"
+    assert "proof_plan" not in payload
+    assert "root_cause" not in payload
+    assert "context_facts" not in payload
+    assert "evidence_gaps" not in payload
+
+
+def test_client_poc_combines_numbered_steps_and_one_bash_block():
+    payload = _client_proof_of_concept(
+        "1. Start the local service.\n2. Send the controlled request.",
+        "```bash\ncurl http://127.0.0.1/test\n```",
+    )
+
+    assert payload == (
+        "### Steps to Reproduce\n\n"
+        "1. Start the local service.\n2. Send the controlled request.\n\n"
+        "```bash\ncurl http://127.0.0.1/test\n```"
+    )
 
 
 def test_verified_snippet_and_branching_trace_are_provider_neutral():

@@ -1,12 +1,19 @@
 {
   "agent_default_model": "gpt-5.4-mini",
   "agent_default_max_output_tokens": 10000,
+  "agent_max_output_tokens_by_model_prefix": {
+    "bedrock-": 9000
+  },
   "agent_fallback_model_by_tier": {
     "fast": "gpt-5.4-mini",
     "standard": "gpt-5.4-mini",
     "deep": "gpt-5.4"
   },
   "agent_model_override_by_operation": {},
+  "request_capabilities": {
+    "reasoning_effort_model_prefixes": ["gpt-5", "gpt-oss", "o3"],
+    "text_verbosity_model_prefixes": ["gpt-5"]
+  },
   "agent_models": [
     {
       "name": "claude-haiku-4.5",
@@ -93,6 +100,13 @@
       "guidance": "Broad code reasoning and multilingual repository analysis."
     },
     {
+      "name": "gpt-4o",
+      "tier": "standard",
+      "latency": "standard",
+      "cost": "standard",
+      "guidance": "Full OpenAI GPT-4 class model for SCM review and structured code-security analysis."
+    },
+    {
       "name": "gpt-5.4-mini",
       "tier": "standard",
       "latency": "low",
@@ -107,8 +121,8 @@
       "guidance": "OpenAI model for deep code-security reasoning and adversarial verification."
     }
   ],
-  "saist_detection_model": "glm-5.3-flash",
-  "saist_validation_model": "kimi-k2.7-code",
+  "saist_detection_model": "gpt-5.4-mini",
+  "saist_validation_model": "gpt-5.4",
   "saist_request_timeout_seconds": 60,
   "saist_process_timeout_seconds": 900,
   "agent_model_by_tier": {

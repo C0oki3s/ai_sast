@@ -1065,7 +1065,7 @@ def test_verified_finding_dependencies_include_its_deep_hunt_request(sample_repo
         "work_identity": work_identity,
         "invocation_id": "invocation-verified",
         "input_hash": "a" * 64,
-        "prompt_asset_version": "2026-09-27.1",
+        "prompt_asset_version": "2026-10-07.1",
         "context_references": [
             {
                 "reference_type": "security_memory",
@@ -1087,7 +1087,7 @@ def test_verified_finding_dependencies_include_its_deep_hunt_request(sample_repo
         for item in dependencies
     )
     assert any(
-        item.dependency_type == "prompt_asset_version" and item.dependency_key == "2026-09-27.1"
+        item.dependency_type == "prompt_asset_version" and item.dependency_key == "2026-10-07.1"
         for item in dependencies
     )
     assert {item.dependency_type for item in dependencies} >= {

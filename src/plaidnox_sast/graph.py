@@ -473,11 +473,13 @@ def _tree_sitter_ir(
     if not language:
         return None
     try:
-        from tree_sitter_language_pack import get_parser
-
+        from tree_sitter_language_pack import Error as LanguagePackError, get_parser
+    except ImportError:
+        return None
+    try:
         parser = get_parser(language)
         tree = parser.parse(content)
-    except (ImportError, LookupError, RuntimeError, ValueError):
+    except (LanguagePackError, LookupError, RuntimeError, ValueError):
         return None
     symbol_types = {str(item) for item in config["symbol_node_types"]}
     call_types = {str(item) for item in config["call_node_types"]}

@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from plaidnox_sast.redaction import redact
+from plaidnox_sast.llm import tenant_cache_namespace
 
 from . import attempts, context_store, triage
 from .api_models import (
@@ -35,6 +38,7 @@ from .assets import load_json
 from .baseline import FindingBaselineClassification
 from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
+from .models import ActivityEventRecord, InstallationTenantRecord, WebhookDeliveryRecord
 from .policy import evaluate_merge_policy
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
@@ -119,7 +123,7 @@ class ReviewService:
 
     def run(self, request: ReviewRequest) -> ReviewResponse:
         review_id = _review_id(request)
-        tenant_id = _tenant_id(request)
+        tenant_id = self.resolve_tenant(request.provider, request.installation_id)
         codebase_id = f"{request.provider}:repository:{request.repository_id}"
         runtime = load_json("runtime/review.json")
         lease_owner = uuid4().hex
@@ -141,6 +145,15 @@ class ReviewService:
         if attempt.state == "completed":
             return _replay_response(attempt)
 
+        _record_review_activity(
+            self.session_factory,
+            tenant_id=tenant_id,
+            request=request,
+            review_id=review_id,
+            event_type="review_started",
+            idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:started",
+        )
+
         heartbeat = _LeaseHeartbeat(
             self.session_factory,
             tenant_id,
@@ -152,7 +165,10 @@ class ReviewService:
         heartbeat.start()
         try:
             try:
-                with self.source_broker.materialize(request) as source:
+                with (
+                    tenant_cache_namespace(tenant_id),
+                    self.source_broker.materialize(request) as source,
+                ):
                     result = review_pull_request(
                         source.repo_path,
                         source.base_revision,
@@ -182,11 +198,32 @@ class ReviewService:
                         error_type=type(exc).__name__,
                         error_message=redact(str(exc)),
                     )
+                _record_review_activity(
+                    self.session_factory,
+                    tenant_id=tenant_id,
+                    request=request,
+                    review_id=review_id,
+                    event_type="review_failed",
+                    idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:failed",
+                )
                 raise
         finally:
             heartbeat.stop()
 
-        response = _response(request, result)
+        response = _response(request, result, tenant_id)
+        application_context = getattr(result, "application_context", None)
+        if application_context is not None:
+            _record_review_activity(
+                self.session_factory,
+                tenant_id=tenant_id,
+                request=request,
+                review_id=review_id,
+                event_type="context_indexed",
+                idempotency_key=(
+                    f"context:{codebase_id}:{application_context.baseline_revision}:"
+                    f"{application_context.source_tree_hash}"
+                ),
+            )
         with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
             completed = repository.complete(
                 review_id,
@@ -196,15 +233,200 @@ class ReviewService:
                 summary=response.summary,
                 incomplete_reason=response.incomplete_reason,
                 counters=_counters_dict(result.counters),
-                findings=[finding.model_dump(mode="json") for finding in response.findings],
+                findings=[_stored_finding(finding) for finding in response.findings],
             )
         if completed:
             self._record_fix_validations(tenant_id, review_id, result)
+            event_type = "review_incomplete" if response.action is PolicyAction.INCOMPLETE else "review_completed"
+            _record_review_activity(
+                self.session_factory,
+                tenant_id=tenant_id,
+                request=request,
+                review_id=review_id,
+                event_type=event_type,
+                idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:{event_type}",
+            )
         if not completed:
             raise attempts.ReviewAttemptConflictError(
                 f"review {review_id} lease was lost before completion"
             )
         return response
+
+    def claim_webhook_delivery(
+        self,
+        *,
+        delivery_id: str,
+        provider: str,
+        installation_id: int,
+        repository_id: int,
+        event_name: str,
+        action: str | None,
+        pull_number: int | None = None,
+        head_sha: str | None = None,
+    ) -> tuple[bool, str]:
+        """Persist a verified delivery before the bot acknowledges it to GitHub."""
+        tenant_id = self.resolve_tenant(provider, installation_id)
+        with self.session_factory.begin() as session:
+            inserted = False
+            try:
+                with session.begin_nested():
+                    session.add(
+                        WebhookDeliveryRecord(
+                            delivery_id=delivery_id,
+                            provider=provider,
+                            installation_id=installation_id,
+                            repository_id=repository_id,
+                            event_name=event_name,
+                            action=action,
+                            tenant_id=tenant_id,
+                            state="accepted",
+                        )
+                    )
+                    session.flush()
+                inserted = True
+            except IntegrityError:
+                session.expire_all()
+
+            existing = session.scalar(
+                select(WebhookDeliveryRecord)
+                .where(WebhookDeliveryRecord.delivery_id == delivery_id)
+                .with_for_update()
+            )
+            if existing is None:
+                raise RuntimeError("webhook delivery claim disappeared during insert")
+            identity = (
+                existing.provider,
+                existing.installation_id,
+                existing.repository_id,
+                existing.event_name,
+                existing.action,
+                existing.tenant_id,
+            )
+            expected_identity = (
+                provider,
+                installation_id,
+                repository_id,
+                event_name,
+                action,
+                tenant_id,
+            )
+            if identity != expected_identity:
+                raise PermissionError("delivery identifier is already bound to a different event")
+
+            if inserted and event_name == "pull_request":
+                event_type = _pr_activity_type(action)
+                if event_type:
+                    session.add(
+                        _activity_record(
+                            tenant_id=tenant_id,
+                            provider=provider,
+                            repository_id=repository_id,
+                            installation_id=installation_id,
+                            pull_number=pull_number,
+                            head_sha=head_sha,
+                            event_type=event_type,
+                            idempotency_key=f"github:{delivery_id}:{event_type}",
+                        )
+                    )
+            accepted = inserted or existing.state != "queued"
+        return accepted, tenant_id
+
+    def mark_webhook_delivery_queued(self, delivery_id: str) -> bool:
+        with self.session_factory.begin() as session:
+            row = session.get(WebhookDeliveryRecord, delivery_id)
+            if row is None:
+                return False
+            row.state = "queued"
+            if row.event_name == "pull_request" and row.action in {
+                "opened",
+                "reopened",
+                "ready_for_review",
+                "synchronize",
+            }:
+                source = session.scalar(
+                    select(ActivityEventRecord)
+                    .where(
+                        ActivityEventRecord.idempotency_key.in_(
+                            [
+                                f"github:{delivery_id}:pr_opened",
+                                f"github:{delivery_id}:pr_updated",
+                            ]
+                        )
+                    )
+                    .limit(1)
+                )
+                session.add(
+                    _activity_record(
+                        tenant_id=row.tenant_id,
+                        provider=row.provider,
+                        repository_id=row.repository_id,
+                        installation_id=row.installation_id,
+                        pull_number=source.pull_number if source else None,
+                        head_sha=source.head_sha if source else None,
+                        event_type="review_queued",
+                        idempotency_key=f"github:{delivery_id}:review_queued",
+                    )
+                )
+        return True
+
+    def update_installation_status(self, *, provider: str, installation_id: int, active: bool) -> bool:
+        with self.session_factory.begin() as session:
+            mapping = session.get(InstallationTenantRecord, (provider, installation_id))
+            if mapping is None:
+                return False
+            mapping.active = active
+        return True
+
+    def record_review_superseded(
+        self,
+        *,
+        provider: str,
+        installation_id: int,
+        repository_id: int,
+        review_number: int,
+        review_id: str,
+        head_sha: str,
+    ) -> None:
+        tenant_id = self.resolve_tenant(provider, installation_id)
+        with self.session_factory.begin() as session:
+            session.merge(
+                _activity_record(
+                    tenant_id=tenant_id,
+                    provider=provider,
+                    repository_id=repository_id,
+                    installation_id=installation_id,
+                    pull_number=review_number,
+                    review_id=review_id,
+                    head_sha=head_sha,
+                    event_type="review_superseded",
+                    idempotency_key=f"{review_id}:superseded",
+                )
+            )
+
+    def record_review_failed(self, request: ReviewRequest) -> None:
+        tenant_id = self.resolve_tenant(request.provider, request.installation_id)
+        review_id = _review_id(request)
+        with self.session_factory.begin() as session:
+            session.merge(
+                _activity_record(
+                    tenant_id=tenant_id,
+                    provider=request.provider,
+                    repository_id=request.repository_id,
+                    installation_id=request.installation_id,
+                    pull_number=request.review_number,
+                    review_id=review_id,
+                    head_sha=request.head_sha,
+                    event_type="review_failed",
+                    idempotency_key=f"{review_id}:failed",
+                )
+            )
+
+    def resolve_tenant(self, provider: str, installation_id: int) -> str:
+        with self.session_factory() as session:
+            mapping = session.get(InstallationTenantRecord, (provider, installation_id))
+        if mapping is None or not mapping.active:
+            raise PermissionError("GitHub installation is not linked to an active product organization")
+        return mapping.tenant_id
 
     def promote_to_baseline(self, review_id: str, merge_revision: str) -> PromoteBaselineResponse | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
@@ -366,7 +588,7 @@ def _replay_response(attempt: attempts.ReviewAttempt) -> ReviewResponse:
     )
 
 
-def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
+def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> ReviewResponse:
     candidate_by_id = {item.candidate_id: item for item in result.candidates}
     verification_by_id = {item.candidate_id: item for item in result.verifications}
     findings: list[ReviewFinding] = []
@@ -427,14 +649,17 @@ def _response(request: ReviewRequest, result: ReviewResult) -> ReviewResponse:
                     if rich_evidence and (proof_plan or regression_test)
                     else None
                 ),
-                proof_of_concept=None,
+                proof_of_concept=_client_proof_of_concept(
+                    proof_plan,
+                    redact(str(getattr(verification, "proof_of_concept", "")).strip()) or None,
+                ),
                 remediation=redact(verification.remediation.strip()) or None,
                 remediation_invariant=security_invariant,
                 proof_plan=proof_plan,
                 regression_test_expectation=regression_test,
                 category=classification.vulnerability_class,
                 baseline_relationship=classification.relationship.lower(),
-                tenant_id=_tenant_id(request),
+                tenant_id=tenant_id,
                 repository_id=request.repository_id,
                 base_revision=request.base_sha,
                 head_revision=request.head_sha,
@@ -505,12 +730,145 @@ def _tenant_id(request: ReviewRequest) -> str:
     return f"{request.provider}:installation:{request.installation_id}"
 
 
+def _pr_activity_type(action: str | None) -> str | None:
+    if action == "opened":
+        return "pr_opened"
+    if action == "merged":
+        return "pr_merged"
+    if action == "closed":
+        return "pr_closed"
+    if action in {"reopened", "ready_for_review", "synchronize", "edited", "converted_to_draft"}:
+        return "pr_updated"
+    return None
+
+
+def _activity_record(
+    *,
+    tenant_id: str,
+    provider: str,
+    repository_id: int,
+    installation_id: int,
+    event_type: str,
+    idempotency_key: str,
+    pull_number: int | None = None,
+    review_id: str | None = None,
+    head_sha: str | None = None,
+) -> ActivityEventRecord:
+    labels = {
+        "pr_opened": "Pull request opened",
+        "pr_updated": "Pull request updated",
+        "pr_closed": "Pull request closed",
+        "pr_merged": "Pull request merged",
+        "review_queued": "Security review queued",
+        "review_started": "Security review started",
+        "review_completed": "Security review completed",
+        "review_incomplete": "Security review incomplete",
+        "review_superseded": "Security review superseded",
+        "review_failed": "Security review failed",
+        "context_indexed": "Application context indexed",
+    }
+    summary = labels[event_type]
+    if pull_number is not None:
+        summary = f"{summary} for PR #{pull_number}"
+    return ActivityEventRecord(
+        event_id=hashlib.sha256(idempotency_key.encode()).hexdigest()[:32],
+        tenant_id=tenant_id,
+        codebase_id=f"{provider}:repository:{repository_id}",
+        provider=provider,
+        repository_id=repository_id,
+        installation_id=installation_id,
+        pull_number=pull_number,
+        review_id=review_id,
+        head_sha=head_sha,
+        event_type=event_type,
+        summary=summary,
+        metadata_json={},
+        idempotency_key=idempotency_key[:255],
+    )
+
+
+def _record_review_activity(
+    factory: sessionmaker[Session],
+    *,
+    tenant_id: str,
+    request: ReviewRequest,
+    review_id: str,
+    event_type: str,
+    idempotency_key: str,
+) -> None:
+    with factory.begin() as session:
+        session.merge(
+            _activity_record(
+                tenant_id=tenant_id,
+                provider=request.provider,
+                repository_id=request.repository_id,
+                installation_id=request.installation_id,
+                pull_number=request.review_number,
+                review_id=review_id,
+                head_sha=request.head_sha,
+                event_type=event_type,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+
 def _optional_verification_text(verification: object, attribute: str) -> str | None:
     value = getattr(verification, attribute, "")
     if value is None:
         return None
     text = str(value).strip()
     return redact(text) or None if text else None
+
+
+def _client_proof_of_concept(proof_plan: str | None, script: str | None) -> str | None:
+    """Build one display-ready PoC without asking the model to repeat itself."""
+
+    if not script:
+        return None
+    lines = script.strip().splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        lines = lines[1:-1]
+    fenced = "\n".join(lines).strip()
+    steps = f"{proof_plan.strip()}\n\n" if proof_plan and proof_plan.strip() else ""
+    return f"### Steps to Reproduce\n\n{steps}```bash\n{fenced}\n```"
+
+
+_REDUNDANT_STORED_FINDING_KEYS = frozenset({
+    "root_cause",
+    "reproduction",
+    "proof_plan",
+    "security_invariant",
+    "gained_capability",
+})
+
+
+def _compact_json(value: object) -> object:
+    """Remove JSONB noise while preserving meaningful false and zero values."""
+
+    if isinstance(value, dict):
+        compacted: dict[str, object] = {}
+        for key, item in value.items():
+            if item is None:
+                continue
+            compact = _compact_json(item)
+            if compact not in ([], {}):
+                compacted[key] = compact
+        return compacted
+    if isinstance(value, list):
+        return [_compact_json(item) for item in value if item is not None]
+    return value
+
+
+def _stored_finding(finding: ReviewFinding) -> dict[str, object]:
+    """Canonical compact payload persisted in ``scm_review_attempts.findings``."""
+
+    payload = finding.model_dump(mode="json")
+    for key in _REDUNDANT_STORED_FINDING_KEYS:
+        payload.pop(key, None)
+    snippet = payload.get("vulnerable_snippet")
+    if isinstance(snippet, dict) and snippet.get("content") == snippet.get("code"):
+        snippet.pop("content", None)
+    return dict(_compact_json(payload))
 
 
 def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -16,7 +16,7 @@ from plaidnox_scm.api_models import ReviewRequest
 from plaidnox_scm.api_service import ReviewService, _review_id
 from plaidnox_scm.attempts import unit_of_work as attempts_unit_of_work
 from plaidnox_scm.evidence import EvidenceRole
-from plaidnox_scm.models import Base
+from plaidnox_scm.models import ActivityEventRecord, Base, InstallationTenantRecord
 from plaidnox_scm.source_broker import RepositoryMirrorBroker, RepositorySource, SourceBrokerError
 
 
@@ -63,7 +63,46 @@ def _factory():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory.begin() as session:
+        session.add(
+            InstallationTenantRecord(
+                provider="github",
+                installation_id=12345,
+                tenant_id="test-tenant",
+                active=True,
+            )
+        )
+    return factory
+
+
+def test_webhook_delivery_claim_is_authenticated_tenant_scoped_and_idempotent() -> None:
+    factory = _factory()
+    service = ReviewService(RepositoryMirrorBroker(Path("/tmp/plaidnox-test-mirrors")), factory, lambda: None)
+    app = create_app(service, api_token="scanner-token")
+    payload = {
+        "delivery_id": "gh-delivery-123",
+        "provider": "github",
+        "installation_id": 12345,
+        "repository_id": 899377752,
+        "event_name": "pull_request",
+        "action": "synchronize",
+        "pull_number": 7,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    }
+    routes = {getattr(route, "path", "") for route in app.routes}
+    assert "/v1/webhook-deliveries/claim" in routes
+    assert "/v1/webhook-deliveries/{delivery_id}/queued" in routes
+
+    first, tenant_id = service.claim_webhook_delivery(**payload)
+    assert (first, tenant_id) == (True, "test-tenant")
+    assert service.mark_webhook_delivery_queued("gh-delivery-123") is True
+    duplicate, tenant_id = service.claim_webhook_delivery(**payload)
+    assert (duplicate, tenant_id) == (False, "test-tenant")
+
+    conflicting = {**payload, "repository_id": 987654321}
+    with pytest.raises(PermissionError):
+        service.claim_webhook_delivery(**conflicting)
 
 
 def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Path) -> None:
@@ -76,7 +115,8 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
         dependency_calls += 1
         raise AssertionError("docs-only review must not construct AI dependencies")
 
-    service = ReviewService(RepositoryMirrorBroker(tmp_path / "mirrors"), _factory(), dependencies)
+    factory = _factory()
+    service = ReviewService(RepositoryMirrorBroker(tmp_path / "mirrors"), factory, dependencies)
     client = TestClient(create_app(service, api_token="scanner-token"))
 
     unauthorized = client.post("/v1/reviews", json=_request(base, head))
@@ -99,6 +139,9 @@ def test_review_endpoint_matches_bot_contract_and_skips_ai_for_docs(tmp_path: Pa
     }
     assert response.json()["review_id"].startswith("review_")
     assert dependency_calls == 0
+    with factory() as session:
+        event_types = set(session.scalars(select(ActivityEventRecord.event_type)))
+    assert {"review_started", "review_completed"}.issubset(event_types)
 
 
 def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_path: Path) -> None:
@@ -117,7 +160,8 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         remediation="Restore cryptographic JWT verification.",
         security_invariant="Only cryptographically signed claims may authenticate a request.",
         gained_capability="Forge an unsigned session claim.",
-        proof_plan="Send a request with an unsigned JWT and observe it is accepted.",
+        proof_plan="1. Send a request with an unsigned JWT.\n2. Observe that the protected route accepts it.",
+        proof_of_concept="curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"",
         regression_test="Reject any request whose JWT signature does not verify.",
         evidence_gaps=(),
         evidence=(
@@ -192,14 +236,21 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
         "root_cause_start_line": 12,
         "root_cause_end_line": 12,
         "root_cause_changed_in_pr": True,
-        "proof_of_concept": None,
+        "proof_of_concept": (
+            "### Steps to Reproduce\n\n"
+            "1. Send a request with an unsigned JWT.\n"
+            "2. Observe that the protected route accepts it.\n\n"
+            "```bash\n"
+            "curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"\n"
+            "```"
+        ),
         "remediation": "Restore cryptographic JWT verification.",
         "remediation_invariant": "Only cryptographically signed claims may authenticate a request.",
-        "proof_plan": "Send a request with an unsigned JWT and observe it is accepted.",
+        "proof_plan": "1. Send a request with an unsigned JWT.\n2. Observe that the protected route accepts it.",
         "regression_test_expectation": "Reject any request whose JWT signature does not verify.",
         "category": "CWE-347",
         "baseline_relationship": "introduced",
-        "tenant_id": "github:installation:12345",
+        "tenant_id": "test-tenant",
         "repository_id": 899377752,
         "base_revision": base,
         "head_revision": head,
@@ -231,6 +282,53 @@ def test_repository_mirror_broker_requires_exact_requested_revisions(tmp_path: P
 
     with RepositoryMirrorBroker(tmp_path / "mirrors").materialize(request) as source:
         assert source == RepositorySource(mirror.resolve(), base, head)
+
+
+def test_repository_mirror_broker_materializes_trusted_s3_bundle(monkeypatch, tmp_path: Path) -> None:
+    staging = tmp_path / "source"
+    base, head = _repository(staging)
+    bundle = tmp_path / "repo.bundle"
+    _git(staging, "bundle", "create", str(bundle), "--all")
+    bucket = "plaidnox-scm-review-bundles-341860778390-us-east-1"
+    bundle_url = (
+        f"https://{bucket}.s3.us-east-1.amazonaws.com/reviews/12345/899377752/review.bundle"
+        "?X-Amz-Signature=fixture"
+    )
+    request = ReviewRequest.model_validate(
+        {**_request(base, head), "source_bundle_url": bundle_url}
+    )
+    broker = RepositoryMirrorBroker(
+        tmp_path / "unused-mirror",
+        source_bundle_bucket=bucket,
+        source_bundle_region="us-east-1",
+    )
+    monkeypatch.setattr(
+        broker,
+        "_download_source_bundle",
+        lambda _request, destination: shutil.copyfile(bundle, destination),
+    )
+
+    with broker.materialize(request) as source:
+        assert source.base_revision == base
+        assert source.head_revision == head
+        assert _git(source.repo_path, "show", f"{head}:README.md") == "# Fixture\n\nDocumentation."
+
+
+def test_source_bundle_broker_rejects_urls_outside_installation_and_repository_scope(tmp_path: Path) -> None:
+    request = ReviewRequest.model_validate(
+        {
+            **_request("a" * 40, "b" * 40),
+            "source_bundle_url": "https://attacker.example/reviews/12345/899377752/review.bundle",
+        }
+    )
+    broker = RepositoryMirrorBroker(
+        tmp_path / "unused-mirror",
+        source_bundle_bucket="plaidnox-scm-review-bundles-341860778390-us-east-1",
+        source_bundle_region="us-east-1",
+    )
+
+    with pytest.raises(SourceBrokerError, match="outside the configured S3 repository scope"):
+        broker._download_source_bundle(request, tmp_path / "source.bundle")
 
 
 def test_repository_mirror_broker_retries_a_not_yet_synced_mirror(monkeypatch, tmp_path: Path) -> None:

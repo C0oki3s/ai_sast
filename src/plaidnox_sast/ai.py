@@ -62,6 +62,7 @@ from .llm import (
     response_text,
 )
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
+from .model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from .prompts import render_operation
 from .redaction import redact as _redact
 from .redaction import redact_payload
@@ -107,6 +108,7 @@ class DeepHuntResult:
     gate_results: list[dict[str, Any]] = field(default_factory=list)
     evidence_locations: list[dict[str, Any]] = field(default_factory=list)
     proof_plan: str = ""
+    proof_of_concept: str = ""
     regression_test: str = ""
     context_requests: list[dict[str, Any]] = field(default_factory=list)
 
@@ -273,6 +275,10 @@ class PlaidNoxDeepHuntAgent:
             for tier, name in model_runtime["agent_fallback_model_by_tier"].items()
         }
         configured_output_limit = int(model_runtime["agent_default_max_output_tokens"])
+        self.model_output_token_limit_by_model_prefix = {
+            str(prefix): int(limit)
+            for prefix, limit in model_runtime.get("agent_max_output_tokens_by_model_prefix", {}).items()
+        }
         self.max_output_tokens = (
             int(max_output_tokens) if max_output_tokens is not None else configured_output_limit
         )
@@ -882,16 +888,8 @@ class PlaidNoxDeepHuntAgent:
             if incremental
             else full_security_ir
         )
-        manifest = {
-            "codebase": codebase,
-            "revision": revision,
-            "routes": [
-                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_routes
-            ],
-            "symbols": [
-                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_symbols
-            ],
-            "security_ir": [
+        prompt_ir = _bounded_prompt_security_ir(
+            [
                 {
                     "path": item.path,
                     "language": item.language,
@@ -913,6 +911,18 @@ class PlaidNoxDeepHuntAgent:
                 }
                 for item in sampled_files
             ],
+            runtime,
+        )
+        manifest = {
+            "codebase": codebase,
+            "revision": revision,
+            "routes": [
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_routes
+            ],
+            "symbols": [
+                {"name": item.name, "path": item.path, "line": item.line} for item in sampled_symbols
+            ],
+            "security_ir": prompt_ir,
             "business_context": _redact(
                 business_context[: int(runtime["business_context_characters"])]
             ),
@@ -931,10 +941,11 @@ class PlaidNoxDeepHuntAgent:
                     "areas_with_omitted_context": truncated_symbol_areas,
                 },
                 "security_ir_files": {
-                    "included": len(sampled_files),
+                    "included": len(prompt_ir),
                     "total": len(graph.files),
-                    "truncated": len(sampled_files) < len(graph.files),
+                    "truncated": len(prompt_ir) < len(graph.files),
                     "areas_with_omitted_context": truncated_file_areas,
+                    "entries_per_file_limited": True,
                 },
                 "security_surfaces": {
                     key: value
@@ -948,7 +959,7 @@ class PlaidNoxDeepHuntAgent:
             manifest.pop("security_ir", None)
             manifest["changed_source_inventory"] = manifest_inventory
             manifest["analysis_scope_tree"] = manifest_tree
-            manifest["security_ir_slice"] = manifest_ir
+            manifest["security_ir_slice"] = _bounded_prompt_security_ir(manifest_ir, runtime)
             manifest["previous_repository_context"] = _compact_repository_context_value(
                 preparation.previous_repository_context or {},
                 "",
@@ -1014,20 +1025,20 @@ class PlaidNoxDeepHuntAgent:
                 business_context[: int(runtime["business_context_characters"])]
             ),
             context_fabric=context_fabric,
-            actors=[dict(item) for item in payload.get("actors", [])],
-            sensitive_assets=[dict(item) for item in payload.get("sensitive_assets", [])],
-            input_surfaces=[dict(item) for item in payload.get("input_surfaces", [])],
-            trust_boundaries=[dict(item) for item in payload.get("trust_boundaries", [])],
+            actors=_mapping_items(payload.get("actors", [])),
+            sensitive_assets=_mapping_items(payload.get("sensitive_assets", [])),
+            input_surfaces=_mapping_items(payload.get("input_surfaces", [])),
+            trust_boundaries=_mapping_items(payload.get("trust_boundaries", [])),
             security_invariants=[str(item) for item in payload.get("security_invariants", [])],
             coverage_gaps=[str(item) for item in payload.get("coverage_gaps", [])],
-            production_areas=[dict(item) for item in payload.get("production_areas", [])],
-            entry_points=[dict(item) for item in payload.get("entry_points", [])],
-            sensitive_effects=[dict(item) for item in payload.get("sensitive_effects", [])],
-            authentication_paths=[dict(item) for item in payload.get("authentication_paths", [])],
-            authorization_decisions=[dict(item) for item in payload.get("authorization_decisions", [])],
-            indirect_dispatch=[dict(item) for item in payload.get("indirect_dispatch", [])],
-            build_time_variants=[dict(item) for item in payload.get("build_time_variants", [])],
-            coverage_ledger=[dict(item) for item in payload.get("coverage_ledger", [])],
+            production_areas=_mapping_items(payload.get("production_areas", [])),
+            entry_points=_mapping_items(payload.get("entry_points", [])),
+            sensitive_effects=_mapping_items(payload.get("sensitive_effects", [])),
+            authentication_paths=_mapping_items(payload.get("authentication_paths", [])),
+            authorization_decisions=_mapping_items(payload.get("authorization_decisions", [])),
+            indirect_dispatch=_mapping_items(payload.get("indirect_dispatch", [])),
+            build_time_variants=_mapping_items(payload.get("build_time_variants", [])),
+            coverage_ledger=_mapping_items(payload.get("coverage_ledger", [])),
             analysis_scope_paths=sorted(scope_paths) if scope_paths else source_tree,
             annotation_grounding=grounding_summary,
         )
@@ -2428,20 +2439,31 @@ class PlaidNoxDeepHuntAgent:
                 )
             )
         )
+        for model_prefix, output_limit in self.model_output_token_limit_by_model_prefix.items():
+            if model_execution.model_name.startswith(model_prefix):
+                effective_max_output_tokens = min(effective_max_output_tokens, output_limit)
+        text_config: dict[str, Any] = {
+            "format": {
+                "type": "json_schema",
+                "name": name,
+                "strict": getattr(self, "strict_output_schema", True),
+                "schema": schema,
+            }
+        }
+        if supports_text_verbosity(model_execution.model_name):
+            text_config["verbosity"] = "low"
         request_kwargs: dict[str, Any] = {
             "model": model_execution.model_name,
-            "reasoning": {"effort": effort},
             "input": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "text": {
-                "verbosity": "low",
-                "format": {"type": "json_schema", "name": name, "strict": True, "schema": schema},
-            },
+            "text": text_config,
             "timeout": request_policy["timeout_seconds"],
             "max_retries": request_policy["max_retries"],
         }
+        if supports_reasoning_effort(model_execution.model_name):
+            request_kwargs["reasoning"] = {"effort": effort}
         if model_execution.model_name.startswith("gpt-"):
             # Routes requests sharing this stable prefix to the same cache shard.
             request_kwargs["prompt_cache_key"] = (
@@ -2476,6 +2498,7 @@ class PlaidNoxDeepHuntAgent:
         max_output_retries = int(truncation_policy.get("max_retries", 0))
         retry_limits = truncation_policy.get("retry_output_tokens_by_tier", {})
         output_retry_count = 0
+        shape_retry_count = 0
         total_attempts = int(shape_retries) + max_output_retries + 1
         best: Any = None
         for attempt in range(total_attempts):
@@ -2522,14 +2545,22 @@ class PlaidNoxDeepHuntAgent:
             invocation["provider_request_id"] = str(getattr(response, "id", "") or "")[:255]
             if getattr(response, "status", "completed") != "completed":
                 detail = getattr(response, "incomplete_details", None)
-                reason = getattr(detail, "reason", "unknown") if detail else "unknown"
+                reason = getattr(detail, "reason", None) if detail else None
+                if not reason and _response_output_tokens(response) >= effective_max_output_tokens:
+                    # Some LiteLLM provider adapters omit incomplete_details even
+                    # when the provider stopped exactly at max_output_tokens.
+                    reason = "max_output_tokens"
+                reason = str(reason or "unknown")
                 if self.checkpoint is not None:
                     self.checkpoint.fail("llm_response", checkpoint_key, f"incomplete:{reason}")
                 invocation["state"] = "incomplete"
                 invocation["error_type"] = f"incomplete:{reason}"
                 retry_limit = int(retry_limits.get(model_execution.model_tier.value, 0))
+                for model_prefix, output_limit in self.model_output_token_limit_by_model_prefix.items():
+                    if model_execution.model_name.startswith(model_prefix):
+                        retry_limit = min(retry_limit, output_limit)
                 if (
-                    reason == "max_output_tokens"
+                    reason in {"max_output_tokens", "unknown"}
                     and output_retry_count < max_output_retries
                     and retry_limit > effective_max_output_tokens
                 ):
@@ -2546,11 +2577,12 @@ class PlaidNoxDeepHuntAgent:
                             checkpoint_execution,
                         )
                     self._emit(
-                        "model_output_truncation_retry",
+                        "model_incomplete_response_retry",
                         operation=prompt_operation,
                         model_tier=model_execution.model_tier.value,
                         retry=output_retry_count,
                         max_output_tokens=retry_limit,
+                        incomplete_reason=reason,
                     )
                     continue
                 raise AIResponseError(f"AI request was incomplete: {reason}")
@@ -2575,6 +2607,10 @@ class PlaidNoxDeepHuntAgent:
                 attempt=attempt + 1,
                 decodable=payload is not None,
             )
+            if shape_retry_count < shape_retries:
+                shape_retry_count += 1
+                continue
+            break
         # Out of retries: hand callers the closest reshaped answer (or the raw
         # one when nothing decoded) so their own schema check raises the
         # stage-specific AIResponseError.
@@ -2637,6 +2673,25 @@ def _checkpoint_work_identity(operation: str, payload: Mapping[str, Any]) -> str
         if payload.get(key) is not None
     }
     return unit_key(operation, stable_candidate) if stable_candidate else ""
+
+
+def _response_output_tokens(response: Any) -> int:
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, Mapping):
+        value = usage.get("output_tokens", 0)
+    else:
+        value = getattr(usage, "output_tokens", 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mapping_items(value: Any) -> list[dict[str, Any]]:
+    """Keep object records from model output and ignore malformed scalar items."""
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
 
 
 def _model_request_policy(runtime: Mapping[str, Any], operation: str) -> dict[str, int | float]:
@@ -2817,7 +2872,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             business_impact=str(payload["business_impact"]),
             classification_references=[
                 {str(key): str(value) for key, value in item.items()}
-                for item in payload["classification_references"]
+                for item in payload.get("classification_references", [])
             ],
             falsification_attempts=[str(item) for item in payload["falsification_attempts"]],
             required_preconditions=[str(item) for item in payload["required_preconditions"]],
@@ -2828,6 +2883,7 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             gate_results=[dict(item) for item in payload["gate_results"]],
             evidence_locations=[dict(item) for item in payload["evidence_locations"]],
             proof_plan=str(payload["proof_plan"]),
+            proof_of_concept=str(payload["proof_of_concept"]),
             regression_test=str(payload["regression_test"]),
             context_requests=[dict(item) for item in payload["context_requests"]],
         )
@@ -3943,6 +3999,44 @@ def _repository_security_ir(
         }
         for item in graph.files[: int(runtime["repository_ir_file_limit"])]
     ]
+
+
+def _bounded_prompt_security_ir(
+    items: list[dict[str, Any]], runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Keep structural navigation broad while bounding the model request payload."""
+    file_limit = int(runtime["repository_prompt_ir_file_limit"])
+    entry_limit = int(runtime["repository_prompt_ir_entries_per_list"])
+    character_limit = int(runtime["repository_prompt_ir_characters"])
+    if min(file_limit, entry_limit, character_limit) < 1:
+        raise ValueError("repository prompt IR limits must be positive")
+
+    sampled, _ = _balanced_area_sample(items, file_limit, lambda item: str(item["path"]))
+    selected: list[dict[str, Any]] = []
+    used = 2  # JSON list brackets
+    for item in sampled:
+        compact: dict[str, Any] = {
+            "path": str(item["path"])[:512],
+            "language": str(item.get("language", ""))[:80],
+        }
+        for field_name in ("symbols", "imports", "calls", "references"):
+            values = item.get(field_name, [])
+            if not isinstance(values, list):
+                continue
+            compact[field_name] = [
+                {str(key): str(value)[:200] if isinstance(value, str) else value
+                 for key, value in entry.items()}
+                if isinstance(entry, dict) else str(entry)[:200]
+                for entry in values[:entry_limit]
+            ]
+            if len(values) > entry_limit:
+                compact[f"omitted_{field_name}"] = len(values) - entry_limit
+        size = len(json.dumps(compact)) + (2 if selected else 0)
+        if used + size > character_limit:
+            continue
+        selected.append(compact)
+        used += size
+    return selected
 
 
 def _analysis_scope_paths(

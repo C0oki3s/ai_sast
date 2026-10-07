@@ -8,14 +8,20 @@ broker or mirror service and never calls a provider API directly.
 from __future__ import annotations
 
 import time
+import subprocess
+import tempfile
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .api_models import ReviewRequest
 from .snapshots import SnapshotError, resolve_revision
+
+MAX_SOURCE_BUNDLE_BYTES = 8 * 1024**3
 
 
 class SourceBrokerError(RuntimeError):
@@ -48,18 +54,74 @@ class RepositoryMirrorBroker:
         *,
         sync_retry_attempts: int = 1,
         sync_retry_interval_seconds: float = 1.0,
+        source_bundle_bucket: str | None = None,
+        source_bundle_region: str = "us-east-1",
     ) -> None:
         self._root = root.resolve()
         self._sync_retry_attempts = max(1, sync_retry_attempts)
         self._sync_retry_interval_seconds = sync_retry_interval_seconds
+        self._source_bundle_bucket = source_bundle_bucket
+        self._source_bundle_region = source_bundle_region
 
     @contextmanager
     def materialize(self, request: ReviewRequest) -> Iterator[RepositorySource]:
+        if request.source_bundle_url:
+            with tempfile.TemporaryDirectory(prefix="plaidnox-scm-source-") as directory:
+                repo_path = Path(directory) / "repository.git"
+                bundle_path = Path(directory) / "source.bundle"
+                self._download_source_bundle(request, bundle_path)
+                try:
+                    subprocess.run(
+                        ["git", "clone", "--bare", str(bundle_path), str(repo_path)],
+                        check=True, capture_output=True, timeout=900,
+                    )
+                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                    raise SourceBrokerError("Uploaded source bundle could not be materialized") from exc
+                base_revision, head_revision = self._resolve_with_retry(repo_path, request)
+                yield RepositorySource(repo_path, base_revision, head_revision)
+            return
+
         repository = (self._root / request.provider / str(request.repository_id)).resolve()
         if self._root not in repository.parents:
             raise SourceBrokerError("Repository mirror path escapes the configured root")
         base_revision, head_revision = self._resolve_with_retry(repository, request)
         yield RepositorySource(repository, base_revision, head_revision)
+
+    def _download_source_bundle(self, request: ReviewRequest, destination: Path) -> None:
+        if not self._source_bundle_bucket:
+            raise SourceBrokerError("Uploaded source bundles are not configured on the SCM API")
+        parsed = urlsplit(request.source_bundle_url or "")
+        expected_hosts = {
+            f"{self._source_bundle_bucket}.s3.{self._source_bundle_region}.amazonaws.com",
+            f"{self._source_bundle_bucket}.s3.amazonaws.com",
+        }
+        expected_prefix = f"/reviews/{request.installation_id}/{request.repository_id}/"
+        if (
+            parsed.scheme != "https" or parsed.netloc not in expected_hosts
+            or not parsed.path.startswith(expected_prefix) or parsed.username or parsed.password
+        ):
+            raise SourceBrokerError("Source bundle URL is outside the configured S3 repository scope")
+
+        class _NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = build_opener(_NoRedirect)
+        try:
+            with opener.open(Request(request.source_bundle_url), timeout=300) as response, destination.open("wb") as output:
+                declared_size = int(response.headers.get("Content-Length", "0") or 0)
+                if declared_size > MAX_SOURCE_BUNDLE_BYTES:
+                    raise SourceBrokerError("Source bundle exceeds the configured size limit")
+                copied = 0
+                while chunk := response.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > MAX_SOURCE_BUNDLE_BYTES:
+                        raise SourceBrokerError("Source bundle exceeds the configured size limit")
+                    output.write(chunk)
+        except SourceBrokerError:
+            raise
+        except Exception as exc:
+            raise SourceBrokerError("Uploaded source bundle could not be downloaded") from exc
 
     def _resolve_with_retry(self, repository: Path, request: ReviewRequest) -> tuple[str, str]:
         """Tolerates a race between webhook delivery and out-of-band mirror sync.

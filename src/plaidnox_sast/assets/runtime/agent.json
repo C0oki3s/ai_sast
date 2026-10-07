@@ -18,9 +18,12 @@
   "context_expansion_max_rounds": 2,
   "context_expansion_max_requests_per_round": 5,
   "repository_entrypoint_limit": 100,
-  "repository_route_limit": 1000,
-  "repository_symbol_limit": 5000,
+  "repository_route_limit": 200,
+  "repository_symbol_limit": 500,
   "repository_ir_file_limit": 2000,
+  "repository_prompt_ir_file_limit": 100,
+  "repository_prompt_ir_entries_per_list": 24,
+  "repository_prompt_ir_characters": 120000,
   "security_context_characters": 12000,
   "business_context_characters": 12000,
   "knowledge_result_limit": 50,
@@ -91,7 +94,7 @@
     }
   },
   "model_output_token_limit_by_operation": {
-    "repository_context": 18000,
+    "repository_context": 30000,
     "hunt_plan": 16000,
     "finding_consolidation": 12000,
     "finding_group_narratives": 12000,
@@ -154,7 +157,7 @@
   "model_output_token_limit_by_operation_by_tier": {
     "security_review": {
       "standard": 8000,
-      "deep": 12000
+      "deep": 30000
     },
     "capability_chain": {
       "standard": 10000,
@@ -162,11 +165,18 @@
     }
   },
   "output_truncation_retry_by_operation": {
+    "repository_context": {
+      "max_retries": 1,
+      "retry_output_tokens_by_tier": {
+        "standard": 40000,
+        "deep": 48000
+      }
+    },
     "security_review": {
       "max_retries": 1,
       "retry_output_tokens_by_tier": {
         "standard": 10000,
-        "deep": 14000
+        "deep": 50000
       }
     },
     "capability_chain": {

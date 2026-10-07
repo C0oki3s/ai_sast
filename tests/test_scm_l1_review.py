@@ -7,12 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from plaidnox_scm.change_relevance import classify
 from plaidnox_scm.context_store import ApplicationContext
 from plaidnox_scm.diffing import compute_diff
-from plaidnox_scm.l1_review import L1ReviewError, LiteLLMChangedFileReviewer
+from plaidnox_scm.l1_review import LiteLLMChangedFileReviewer
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -110,19 +108,89 @@ def test_l1_review_uses_changed_file_context_and_returns_lean_candidate(tmp_path
     assert result.candidates[0].suspected_broken_invariant.startswith("Only authentic")
     assert result.candidates[0].requested_expansion[0].kind == "route"
     request = client.responses.calls[0]
+    assert request["model"] == "glm-5.3-flash"
     assert request["text"]["format"]["type"] == "json_schema"
+    assert "reasoning" not in request
+    assert "verbosity" not in request["text"]
+    assert request["max_output_tokens"] == 12000
     candidate_fields = {item.name for item in fields(result.candidates[0])}
     assert not {"severity", "cwe", "remediation", "merge_action"}.intersection(candidate_fields)
 
 
-def test_l1_review_rejects_candidate_not_anchored_to_changed_lines(tmp_path: Path) -> None:
+def test_l1_review_uses_explicit_scm_model_and_cache_key(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+    client = _Client(_payload())
+
+    LiteLLMChangedFileReviewer(client, model="gpt-5.4").review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert client.responses.calls[0]["model"] == "gpt-5.4"
+    assert client.responses.calls[0]["prompt_cache_key"] == "plaidnox-scm:changed_file_review"
+    assert client.responses.calls[0]["text"]["format"]["strict"] is False
+    assert client.responses.calls[0]["reasoning"] == {"effort": "medium"}
+    assert client.responses.calls[0]["text"]["verbosity"] == "medium"
+
+
+def test_l1_review_accepts_omitted_empty_candidate_annotations(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    payload = _payload()
+    candidate = payload["candidates"][0]
+    for field in ("context_facts_used", "context_gaps", "requested_expansion"):
+        candidate.pop(field)
+    diff = compute_diff(repo, base, head)
+
+    result = LiteLLMChangedFileReviewer(_Client(payload)).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.candidates[0].context_facts_used == ()
+    assert result.candidates[0].context_gaps == ()
+    assert result.candidates[0].requested_expansion == ()
+
+
+def test_l1_review_marks_unanchored_candidate_as_incomplete(tmp_path: Path) -> None:
     repo, base, head = _repo(tmp_path)
     diff = compute_diff(repo, base, head)
 
-    with pytest.raises(L1ReviewError, match="changed line range"):
-        LiteLLMChangedFileReviewer(_Client(_payload(start_line=99))).review(
-            repo, diff, classify(diff), _context(base)
-        )
+    result = LiteLLMChangedFileReviewer(_Client(_payload(start_line=99))).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.candidates == ()
+    assert result.coverage_complete is False
+    assert "invalid candidate" in result.coverage_gaps[0]
+
+
+def test_l1_review_marks_missing_coverage_status_as_incomplete(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+    payload = _payload()
+    del payload["coverage_complete"]
+
+    result = LiteLLMChangedFileReviewer(_Client(payload)).review(
+        repo, diff, classify(diff), _context(base)
+    )
+
+    assert result.coverage_complete is False
+    assert "omitted coverage status" in result.coverage_gaps[0]
+
+
+def test_l1_review_marks_provider_failure_as_incomplete(tmp_path: Path) -> None:
+    repo, base, head = _repo(tmp_path)
+    diff = compute_diff(repo, base, head)
+
+    def fail(**_kwargs):
+        raise RuntimeError("gateway unavailable")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=fail))
+    result = LiteLLMChangedFileReviewer(client).review(repo, diff, classify(diff), _context(base))
+
+    assert result.model_calls == 1
+    assert result.candidates == ()
+    assert result.coverage_complete is False
+    assert result.coverage_gaps == ("Model request failed for middleware.js (RuntimeError)",)
 
 
 def test_l1_review_skips_docs_in_mixed_pr_and_scopes_relevance_to_runtime_file(

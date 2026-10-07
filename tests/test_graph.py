@@ -1,4 +1,5 @@
 import pytest
+import plaidnox_sast.graph as graph_module
 
 from plaidnox_sast.graph import (
     RipgrepDiscovery,
@@ -14,6 +15,16 @@ def test_structural_graph_uses_tree_sitter_without_baked_in_searches(sample_repo
     assert graph.tree_sitter_files >= 1
     assert graph.rg_queries == 0
     assert [route.name for route in graph.routes] == ["POST /signin"]
+
+
+def test_structural_graph_falls_back_for_unsupported_parser(tmp_path, monkeypatch):
+    (tmp_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    monkeypatch.setattr(graph_module, "_language_for", lambda *_: "text")
+
+    graph = build_structural_graph(tmp_path)
+
+    assert [file.path for file in graph.files] == ["app.py"]
+    assert graph.fallback_files == 1
 
 
 def test_structural_graph_returns_changed_attack_surface(sample_repo):

@@ -13,8 +13,11 @@ from plaidnox_sast.ai import (
     HuntPlan,
     HuntTask,
     PlaidNoxDeepHuntAgent,
+    _bounded_prompt_security_ir,
     _execute_recon_search_plan,
     _ground_repository_annotations,
+    _deep_hunt_result_from_response,
+    _mapping_items,
     _resolve_context_request,
     _security_workset_review_units,
     _search_segments,
@@ -29,6 +32,40 @@ from plaidnox_sast.models import (
     ModelTier,
     Severity,
 )
+
+
+def test_prompt_security_ir_is_bounded_and_balanced_across_areas():
+    items = [
+        {"path": path, "language": "python", "symbols": [{"name": "x" * 1000}] * 40}
+        for path in ("api/a.py", "api/b.py", "web/a.py")
+    ]
+    runtime = {
+        "repository_prompt_ir_file_limit": 2,
+        "repository_prompt_ir_entries_per_list": 2,
+        "repository_prompt_ir_characters": 1500,
+    }
+
+    selected = _bounded_prompt_security_ir(items, runtime)
+
+    assert [item["path"] for item in selected] == ["api/a.py", "web/a.py"]
+    assert all(item["omitted_symbols"] == 38 for item in selected)
+    assert len(json.dumps(selected)) <= 1500
+
+
+def test_mapping_items_ignores_malformed_scalar_annotations():
+    assert _mapping_items([{"name": "valid"}, "x", 3, None]) == [{"name": "valid"}]
+    assert _mapping_items("not-a-list") == []
+
+
+def test_deep_hunt_response_accepts_omitted_classification_references():
+    payload = review_payload()
+    del payload["classification_references"]
+
+    result = _deep_hunt_result_from_response(FakeResponse(payload))
+
+    assert result.classification_references == []
+    assert result.supported is True
+    assert result.proof_of_concept.startswith("TARGET_URL=")
 
 
 def review_payload(**overrides):
@@ -74,6 +111,7 @@ def review_payload(**overrides):
                 {"path": "app.js", "start_line": 2, "end_line": 4, "role": "propagation"}
             ],
             "proof_plan": "Submit controlled content and observe the renderer request boundary.",
+            "proof_of_concept": "TARGET_URL=${TARGET_URL:?set TARGET_URL}\\ncurl -fsS \"$TARGET_URL/report?url=https://example.invalid/marker\"",
             "regression_test": "Assert remote resources are rejected for attacker-controlled report content.",
             "context_requests": [],
         }
@@ -602,7 +640,7 @@ def test_ai_review_routes_to_the_model_configured_for_the_model_tier(sample_repo
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.DEEP)
     assert client.responses.kwargs["model"] == agent.model_by_tier["deep"]
     assert client.responses.kwargs["model"] != "test-model"
-    assert client.responses.kwargs["max_output_tokens"] == 12000
+    assert client.responses.kwargs["max_output_tokens"] == 30000
     assert client.responses.kwargs["reasoning"]["effort"] == "high"
 
     agent.review(sample_repo, deep_candidate(), finding(), model_tier=ModelTier.FAST)
@@ -643,11 +681,105 @@ def test_security_review_retries_max_output_truncation_once_with_larger_budget(s
 
     client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
     agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
 
     result = agent.review(sample_repo, deep_candidate(), finding())
 
     assert result.supported is True
     assert [request["max_output_tokens"] for request in requests] == [8000, 10000]
+
+
+def test_repository_context_retries_when_gateway_omits_truncation_reason():
+    requests = []
+    responses = [
+        type(
+            "IncompleteResponse",
+            (),
+            {
+                "status": "incomplete",
+                "incomplete_details": None,
+                "output_text": "",
+                "usage": {"output_tokens": 30000},
+            },
+        )(),
+        FakeResponse({"ok": True}),
+    ]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    result = agent._structured_response(
+        "repository_context_fixture",
+        schema,
+        "repository_context",
+        {},
+        model_tier=ModelTier.DEEP,
+    )
+
+    assert json.loads(result.output_text) == {"ok": True}
+    assert [request["max_output_tokens"] for request in requests] == [30000, 48000]
+
+
+def test_security_review_retries_unknown_incomplete_reason_once():
+    requests = []
+    responses = [
+        type("IncompleteResponse", (), {
+            "status": "incomplete", "incomplete_details": None,
+            "output_text": "", "usage": {},
+        })(),
+        FakeResponse({"ok": True}),
+    ]
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    agent.model_output_token_limit_by_model_prefix = {}
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+    result = agent._structured_response(
+        "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
+    )
+
+    assert json.loads(result.output_text) == {"ok": True}
+    assert [request["max_output_tokens"] for request in requests] == [30000, 50000]
+
+
+def test_gpt_deep_review_uses_its_configured_output_retry_budget():
+    requests = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return type("IncompleteResponse", (), {
+            "status": "incomplete",
+            "incomplete_details": type("Details", (), {"reason": "max_output_tokens"})(),
+            "output_text": "",
+            "usage": {},
+        })()
+
+    client = type("C", (), {"responses": type("R", (), {"create": staticmethod(create)})()})()
+    agent = PlaidNoxDeepHuntAgent(client)
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+    with pytest.raises(AIResponseError, match="incomplete"):
+        agent._structured_response(
+            "security_review_fixture", schema, "security_review", {}, model_tier=ModelTier.DEEP,
+        )
+
+    assert [request["max_output_tokens"] for request in requests] == [30000, 50000]
 
 
 def test_ai_review_redacts_secrets_from_every_payload_field_not_only_source(sample_repo):
@@ -1208,9 +1340,7 @@ app.get("/users/:id", async (req, res) => {
         "security_surface_inventory"
     ]["total"]
     assert "security_surfaces" in recon_manifest["repository_context_coverage"]
-    assert client.responses.requests[1]["max_output_tokens"] == load_json("runtime/agent.json")[
-        "model_output_token_limit_by_operation"
-    ]["repository_context"]
+    assert client.responses.requests[1]["max_output_tokens"] == 30000
     assert client.responses.requests[2]["text"]["format"]["name"] == "plaidnox_search_query_plan"
     assert client.responses.requests[3]["text"]["format"]["name"] == "plaidnox_vulnerability_discovery"
     discovery_payload = json.loads(client.responses.requests[3]["input"][1]["content"])
@@ -1824,6 +1954,37 @@ def test_structured_response_uses_the_reasoning_effort_configured_for_the_operat
         "reasoning_effort_by_operation_by_tier"
     ]["security_review"]["standard"]
     assert client.responses.kwargs["reasoning"]["effort"] == expected
+
+
+def test_structured_response_omits_unsupported_gpt4_reasoning_and_verbosity(sample_repo):
+    client = FakeClient(review_payload())
+    agent = PlaidNoxDeepHuntAgent(client, model="gpt-4o")
+    agent.model_by_tier["standard"] = "gpt-4o"
+    agent.model_execution_router.fallback_by_tier[ModelTier.STANDARD] = "gpt-4o"
+
+    agent.review(sample_repo, deep_candidate(), finding())
+
+    assert client.responses.kwargs["model"] == "gpt-4o"
+    assert "reasoning" not in client.responses.kwargs
+    assert "verbosity" not in client.responses.kwargs["text"]
+    assert client.responses.kwargs["text"]["format"]["type"] == "json_schema"
+
+
+def test_repository_context_uses_the_configured_gpt_budget(sample_repo):
+    from plaidnox_sast.assets import load_json
+
+    client = FakeClient(review_payload())
+    agent = PlaidNoxDeepHuntAgent(client, model="bedrock-nova-pro")
+
+    agent._structured_response(
+        "plaidnox_repository_context",
+        load_json("schemas/repository_context.json"),
+        "repository_context",
+        {"source_tree": ["app.py"]},
+    )
+
+    assert client.responses.kwargs["model"] == "gpt-5.4-mini"
+    assert client.responses.kwargs["max_output_tokens"] == 30000
 
 
 def test_fast_search_plan_uses_bounded_transport_policy_and_emits_timing(sample_repo):

@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
-from plaidnox_sast.assets import load_json as load_sast_json
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
 from plaidnox_sast.llm import response_json
+from plaidnox_sast.model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from plaidnox_sast.redaction import redact_payload
 
 from .assets import load_json
@@ -81,8 +81,9 @@ class ChangedFileReviewer(Protocol):
 class LiteLLMChangedFileReviewer:
     """One structured LiteLLM review call per changed runtime/configuration file."""
 
-    def __init__(self, client: ResponsesClient) -> None:
+    def __init__(self, client: ResponsesClient, model: str | None = None) -> None:
         self._client = client
+        self._model = model
 
     def review(
         self,
@@ -94,7 +95,7 @@ class LiteLLMChangedFileReviewer:
         runtime = load_json("runtime/review.json")
         schema = load_json("schemas/changed_file_review.json")
         model_tier = str(runtime["l1_model_tier"])
-        model = str(load_sast_json("runtime/models.json")["agent_model_by_tier"][model_tier])
+        model = self._model or str(runtime["models"][model_tier])
         candidates: list[L1Candidate] = []
         reviewed_paths: list[str] = []
         coverage_gaps: list[str] = []
@@ -120,27 +121,43 @@ class LiteLLMChangedFileReviewer:
                     int(runtime["maximum_application_context_characters"]),
                 )
                 system_prompt, user_prompt = render_operation("changed_file_review", redact_payload(payload))
-                response = self._client.responses.create(
-                    model=model,
-                    reasoning={"effort": str(runtime["l1_reasoning_effort"])},
-                    input=[
+                model_calls += 1
+                text_config: dict[str, Any] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "plaidnox_scm_changed_file_review",
+                        "strict": not model.startswith("gpt-"),
+                        "schema": schema,
+                    }
+                }
+                if supports_text_verbosity(model):
+                    text_config["verbosity"] = "medium"
+                request: dict[str, Any] = {
+                    "model": model,
+                    "input": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    text={
-                        "verbosity": "low",
-                        "format": {
-                            "type": "json_schema",
-                            "name": "plaidnox_scm_changed_file_review",
-                            "strict": True,
-                            "schema": schema,
-                        },
-                    },
-                    max_output_tokens=int(runtime["l1_max_output_tokens"]),
-                )
-                model_calls += 1
+                    "text": text_config,
+                    "max_output_tokens": int(runtime["l1_max_output_tokens"]),
+                    "prompt_cache_key": "plaidnox-scm:changed_file_review",
+                }
+                if supports_reasoning_effort(model):
+                    request["reasoning"] = {"effort": str(runtime["l1_reasoning_effort"])}
+                try:
+                    response = self._client.responses.create(**request)
+                except Exception as exc:
+                    # A provider or gateway error means this file was not reviewed.
+                    # Keep the PR check incomplete instead of returning HTTP 500.
+                    coverage_complete = False
+                    coverage_gaps.append(
+                        f"Model request failed for {changed_file.path} ({type(exc).__name__})"
+                    )
+                    continue
                 if getattr(response, "status", "completed") != "completed":
-                    raise L1ReviewError(f"L1 review was incomplete for {changed_file.path}")
+                    coverage_complete = False
+                    coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")
+                    continue
                 result = _parse_response(response, changed_file)
                 candidates.extend(result[0])
                 coverage_complete = coverage_complete and result[1]
@@ -219,39 +236,62 @@ def _parse_response(
 ) -> tuple[list[L1Candidate], bool, list[str]]:
     try:
         payload = response_json(response)
-        raw_candidates = list(payload["candidates"])
-        coverage_complete = bool(payload["coverage_complete"])
-        coverage_gaps = [str(item) for item in payload["coverage_gaps"]]
-    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise L1ReviewError(f"L1 response did not match the schema for {changed_file.path}") from exc
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return [], False, [f"Model returned invalid structured output for {changed_file.path}"]
+    if not isinstance(payload, Mapping):
+        return [], False, [f"Model returned invalid structured output for {changed_file.path}"]
+
+    coverage_complete = payload.get("coverage_complete") is True
+    raw_gaps = payload.get("coverage_gaps", [])
+    coverage_gaps = [str(item) for item in raw_gaps] if isinstance(raw_gaps, list) else []
+    if "coverage_complete" not in payload:
+        coverage_gaps.append(f"Model omitted coverage status for {changed_file.path}")
+    if not isinstance(raw_gaps, list):
+        coverage_complete = False
+        coverage_gaps.append(f"Model returned invalid coverage gaps for {changed_file.path}")
+    raw_candidates = payload.get("candidates", [])
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+        coverage_complete = False
+        coverage_gaps.append(f"Model returned invalid candidates for {changed_file.path}")
+    if "candidates" not in payload:
+        coverage_complete = False
+        coverage_gaps.append(f"Model omitted candidates for {changed_file.path}")
 
     candidates: list[L1Candidate] = []
     for item in raw_candidates:
-        if str(item["changed_path"]) != changed_file.path:
-            raise L1ReviewError("L1 candidate path was not the file under review")
-        start = int(item["changed_lines"]["start"])
-        end = int(item["changed_lines"]["end"])
-        if end < start or not _intersects_changed_lines(changed_file, start, end):
-            raise L1ReviewError("L1 candidate was not anchored to a changed line range")
-        candidates.append(
-            L1Candidate(
-                candidate_id=str(item["candidate_id"]),
-                changed_path=changed_file.path,
-                changed_symbol=str(item["changed_symbol"]),
-                changed_lines=ChangedLines(start, end),
-                behavior_before=str(item["behavior_before"]),
-                behavior_after=str(item["behavior_after"]),
-                security_role=str(item["security_role"]),
-                suspected_broken_invariant=str(item["suspected_broken_invariant"]),
-                provisional_attacker_capability=str(item["provisional_attacker_capability"]),
-                context_facts_used=tuple(str(value) for value in item["context_facts_used"]),
-                context_gaps=tuple(str(value) for value in item["context_gaps"]),
-                requested_expansion=tuple(
-                    ExpansionRequest(str(value["kind"]), str(value["target"]), str(value["reason"]))
-                    for value in item["requested_expansion"]
-                ),
+        try:
+            if str(item["changed_path"]) != changed_file.path:
+                raise L1ReviewError("L1 candidate path was not the file under review")
+            start = int(item["changed_lines"]["start"])
+            end = int(item["changed_lines"]["end"])
+            if end < start or not _intersects_changed_lines(changed_file, start, end):
+                raise L1ReviewError("L1 candidate was not anchored to a changed line range")
+            # LiteLLM providers can omit empty arrays despite the requested JSON schema.
+            # These are annotations; absence must not turn an otherwise valid candidate
+            # into a server error or fabricate security evidence.
+            candidates.append(
+                L1Candidate(
+                    candidate_id=str(item["candidate_id"]),
+                    changed_path=changed_file.path,
+                    changed_symbol=str(item["changed_symbol"]),
+                    changed_lines=ChangedLines(start, end),
+                    behavior_before=str(item["behavior_before"]),
+                    behavior_after=str(item["behavior_after"]),
+                    security_role=str(item["security_role"]),
+                    suspected_broken_invariant=str(item["suspected_broken_invariant"]),
+                    provisional_attacker_capability=str(item["provisional_attacker_capability"]),
+                    context_facts_used=tuple(str(value) for value in item.get("context_facts_used", [])),
+                    context_gaps=tuple(str(value) for value in item.get("context_gaps", [])),
+                    requested_expansion=tuple(
+                        ExpansionRequest(str(value["kind"]), str(value["target"]), str(value["reason"]))
+                        for value in item.get("requested_expansion", [])
+                    ),
+                )
             )
-        )
+        except (AttributeError, KeyError, TypeError, ValueError, L1ReviewError):
+            coverage_complete = False
+            coverage_gaps.append(f"Model returned an invalid candidate for {changed_file.path}")
     return candidates, coverage_complete, coverage_gaps
 
 

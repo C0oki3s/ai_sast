@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from .assets import load_json
 from .models import Candidate, CandidateEvidencePacket
+import itertools
 
 
 def _normalize(value: str) -> str:
@@ -112,7 +113,7 @@ def root_equivalence_key(candidate: Candidate) -> str:
         return ""
     if effect == "unresolved" or capability == "unresolved":
         return ""
-    return "|".join((path, symbol, effect, capability))
+    return f"{path}|{symbol}|{effect}|{capability}"
 
 
 def _same_candidate_or_cluster(first: Candidate, second: Candidate, nearby_lines: int = _NEARBY_LINES) -> bool:
@@ -193,7 +194,7 @@ def candidate_evidence_packet(candidate: Candidate) -> CandidateEvidencePacket:
     graph_path = [str(item) for item in candidate.evidence.graph_path if str(item)]
     trace_edges = [
         {"source": source, "target": target}
-        for source, target in zip(graph_path, graph_path[1:], strict=False)
+        for source, target in itertools.pairwise(graph_path)
     ]
     supporting = [
         dict(item)

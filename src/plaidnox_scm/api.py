@@ -8,14 +8,17 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 
 from .api_models import (
+    InstallationStatusUpdate,
     PromoteBaselineRequest,
     PromoteBaselineResponse,
     ReviewAttemptStatus,
     ReviewRequest,
     ReviewResponse,
+    ReviewSupersededRequest,
     TriageRequest,
     TriageResponse,
     TriageStatus,
+    WebhookDeliveryClaim,
 )
 from .api_service import ReviewNotCompletedError, ReviewService
 from .attempts import ReviewAttemptConflictError, ReviewAttemptExhaustedError
@@ -42,6 +45,64 @@ def create_app(service: ReviewService, *, api_token: str) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.post("/v1/webhook-deliveries/claim", dependencies=[Depends(authenticate)])
+    async def claim_webhook_delivery(request: WebhookDeliveryClaim) -> dict[str, object]:
+        try:
+            accepted, tenant_id = await run_in_threadpool(
+                service.claim_webhook_delivery,
+                delivery_id=request.delivery_id,
+                provider=request.provider,
+                installation_id=request.installation_id,
+                repository_id=request.repository_id,
+                event_name=request.event_name,
+                action=request.action,
+                pull_number=request.pull_number,
+                head_sha=request.head_sha,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        return {"accepted": accepted, "tenant_id": tenant_id}
+
+    @app.post("/v1/webhook-deliveries/{delivery_id}/queued", dependencies=[Depends(authenticate)])
+    async def mark_webhook_delivery_queued(delivery_id: str) -> dict[str, bool]:
+        queued = await run_in_threadpool(service.mark_webhook_delivery_queued, delivery_id)
+        if not queued:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown delivery_id")
+        return {"queued": True}
+
+    @app.post("/v1/installations/status", dependencies=[Depends(authenticate)])
+    async def update_installation_status(request: InstallationStatusUpdate) -> dict[str, bool]:
+        updated = await run_in_threadpool(
+            service.update_installation_status,
+            provider=request.provider,
+            installation_id=request.installation_id,
+            active=request.active,
+        )
+        if not updated:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown installation mapping")
+        return {"updated": True}
+
+    @app.post("/v1/reviews/superseded", dependencies=[Depends(authenticate)])
+    async def record_review_superseded(request: ReviewSupersededRequest) -> dict[str, bool]:
+        await run_in_threadpool(
+            service.record_review_superseded,
+            provider=request.provider,
+            installation_id=request.installation_id,
+            repository_id=request.repository_id,
+            review_number=request.review_number,
+            review_id=request.review_id,
+            head_sha=request.head_sha,
+        )
+        return {"recorded": True}
+
+    @app.post("/v1/reviews/failed", dependencies=[Depends(authenticate)])
+    async def record_review_failed(request: ReviewRequest) -> dict[str, bool]:
+        try:
+            await run_in_threadpool(service.record_review_failed, request)
+        except PermissionError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        return {"recorded": True}
+
     @app.post(
         "/v1/reviews",
         response_model=ReviewResponse,
@@ -50,6 +111,8 @@ def create_app(service: ReviewService, *, api_token: str) -> FastAPI:
     async def review(request: ReviewRequest) -> ReviewResponse:
         try:
             return await run_in_threadpool(service.run, request)
+        except PermissionError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except SourceBrokerError as exc:
             raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(exc)) from exc
         except (ReviewAttemptConflictError, ReviewAttemptExhaustedError) as exc:
