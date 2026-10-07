@@ -638,18 +638,22 @@ class ReviewService:
                 findings=[_stored_finding(finding) for finding in response.findings],
             )
             if completed:
-                fix_triage = triage.FindingTriageRepository(session, tenant_id)
-                _apply_fix_validations(fix_triage, review_id, result)
-                _apply_occurrences(
-                    occurrences.FindingOccurrenceRepository(session, tenant_id),
-                    fix_triage,
-                    codebase_id,
-                    request,
-                    review_id,
-                    response,
-                    result,
-                    run_started_at,
-                )
+                finding_statuses = occurrences.FindingOccurrenceRepository(session, tenant_id)
+                # A close or merge can commit while verification runs. Lock and check its
+                # state before *any* triage writes; the lock stays held through commit.
+                if finding_statuses.review_is_open(codebase_id, request.review_number):
+                    fix_triage = triage.FindingTriageRepository(session, tenant_id)
+                    _apply_fix_validations(fix_triage, review_id, result)
+                    _apply_occurrences(
+                        finding_statuses,
+                        fix_triage,
+                        codebase_id,
+                        request,
+                        review_id,
+                        response,
+                        result,
+                        run_started_at,
+                    )
         return completed
 
     def _record_fix_validations(self, tenant_id: str, review_id: str, result: ReviewResult) -> None:

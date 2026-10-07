@@ -59,6 +59,11 @@ class FindingOccurrenceRepository:
             .limit(1)
         ) is not None
 
+    def review_is_open(self, codebase_id: str, review_number: int) -> bool:
+        """Lock the PR state for this transaction before writing findings or triage."""
+
+        return self._lock_pull_request(codebase_id, review_number).state == OPEN
+
     def record_run(
         self,
         codebase_id: str,
@@ -76,7 +81,7 @@ class FindingOccurrenceRepository:
         finishes after the PR closed must not set its findings back to open.
         """
 
-        if self._lock_pull_request(codebase_id, review_number).state != OPEN:
+        if not self.review_is_open(codebase_id, review_number):
             return False
         scope = pr_scope(review_number)
 
