@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -76,14 +77,7 @@ def backfill_trace_code(
                 report.missing_snapshots += 1
                 continue
             cache: dict[str, list[str] | None] = {}
-
-            def lines_of(path: str) -> list[str] | None:
-                if path not in cache:
-                    source = reader(mirror, record.head_sha, path)
-                    cache[path] = source.splitlines() if source is not None else None
-                    if source is None:
-                        report.unreadable_files += 1
-                return cache[path]
+            lines_of = partial(_read_lines, cache, reader, mirror, record.head_sha, report)
 
             updated: list[Any] = []
             changed = False
@@ -113,6 +107,18 @@ def backfill_trace_code(
                 if apply:
                     record.findings = updated
     return report
+
+
+def _read_lines(
+    cache: dict[str, list[str] | None], reader: BlobReader, mirror: Path, revision: str,
+    report: BackfillReport, path: str,
+) -> list[str] | None:
+    if path not in cache:
+        source = reader(mirror, revision, path)
+        cache[path] = source.splitlines() if source is not None else None
+        if source is None:
+            report.unreadable_files += 1
+    return cache[path]
 
 
 def _has_commit(mirror: Path, revision: str) -> bool:

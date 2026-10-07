@@ -59,7 +59,7 @@ def cwe_ids(references: Iterable[dict[str, object]], *texts: str) -> frozenset[s
 def canonical_class(references: Iterable[dict[str, object]], vulnerability_class: str, title: str = "") -> str:
     cwes = cwe_ids(references, vulnerability_class, title)
     if cwes:
-        return sorted(cwes, key=lambda value: int(value[4:]))[0].lower()
+        return min(cwes, key=lambda value: int(value[4:])).lower()
     words = sorted(_tokens(vulnerability_class))
     return "-".join(words) or re.sub(r"\s+", " ", vulnerability_class.strip().lower())
 
