@@ -102,6 +102,25 @@ def test_complete_then_fresh_claim_returns_completed_row_unchanged() -> None:
     assert attempt.attempt_count == 1  # unchanged: no re-run/reclaim happened
 
 
+def test_previous_findings_are_scoped_to_tenant_codebase_and_pr() -> None:
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+    for tenant, review_id, codebase, number in (
+        ("tenant-a", "same-pr", "repo-1", 7),
+        ("tenant-a", "other-pr", "repo-1", 8),
+        ("tenant-a", "other-repo", "repo-2", 7),
+        ("tenant-b", "other-tenant", "repo-1", 7),
+    ):
+        with unit_of_work(factory, tenant) as repository:
+            repository.claim(review_id, codebase, **_claim_kwargs(review_number=number, delivery_id=review_id))
+            repository.complete(
+                review_id, "worker-1", outcome="findings_verified", action="warn", summary="s",
+                incomplete_reason=None, counters={}, findings=[{"finding_id": review_id}],
+            )
+    with unit_of_work(factory, "tenant-a") as repository:
+        found = repository.previous_findings("repo-1", 7, exclude_review_id="current")
+    assert [item["finding_id"] for item in found] == ["same-pr"]
+
+
 def test_claim_exhausted_after_max_attempts_raises() -> None:
     factory = sessionmaker(bind=_engine(), expire_on_commit=False)
     epoch = datetime(2024, 1, 1, tzinfo=UTC)

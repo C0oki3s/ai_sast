@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from plaidnox_sast.llm import LiteLLMConfigurationError
 from plaidnox_sast.persistence import DatabaseConfigurationError, DatabaseSettings
 
+from .backfill import backfill_trace_code
 from .models import Base
 from .production import dependencies_from_environment
 from .review import ReviewResult, review_pull_request
@@ -36,7 +38,30 @@ def _parser() -> argparse.ArgumentParser:
         help="transitional local-only SQLite ApplicationContext cache path; ignored when "
         "PLAIDNOX_DATABASE_URL is configured",
     )
+    backfill = sub.add_parser("backfill-trace-code", help="fill code windows in older completed SCM reviews")
+    backfill.add_argument("--repository-root", type=Path, default=os.environ.get("PLAIDNOX_SCM_REPOSITORY_ROOT"))
+    backfill.add_argument("--tenant")
+    backfill.add_argument("--limit", type=int)
+    backfill.add_argument("--apply", action="store_true", help="write validated changes; default is dry run")
     return parser
+
+
+def _backfill(args: argparse.Namespace) -> int:
+    if not args.repository_root:
+        sys.stderr.write("--repository-root or PLAIDNOX_SCM_REPOSITORY_ROOT is required\n")
+        return 1
+    try:
+        engine = DatabaseSettings.from_environment().create_engine()
+        factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+        report = backfill_trace_code(
+            factory, Path(args.repository_root), apply=args.apply, tenant_id=args.tenant, limit=args.limit
+        )
+    except (DatabaseConfigurationError, ValueError) as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    json.dump({"applied": args.apply, **report.as_dict()}, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
 
 
 def _result_to_json(result: ReviewResult) -> dict[str, Any]:
@@ -85,6 +110,8 @@ def _result_to_json(result: ReviewResult) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "backfill-trace-code":
+        return _backfill(args)
     if args.command != "review":
         return 1
 

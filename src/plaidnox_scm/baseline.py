@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .baseline_models import BaselineFinding
+from .dedupe import IssueSignature, canonical_class, evidence_text, same_issue, signature, verification_signature
 from .diffing import Diff
 from .l1_review import L1Candidate
 from .verification import CandidateVerification
@@ -45,6 +46,53 @@ class FindingBaselineClassification:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class PriorFinding:
+    signature: IssueSignature
+    root_cause_fingerprint: str
+    finding_fingerprint: str
+
+
+def prior_findings_from_stored(findings: Any) -> tuple[PriorFinding, ...]:
+    """Read matchable identities from previous completed runs, newest first."""
+    prior: list[PriorFinding] = []
+    seen: set[str] = set()
+    for item in findings or ():
+        if not isinstance(item, dict):
+            continue
+        finding_id = str(item.get("finding_id") or "")
+        root_id = str(item.get("root_cause_fingerprint") or "")
+        path = str(item.get("root_cause_path") or "")
+        if not finding_id or not root_id or not path or finding_id in seen:
+            continue
+        seen.add(finding_id)
+        start = int(item.get("root_cause_start_line") or 1)
+        snippet = item.get("vulnerable_snippet")
+        code = (snippet.get("code") or snippet.get("content")) if isinstance(snippet, dict) else None
+        trace = item.get("evidence_trace")
+        nodes = trace.get("nodes") if isinstance(trace, dict) else None
+        trace_nodes = (
+            (str(node.get("role") or ""), str(node.get("path") or ""), str(node.get("code") or ""))
+            for node in (nodes or ()) if isinstance(node, dict)
+        )
+        prior.append(PriorFinding(
+            signature=signature(
+                path=path, symbol=str(item.get("root_cause_symbol") or ""),
+                start_line=start, end_line=int(item.get("root_cause_end_line") or start),
+                title=str(item.get("title") or ""),
+                vulnerability_class=str(item.get("category") or ""),
+                remediation=str(item.get("remediation") or ""),
+                security_invariant=str(item.get("security_invariant") or ""),
+                references=(ref for ref in item.get("classification_references") or () if isinstance(ref, dict)),
+                root_code=code if isinstance(code, str) else None,
+                source_code=evidence_text(code if isinstance(code, str) else None, trace_nodes),
+            ),
+            root_cause_fingerprint=root_id,
+            finding_fingerprint=finding_id,
+        ))
+    return tuple(prior)
+
+
 def classify_against_baseline(
     codebase_id: str,
     diff: Diff,
@@ -54,6 +102,7 @@ def classify_against_baseline(
     security_controls: tuple[Any, ...],
     *,
     coverage_complete: bool,
+    prior_findings: tuple[PriorFinding, ...] = (),
 ) -> tuple[FindingBaselineClassification, ...]:
     """Compare head verification results to findings from the exact base.
 
@@ -74,26 +123,48 @@ def classify_against_baseline(
 
     classifications: list[FindingBaselineClassification] = []
     matched_roots: set[str] = set()
+    claimed_prior: set[str] = set()
     for verification in verifications:
         candidate = candidate_by_id.get(verification.candidate_id)
         if candidate is None:
             continue
+        current = verification_signature(candidate, verification)
+        root_changed = _path_changed(diff, candidate.changed_path)
+        issue_class = canonical_class(
+            verification.classification_references, verification.vulnerability_class, verification.title
+        )
         root_fingerprint = root_cause_fingerprint(
             codebase_id,
             candidate.changed_path,
             candidate.changed_symbol,
-            verification.vulnerability_class,
+            issue_class,
+            current.source_hash if verification.state == "verified" else None,
         )
+        reused_finding: str | None = None
         baseline = baseline_by_root.get(root_fingerprint)
         if baseline is None:
             location_matches = baseline_by_location.get(
                 (_normalise_path(candidate.changed_path), _normalise_text(candidate.changed_symbol)),
                 [],
             )
-            if len(location_matches) == 1:
+            if len(location_matches) == 1 and canonical_class(
+                (), location_matches[0].vulnerability_class, location_matches[0].title
+            ) == issue_class:
                 baseline = location_matches[0]
-                root_fingerprint = baseline.root_cause_fingerprint
-        root_changed = _path_changed(diff, candidate.changed_path)
+        if verification.state == "verified" and prior_findings:
+            prior = next((item for item in prior_findings
+                          if item.finding_fingerprint not in claimed_prior
+                          and item.signature.source_hash is not None
+                          and item.signature.source_hash == current.source_hash
+                          and same_issue(item.signature, current)), None)
+            if prior is not None:
+                claimed_prior.add(prior.finding_fingerprint)
+                root_fingerprint = prior.root_cause_fingerprint
+                reused_finding = prior.finding_fingerprint
+        elif baseline is not None and not root_changed:
+            # The unchanged baseline identity is safe to retain. A changed path
+            # needs matching source evidence from a prior run before triage follows.
+            root_fingerprint = baseline.root_cause_fingerprint
 
         if verification.state == "verified":
             relationship = _verified_relationship(
@@ -122,9 +193,12 @@ def classify_against_baseline(
                 relationship=relationship,
                 root_cause_fingerprint=root_fingerprint,
                 finding_fingerprint=(
-                    baseline.finding_fingerprint
-                    if baseline is not None
-                    else finding_fingerprint(root_fingerprint, verification.gained_capability)
+                    reused_finding
+                    or (baseline.finding_fingerprint if baseline is not None and not root_changed else None)
+                    or finding_fingerprint(
+                        root_fingerprint,
+                        issue_class + "|" + "-".join(sorted(current.invariant_tokens)),
+                    )
                 ),
                 candidate_id=candidate.candidate_id,
                 verification_state=verification.state,
@@ -180,18 +254,14 @@ def root_cause_fingerprint(
     path: str,
     symbol: str,
     vulnerability_class: str,
+    evidence_hash: str | None = None,
 ) -> str:
-    return _digest(
-        "root",
-        codebase_id,
-        _normalise_path(path),
-        _normalise_text(symbol),
-        _normalise_text(vulnerability_class),
-    )
+    parts = ("root", codebase_id, _normalise_path(path), _normalise_text(symbol), _normalise_text(vulnerability_class))
+    return _digest(*parts, evidence_hash) if evidence_hash else _digest(*parts)
 
 
-def finding_fingerprint(root_fingerprint: str, gained_capability: str) -> str:
-    return _digest("finding", root_fingerprint, _normalise_text(gained_capability))
+def finding_fingerprint(root_fingerprint: str, issue_class: str) -> str:
+    return _digest("finding", root_fingerprint, _normalise_text(issue_class))
 
 
 def _verified_relationship(

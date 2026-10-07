@@ -72,7 +72,8 @@ def build_review_evidence(
                 path=str(location.get("path", "")),
                 start_line=_optional_line(location.get("start_line")),
                 end_line=_optional_line(location.get("end_line")),
-                summary=f"Deep Hunt {location.get('role', 'evidence')!s} evidence",
+                summary=str(location.get("summary") or "").strip()[:240]
+                or f"Deep Hunt {location.get('role', 'evidence')!s} evidence",
             )
         )
     return tuple(values)

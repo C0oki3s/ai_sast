@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -83,6 +83,24 @@ class ReviewAttemptRepository:
 
         record = self._session.get(ReviewAttemptRecord, review_id)
         return _to_value(record) if record is not None else None
+
+    def previous_findings(
+        self, codebase_id: str, review_number: int, *, exclude_review_id: str, limit: int = 20
+    ) -> tuple[Any, ...]:
+        """Completed attempts for this tenant, codebase, and PR, newest first."""
+        rows = self._session.scalars(
+            select(ReviewAttemptRecord)
+            .where(
+                ReviewAttemptRecord.tenant_id == self._tenant_id,
+                ReviewAttemptRecord.codebase_id == codebase_id,
+                ReviewAttemptRecord.review_number == review_number,
+                ReviewAttemptRecord.state == "completed",
+                ReviewAttemptRecord.review_id != exclude_review_id,
+            )
+            .order_by(ReviewAttemptRecord.started_at.desc())
+            .limit(limit)
+        )
+        return tuple(finding for row in rows for finding in (row.findings or ()))
 
     def claim(
         self,

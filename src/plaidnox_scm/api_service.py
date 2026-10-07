@@ -36,7 +36,7 @@ from .api_models import (
     VulnerableSnippet,
 )
 from .assets import load_json
-from .baseline import FindingBaselineClassification
+from .baseline import FindingBaselineClassification, prior_findings_from_stored
 from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
 from .models import ActivityEventRecord, InstallationTenantRecord, WebhookDeliveryRecord
@@ -113,6 +113,7 @@ _COUNTER_FIELDS = (
     "resolved",
     "in_triage",
     "blocking",
+    "duplicates_merged",
 )
 
 
@@ -149,6 +150,11 @@ class ReviewService:
             )
         if attempt.state == "completed":
             return _replay_response(attempt)
+
+        with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
+            prior_findings = prior_findings_from_stored(
+                repository.previous_findings(codebase_id, request.review_number, exclude_review_id=review_id)
+            )
 
         _record_review_activity(
             self.session_factory,
@@ -199,6 +205,7 @@ class ReviewService:
                         tenant_id,
                         self.session_factory,
                         on_stage=on_stage,
+                        prior_findings=prior_findings,
                     )
                     if result.outcome == "configuration_required":
                         dependencies = self.dependencies_factory()
@@ -213,6 +220,7 @@ class ReviewService:
                             l1_reviewer=dependencies.l1_reviewer,
                             candidate_verifier=dependencies.candidate_verifier,
                             on_stage=on_stage,
+                            prior_findings=prior_findings,
                         )
             except Exception as exc:
                 with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
@@ -616,13 +624,17 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
     candidate_by_id = {item.candidate_id: item for item in result.candidates}
     verification_by_id = {item.candidate_id: item for item in result.verifications}
     findings: list[ReviewFinding] = []
+    emitted: set[str] = set()
     for classification in result.baseline_classifications:
         if classification.verification_state != "verified" or classification.candidate_id is None:
+            continue
+        if classification.finding_fingerprint in emitted:
             continue
         candidate = candidate_by_id.get(classification.candidate_id)
         verification = verification_by_id.get(classification.candidate_id)
         if candidate is None or verification is None:
             continue
+        emitted.add(classification.finding_fingerprint)
 
         proof_plan = _optional_verification_text(verification, "proof_plan")
         regression_test = _optional_verification_text(verification, "regression_test")

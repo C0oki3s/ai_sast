@@ -19,7 +19,8 @@ from plaidnox_sast.ai import AIResponseError
 
 from .application_context import ApplicationContextBuilder
 from .assets import load_json
-from .baseline import FindingBaselineClassification, classify_against_baseline
+from .baseline import FindingBaselineClassification, PriorFinding, classify_against_baseline
+from .dedupe import consolidate_verified
 from .baseline_models import BaselineFinding
 from .change_relevance import ChangeRelevance, classify
 from .context_store import ApplicationContext, unit_of_work
@@ -59,6 +60,7 @@ class ReviewCounters:
     resolved: int = 0
     in_triage: int = 0
     blocking: int = 0
+    duplicates_merged: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +93,7 @@ def review_pull_request(
     l1_reviewer: ChangedFileReviewer | None = None,
     candidate_verifier: CandidateVerifier | None = None,
     on_stage: StageCallback | None = None,
+    prior_findings: tuple[PriorFinding, ...] = (),
 ) -> ReviewResult:
     def stage(name: str, **metadata: str | int | float | bool | None) -> None:
         if on_stage is None:
@@ -324,12 +327,17 @@ def review_pull_request(
         if batch.candidates
         else ()
     )
+    evaluated_count = len(verifications)
+    consolidation = consolidate_verified(batch.candidates, verifications)
+    verifications = consolidation.verifications
+    duplicates_merged = len(consolidation.merged_into)
     stage(
         "verification_complete",
-        evaluated=len(verifications),
+        evaluated=evaluated_count,
         verified=sum(item.state == "verified" for item in verifications),
         rejected=sum(item.state == "rejected" for item in verifications),
         unresolved=sum(item.state == "unresolved" for item in verifications),
+        duplicates_merged=duplicates_merged,
     )
     provisional_coverage_complete = batch.coverage_complete and not any(
         item.state == "unresolved" for item in verifications
@@ -342,13 +350,18 @@ def review_pull_request(
         baseline_findings,
         application_context.security_controls,
         coverage_complete=provisional_coverage_complete,
+        prior_findings=prior_findings,
     )
     policy = evaluate_merge_policy(
         baseline_classifications,
         coverage_complete=provisional_coverage_complete,
         triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
     )
-    counters = _counters(batch, verifications, baseline_classifications, policy)
+    counters = replace(
+        _counters(batch, verifications, baseline_classifications, policy),
+        evaluated=evaluated_count,
+        duplicates_merged=duplicates_merged,
+    )
     stage(
         "baseline_compared",
         introduced=counters.introduced,

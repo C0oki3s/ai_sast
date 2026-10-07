@@ -157,13 +157,19 @@
               "defense",
               "effect"
             ]
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 240,
+            "description": "One sentence explaining what happens at this location in the attack path."
           }
         },
         "required": [
           "path",
           "start_line",
           "end_line",
-          "role"
+          "role",
+          "summary"
         ]
       },
       "maxItems": 8
