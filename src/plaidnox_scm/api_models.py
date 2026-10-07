@@ -38,6 +38,8 @@ class ReviewRequest(BaseModel):
     delivery_id: str = Field(min_length=1, max_length=255, pattern=r"^[^\x00-\x20\x7f]+$")
     # Short-lived, installation-scoped S3 URL uploaded by the trusted GitHub bot.
     source_bundle_url: str | None = Field(default=None, max_length=4096)
+    # Pull request author (provider login). Optional: stored for the dashboard only.
+    author_login: str | None = Field(default=None, min_length=1, max_length=255, pattern=r"^[^\x00-\x20\x7f]+$")
 
 
 class WebhookDeliveryClaim(BaseModel):
@@ -126,6 +128,19 @@ class FindingTraceNode(BaseModel):
     label: str
     summary: str
     provenance: str
+    # Redacted code window around the node, stored so the trace can be rendered
+    # without the repository. Absent on findings verified before it was captured.
+    code: str | None = None
+    code_start_line: int | None = Field(default=None, gt=0)
+    code_end_line: int | None = Field(default=None, gt=0)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        for field_name in ("code", "code_start_line", "code_end_line"):
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
+        return data
 
 
 class FindingTraceEdge(BaseModel):
@@ -166,6 +181,17 @@ class FindingReproduction(BaseModel):
     regression_test_expectation: str | None = None
 
 
+class ClassificationReference(BaseModel):
+    """CWE / OWASP / CAPEC style reference the verifier attached to the finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str
+    identifier: str
+    name: str | None = None
+    source_url: str | None = None
+
+
 class ReviewFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -193,6 +219,8 @@ class ReviewFinding(BaseModel):
     gained_capability: str | None = None
     reproduction: FindingReproduction | None = None
 
+    # Display-ready reproduction: numbered steps plus one runnable script when the
+    # verifier produced it. Always present on a verified finding that has a proof plan.
     proof_of_concept: str | None = None
     remediation: str | None = None
     remediation_invariant: str | None = None
@@ -213,6 +241,7 @@ class ReviewFinding(BaseModel):
     evidence: list[FindingEvidence] = Field(default_factory=list)
     context_facts: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)
+    classification_references: list[ClassificationReference] = Field(default_factory=list)
     verified_at: datetime
 
     @model_serializer(mode="wrap")
@@ -231,6 +260,8 @@ class ReviewFinding(BaseModel):
         ):
             if getattr(self, field_name) is None:
                 data.pop(field_name, None)
+        if not self.classification_references:
+            data.pop("classification_references", None)
         return data
 
 

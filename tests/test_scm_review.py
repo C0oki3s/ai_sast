@@ -258,6 +258,65 @@ def test_jwt_verification_removal_runs_l1_and_independent_verification(tmp_path:
     assert builder.calls == reviewer.calls == verifier.calls == 1
 
 
+def test_review_reports_every_stage_in_order_with_its_details(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "middleware").mkdir()
+    (repo / "middleware" / "ValidateToken.js").write_text("const claims = verifier.verify(token);\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "middleware" / "ValidateToken.js").write_text("const claims = jwt.decode(token);\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "regression")
+    head = _git(repo, "rev-parse", "HEAD")
+    hypothesis = L1Candidate(
+        candidate_id="jwt-regression", changed_path="middleware/ValidateToken.js", changed_symbol="ValidateToken",
+        changed_lines=ChangedLines(1, 1), behavior_before="verified", behavior_after="decoded",
+        security_role="auth", suspected_broken_invariant="authentic tokens only",
+        provisional_attacker_capability="forge identity", context_facts_used=(), context_gaps=(), requested_expansion=(),
+    )
+    stages: list[tuple[str, dict]] = []
+
+    review_pull_request(
+        repo, base, head, "codebase-1", "tenant-a", _factory(),
+        context_builder=_ContextBuilder(), l1_reviewer=_L1Reviewer(hypothesis), candidate_verifier=_Verifier(),
+        on_stage=lambda name, metadata: stages.append((name, metadata)),
+    )
+
+    assert [name for name, _ in stages] == [
+        "changes_analyzed", "context_ready", "candidates_generated",
+        "verification_complete", "baseline_compared", "policy_evaluated",
+    ]
+    details = dict(stages)
+    assert details["changes_analyzed"]["files_changed"] == 1
+    assert details["changes_analyzed"]["modified"] == 1
+    assert details["candidates_generated"]["candidates"] == 1
+    assert details["verification_complete"]["verified"] == 1
+    assert details["policy_evaluated"]["decision"] == "BLOCK"
+    assert all(isinstance(value, str | int | float | bool) for _, meta in stages for value in meta.values())
+
+
+def test_a_failing_stage_callback_never_breaks_the_review(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "README.md").write_text("# Project\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "README.md").write_text("# Project\n\nMore.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "docs")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    def explode(name, metadata):
+        raise RuntimeError("timeline store unavailable")
+
+    result = review_pull_request(repo, base, head, "codebase-1", "tenant-a", _factory(), on_stage=explode)
+
+    assert result.outcome == "pass_fast_exit"
+
+
 
 def test_false_positive_triage_is_honoured_by_the_next_review(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

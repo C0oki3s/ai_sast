@@ -76,3 +76,25 @@ belong in `PlaidNox/plaidnox-github-bot`.
 Changes to review orchestration, source-broker interfaces, AI review, Deep Hunt,
 baseline comparison, policy evaluation, and canonical findings belong in
 `ai_sast/src/plaidnox_scm`.
+
+## Additive contract fields (dashboard data)
+
+These are optional and backwards compatible; a bot that ignores them keeps working.
+
+- Request: `author_login` (PR author's provider login). Stored on
+  `scm_review_attempts` with `head_ref`, `base_ref` and `repository_full_name`
+  so the dashboard can show branch and author. **Bot change needed:** send
+  `pull_request.user.login` as `author_login`.
+- Response finding: `classification_references` (CWE/OWASP), emitted only when
+  the verifier produced them.
+- Response `evidence_trace.nodes[]`: `code`, `code_start_line`, `code_end_line`
+  — the redacted source window around each taint node, captured at verification
+  time and persisted with the finding. Bots that validate trace nodes strictly
+  must accept these keys.
+- `proof_of_concept` is now always present on a verified finding that has a
+  proof plan (steps only when the verifier returned no script).
+- Per-run timeline: each review records stage events (`snapshot_ready`,
+  `changes_analyzed`, `context_ready`, `candidates_generated`,
+  `verification_complete`, `baseline_compared`, `policy_evaluated`) in
+  `scm_activity_events` with the run's `review_id` and stage details in
+  `metadata`.

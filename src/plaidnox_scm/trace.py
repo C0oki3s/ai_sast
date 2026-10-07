@@ -35,6 +35,12 @@ class EvidenceTraceNode:
     label: str
     summary: str
     provenance: str
+    # Redacted source window around the node (a few lines of context either side),
+    # captured from the immutable head snapshot so the trace can be rendered later
+    # without re-reading the repository.
+    code: str = ""
+    code_start_line: int | None = None
+    code_end_line: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +74,11 @@ _ROLE_LAYER = {
     EvidenceRole.DOWNSTREAM_TRUST: 4,
     EvidenceRole.SENSITIVE_EFFECT: 5,
 }
+
+# Context lines kept around each trace node, and the hard cap on a stored window.
+_CODE_CONTEXT_LINES = 3
+_CODE_WINDOW_MAX_LINES = 40
+_CODE_WINDOW_MAX_CHARS = 4000
 
 _NODE_KIND = {
     EvidenceRole.ATTACKER_ORIGIN: "SOURCE",
@@ -249,6 +260,7 @@ def _validated_node(
         return None
 
     expression = redact("\n".join(lines[start - 1 : end])[:1200])
+    code_start, code_end, code = _code_window(lines, start, end)
     anchor = _anchor_at(graph, path, start, end)
     symbol = anchor.qualified_name or anchor.name if anchor is not None else path
     key = (item.role.value, path, start, end, item.summary, symbol, expression)
@@ -265,7 +277,33 @@ def _validated_node(
         label=_label(item.role),
         summary=redact(item.summary.strip()),
         provenance=redact(item.source.strip()),
+        code=code,
+        code_start_line=code_start,
+        code_end_line=code_end,
     )
+
+
+def _code_window(lines: list[str], start: int, end: int) -> tuple[int, int, str]:
+    """Node range plus surrounding context, bounded and redacted before persistence."""
+
+    first = max(1, start - _CODE_CONTEXT_LINES)
+    last = min(len(lines), end + _CODE_CONTEXT_LINES)
+    if last - first + 1 > _CODE_WINDOW_MAX_LINES:
+        # Keep the node itself; trim context first, then the tail of a very long node.
+        first = max(1, start - 1)
+        last = min(len(lines), first + _CODE_WINDOW_MAX_LINES - 1)
+    window = "\n".join(lines[first - 1 : last])
+    if len(window) > _CODE_WINDOW_MAX_CHARS:
+        kept: list[str] = []
+        size = 0
+        for line in lines[first - 1 : last]:
+            if size + len(line) + 1 > _CODE_WINDOW_MAX_CHARS:
+                break
+            kept.append(line)
+            size += len(line) + 1
+        last = first + max(0, len(kept) - 1)
+        window = "\n".join(kept)
+    return first, last, redact(window)
 
 
 def _anchor_at(

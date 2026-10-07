@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -58,6 +58,10 @@ class ReviewAttempt:
     error_message: str | None
     started_at: datetime
     completed_at: datetime | None
+    base_ref: str | None = None
+    head_ref: str | None = None
+    repository_full_name: str | None = None
+    author_login: str | None = None
 
 
 class ReviewAttemptRepository:
@@ -95,6 +99,10 @@ class ReviewAttemptRepository:
         lease_seconds: int,
         max_attempts: int,
         now: datetime | None = None,
+        base_ref: str | None = None,
+        head_ref: str | None = None,
+        repository_full_name: str | None = None,
+        author_login: str | None = None,
     ) -> ReviewAttempt:
         """Get-or-create by `review_id`, enforcing bounded-retry lease semantics.
 
@@ -123,6 +131,10 @@ class ReviewAttemptRepository:
                 base_sha=base_sha,
                 head_sha=head_sha,
                 delivery_id=delivery_id,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                repository_full_name=repository_full_name,
+                author_login=author_login,
                 state="running",
                 lease_owner=lease_owner,
                 lease_expires_at=lease_until,
@@ -169,6 +181,11 @@ class ReviewAttemptRepository:
                     lease_owner=lease_owner,
                     lease_expires_at=lease_until,
                     attempt_count=ReviewAttemptRecord.attempt_count + 1,
+                    # A retried delivery may carry metadata the first one lacked.
+                    base_ref=func.coalesce(base_ref, ReviewAttemptRecord.base_ref),
+                    head_ref=func.coalesce(head_ref, ReviewAttemptRecord.head_ref),
+                    repository_full_name=func.coalesce(repository_full_name, ReviewAttemptRecord.repository_full_name),
+                    author_login=func.coalesce(author_login, ReviewAttemptRecord.author_login),
                     started_at=moment,
                     completed_at=None,
                     outcome=None,
@@ -341,6 +358,10 @@ def _to_value(record: ReviewAttemptRecord) -> ReviewAttempt:
         error_message=record.error_message,
         started_at=record.started_at,
         completed_at=record.completed_at,
+        base_ref=record.base_ref,
+        head_ref=record.head_ref,
+        repository_full_name=record.repository_full_name,
+        author_login=record.author_login,
     )
 
 

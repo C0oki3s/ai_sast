@@ -265,3 +265,29 @@ def test_concurrent_first_claim_race_is_resolved_by_refetch_not_a_500(monkeypatc
     with pytest.raises(ReviewAttemptConflictError):
         with unit_of_work(factory, "tenant-a") as repository:
             repository.claim("review-1", "codebase-1", **_claim_kwargs(lease_owner="worker-loser"))
+
+
+def test_claim_stores_pull_request_metadata_and_keeps_it_on_reclaim() -> None:
+    factory = sessionmaker(bind=_engine(), expire_on_commit=False)
+    moment = datetime(2026, 10, 7, tzinfo=UTC)
+
+    with unit_of_work(factory, "tenant-a") as repository:
+        first = repository.claim(
+            "review-1", "codebase-1",
+            **_claim_kwargs(
+                base_ref="main", head_ref="fix/tree-sitter-parser-fallback",
+                repository_full_name="C0oki3s/ai_sast", author_login="jaikandepu", now=moment, lease_seconds=1,
+            ),
+        )
+    assert (first.head_ref, first.base_ref, first.repository_full_name, first.author_login) == (
+        "fix/tree-sitter-parser-fallback", "main", "C0oki3s/ai_sast", "jaikandepu",
+    )
+
+    # An older bot retrying without author metadata must not wipe what was stored.
+    with unit_of_work(factory, "tenant-a") as repository:
+        again = repository.claim(
+            "review-1", "codebase-1",
+            **_claim_kwargs(lease_owner="worker-2", now=moment + timedelta(seconds=5)),
+        )
+    assert again.attempt_count == 2
+    assert (again.head_ref, again.author_login) == ("fix/tree-sitter-parser-fallback", "jaikandepu")
