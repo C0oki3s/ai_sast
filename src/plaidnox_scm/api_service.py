@@ -18,6 +18,7 @@ from plaidnox_sast.llm import tenant_cache_namespace
 
 from . import attempts, context_store, triage
 from .api_models import (
+    ClassificationReference,
     FindingEvidence,
     FindingReproduction,
     FindingRootCause,
@@ -138,6 +139,10 @@ class ReviewService:
                 base_sha=request.base_sha,
                 head_sha=request.head_sha,
                 delivery_id=request.delivery_id,
+                base_ref=request.base_ref,
+                head_ref=request.head_ref,
+                repository_full_name=request.repository_full_name,
+                author_login=request.author_login,
                 lease_owner=lease_owner,
                 lease_seconds=int(runtime["review_attempt_lease_seconds"]),
                 max_attempts=int(runtime["review_attempt_max_attempts"]),
@@ -165,10 +170,27 @@ class ReviewService:
         heartbeat.start()
         try:
             try:
+                def on_stage(name: str, metadata: dict[str, str | int | float | bool]) -> None:
+                    _record_review_activity(
+                        self.session_factory,
+                        tenant_id=tenant_id,
+                        request=request,
+                        review_id=review_id,
+                        event_type=name,
+                        idempotency_key=f"{review_id}:attempt:{attempt.attempt_count}:stage:{name}",
+                        metadata=metadata,
+                    )
+
                 with (
                     tenant_cache_namespace(tenant_id),
                     self.source_broker.materialize(request) as source,
                 ):
+                    on_stage("snapshot_ready", {
+                        "base": source.base_revision[:12],
+                        "head": source.head_revision[:12],
+                        "head_ref": request.head_ref,
+                        "base_ref": request.base_ref,
+                    })
                     result = review_pull_request(
                         source.repo_path,
                         source.base_revision,
@@ -176,6 +198,7 @@ class ReviewService:
                         codebase_id,
                         tenant_id,
                         self.session_factory,
+                        on_stage=on_stage,
                     )
                     if result.outcome == "configuration_required":
                         dependencies = self.dependencies_factory()
@@ -189,6 +212,7 @@ class ReviewService:
                             context_builder=dependencies.context_builder,
                             l1_reviewer=dependencies.l1_reviewer,
                             candidate_verifier=dependencies.candidate_verifier,
+                            on_stage=on_stage,
                         )
             except Exception as exc:
                 with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
@@ -698,6 +722,7 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                 ],
                 context_facts=[redact(fact) for fact in candidate.context_facts_used],
                 evidence_gaps=[redact(gap) for gap in verification.evidence_gaps],
+                classification_references=_classification_references(verification),
                 verified_at=datetime.now(UTC),
             )
         )
@@ -753,6 +778,7 @@ def _activity_record(
     pull_number: int | None = None,
     review_id: str | None = None,
     head_sha: str | None = None,
+    metadata: dict[str, str | int | float | bool] | None = None,
 ) -> ActivityEventRecord:
     labels = {
         "pr_opened": "Pull request opened",
@@ -766,9 +792,10 @@ def _activity_record(
         "review_superseded": "Security review superseded",
         "review_failed": "Security review failed",
         "context_indexed": "Application context indexed",
+        **_STAGE_LABELS,
     }
     summary = labels[event_type]
-    if pull_number is not None:
+    if pull_number is not None and event_type not in _STAGE_LABELS:
         summary = f"{summary} for PR #{pull_number}"
     return ActivityEventRecord(
         event_id=hashlib.sha256(idempotency_key.encode()).hexdigest()[:32],
@@ -782,9 +809,33 @@ def _activity_record(
         head_sha=head_sha,
         event_type=event_type,
         summary=summary,
-        metadata_json={},
+        metadata_json=_safe_metadata(metadata or {}),
         idempotency_key=idempotency_key[:255],
     )
+
+
+# Per-run review stages, recorded with the run's review_id so the dashboard can
+# draw one run's timeline without mixing in other runs of the same pull request.
+_STAGE_LABELS = {
+    "snapshot_ready": "Repository snapshot ready",
+    "changes_analyzed": "Changed files analyzed",
+    "review_skipped": "AI review skipped",
+    "context_ready": "Application context ready",
+    "candidates_generated": "Changed-code review complete",
+    "verification_complete": "Independent verification complete",
+    "baseline_compared": "Compared against the default branch",
+    "policy_evaluated": "Merge policy evaluated",
+}
+
+
+def _safe_metadata(metadata: dict[str, object]) -> dict[str, str | int | float | bool]:
+    safe: dict[str, str | int | float | bool] = {}
+    for key, value in list(metadata.items())[:24]:
+        if isinstance(value, bool | int | float):
+            safe[str(key)[:64]] = value
+        elif value is not None:
+            safe[str(key)[:64]] = redact(str(value))[:500]
+    return safe
 
 
 def _record_review_activity(
@@ -795,6 +846,7 @@ def _record_review_activity(
     review_id: str,
     event_type: str,
     idempotency_key: str,
+    metadata: dict[str, str | int | float | bool] | None = None,
 ) -> None:
     with factory.begin() as session:
         session.merge(
@@ -808,6 +860,7 @@ def _record_review_activity(
                 head_sha=request.head_sha,
                 event_type=event_type,
                 idempotency_key=idempotency_key,
+                metadata=metadata,
             )
         )
 
@@ -821,10 +874,17 @@ def _optional_verification_text(verification: object, attribute: str) -> str | N
 
 
 def _client_proof_of_concept(proof_plan: str | None, script: str | None) -> str | None:
-    """Build one display-ready PoC without asking the model to repeat itself."""
+    """Build one display-ready PoC without asking the model to repeat itself.
 
-    if not script:
-        return None
+    A verified finding always carries a proof plan, so it always gets a PoC: the
+    numbered steps, plus the runnable script when the verifier produced one. The
+    stored finding drops the separate ``proof_plan`` key, so returning ``None``
+    here would lose the reproduction from the database entirely.
+    """
+
+    steps_text = proof_plan.strip() if proof_plan and proof_plan.strip() else ""
+    if not script or not script.strip():
+        return f"### Steps to Reproduce\n\n{steps_text}" if steps_text else None
     lines = script.strip().splitlines()
     if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
         lines = lines[1:-1]
@@ -869,6 +929,26 @@ def _stored_finding(finding: ReviewFinding) -> dict[str, object]:
     if isinstance(snippet, dict) and snippet.get("content") == snippet.get("code"):
         snippet.pop("content", None)
     return dict(_compact_json(payload))
+
+
+def _classification_references(verification: object) -> list[ClassificationReference]:
+    references: list[ClassificationReference] = []
+    for item in getattr(verification, "classification_references", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        namespace = str(item.get("namespace", "")).strip()
+        identifier = str(item.get("identifier", "")).strip()
+        if not namespace or not identifier:
+            continue
+        references.append(
+            ClassificationReference(
+                namespace=redact(namespace),
+                identifier=redact(identifier),
+                name=redact(str(item.get("name", "")).strip()) or None,
+                source_url=str(item.get("source_url", "")).strip() or None,
+            )
+        )
+    return references
 
 
 def _evidence_summary(evidence: object, role: EvidenceRole) -> str | None:
@@ -918,6 +998,9 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
                 label=redact(str(item.label)),
                 summary=redact(str(item.summary)),
                 provenance=redact(str(item.provenance)),
+                code=redact(str(getattr(item, "code", "") or "")) or None,
+                code_start_line=getattr(item, "code_start_line", None) or None,
+                code_end_line=getattr(item, "code_end_line", None) or None,
             )
             for item in value.nodes
         ]

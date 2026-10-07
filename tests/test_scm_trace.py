@@ -183,3 +183,41 @@ def test_evidence_trace_marks_unproven_or_unresolved_hops_incomplete(tmp_path: P
     assert trace.complete is False
     assert "Runtime-only authorization branch was not observed" in trace.evidence_gaps
     assert any("could not be machine-validated" in gap or "No machine-supported transition" in gap for gap in trace.evidence_gaps)
+
+
+def test_every_trace_node_stores_its_code_window_with_line_numbers(tmp_path: Path):
+    _write_fixture(tmp_path)
+    graph = build_structural_graph(tmp_path)
+
+    trace = build_evidence_trace(
+        tmp_path,
+        graph,
+        _candidate(),
+        _branching_evidence(),
+        attack_path="x-user-email -> verified claim overwrite -> protected user lookups",
+        gained_capability="Select another user's identity",
+    )
+
+    assert trace is not None
+    for node in trace.nodes:
+        assert node.code, node
+        assert node.code_start_line is not None and node.code_end_line is not None
+        # The window always contains the node's own range.
+        assert node.code_start_line <= node.start_line <= node.end_line <= node.code_end_line
+        source = (tmp_path / node.path).read_text(encoding="utf-8").splitlines()
+        assert node.code.splitlines() == source[node.code_start_line - 1 : node.code_end_line]
+
+    origin = next(node for node in trace.nodes if node.kind == "SOURCE")
+    # Three lines of context either side, clipped to the file.
+    assert (origin.code_start_line, origin.code_end_line) == (1, 6)
+
+
+def test_trace_node_code_window_is_bounded(tmp_path: Path):
+    from plaidnox_scm.trace import _code_window
+
+    lines = [f"line {index}" for index in range(1, 501)]
+    start, end, code = _code_window(lines, 200, 300)
+
+    assert start <= 200
+    assert end - start + 1 <= 40
+    assert code.splitlines()[0] == f"line {start}"

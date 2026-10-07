@@ -203,3 +203,90 @@ def test_verified_snippet_and_branching_trace_are_provider_neutral():
     }
     assert all(edge["via"] for edge in payload["evidence_trace"]["edges"])
     assert "github.com" not in str(payload["evidence_trace"]).lower()
+
+
+def test_client_poc_keeps_the_steps_when_the_verifier_returned_no_script():
+    payload = _client_proof_of_concept("1. Start the local service.\n2. Send the request.", "")
+
+    assert payload == "### Steps to Reproduce\n\n1. Start the local service.\n2. Send the request."
+    assert _client_proof_of_concept(None, None) is None
+
+
+def test_stored_finding_always_carries_a_poc_for_a_proof_plan_only_verification():
+    poc = _client_proof_of_concept("1. Send a crafted header.\n2. Observe the other user's data.", "")
+    payload = _stored_finding(_finding(proof_of_concept=poc, proof_plan="1. Send a crafted header."))
+
+    assert "proof_plan" not in payload  # folded into the PoC, never lost
+    assert payload["proof_of_concept"].startswith("### Steps to Reproduce")
+    assert "Observe the other user's data" in payload["proof_of_concept"]
+
+
+def test_trace_node_code_window_round_trips_through_the_api_and_storage():
+    node = EvidenceTraceNode(
+        node_id="trace_source",
+        role=EvidenceRole.ATTACKER_ORIGIN,
+        kind="SOURCE",
+        path="src/api_models.py",
+        start_line=40,
+        end_line=40,
+        symbol="ReviewRequest",
+        expression="source_bundle_url: str | None = Field(default=None)",
+        label="Attacker origin",
+        summary="Request body field",
+        provenance="deep_hunt",
+        code="class ReviewRequest:\n    source_bundle_url: str | None = Field(default=None)\n",
+        code_start_line=39,
+        code_end_line=41,
+    )
+    trace = EvidenceTrace(
+        trace_type="taint_and_trust", step_count=1, file_count=1, nodes=(node,), edges=(),
+        entry_nodes=("trace_source",), terminal_nodes=("trace_source",),
+        attack_path="body -> clone", gained_capability="exhaust workers", complete=False, evidence_gaps=(),
+    )
+
+    stored = _stored_finding(_finding(evidence_trace=_api_evidence_trace(trace)))
+    stored_node = stored["evidence_trace"]["nodes"][0]
+
+    assert stored_node["code"].startswith("class ReviewRequest:")
+    assert (stored_node["code_start_line"], stored_node["code_end_line"]) == (39, 41)
+    # A stored finding must replay through the strict response model.
+    assert ReviewFinding.model_validate(stored).evidence_trace.nodes[0].code_start_line == 39
+
+
+def test_old_trace_nodes_without_code_still_validate_and_omit_the_keys():
+    payload = _finding(evidence_trace={
+        "step_count": 1, "file_count": 1, "attack_path": "a", "gained_capability": "b",
+        "nodes": [{"node_id": "n", "role": "ATTACKER_ORIGIN", "kind": "SOURCE", "path": "a.py", "symbol": "s",
+                   "expression": "x", "label": "Attacker origin", "summary": "s", "provenance": "deep_hunt"}],
+    }).model_dump(mode="json")
+
+    assert "code" not in payload["evidence_trace"]["nodes"][0]
+
+
+def test_classification_references_are_stored_only_when_present():
+    from plaidnox_scm.api_models import ClassificationReference
+
+    bare = _finding().model_dump(mode="json")
+    tagged = _stored_finding(_finding(classification_references=[
+        ClassificationReference(namespace="CWE", identifier="CWE-400", name="Uncontrolled Resource Consumption"),
+    ]))
+
+    assert "classification_references" not in bare
+    assert tagged["classification_references"] == [
+        {"namespace": "CWE", "identifier": "CWE-400", "name": "Uncontrolled Resource Consumption"},
+    ]
+
+
+def test_stage_events_belong_to_the_run_and_keep_safe_metadata():
+    from plaidnox_scm.api_service import _activity_record
+
+    record = _activity_record(
+        tenant_id="t", provider="github", repository_id=1, installation_id=2, pull_number=9,
+        review_id="review_abc", head_sha="b" * 40, event_type="changes_analyzed",
+        idempotency_key="review_abc:attempt:1:stage:changes_analyzed",
+        metadata={"files_changed": 5, "added": 0, "review_depth": "DEEP", "docs_only": False},
+    )
+
+    assert record.review_id == "review_abc"
+    assert record.summary == "Changed files analyzed"
+    assert record.metadata_json == {"files_changed": 5, "added": 0, "review_depth": "DEEP", "docs_only": False}

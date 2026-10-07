@@ -197,6 +197,11 @@ class ReviewAttemptRecord(Base):
     base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     delivery_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Pull request metadata from the normalized request, kept for the dashboard.
+    base_ref: Mapped[str | None] = mapped_column(String(255))
+    head_ref: Mapped[str | None] = mapped_column(String(255))
+    repository_full_name: Mapped[str | None] = mapped_column(String(255))
+    author_login: Mapped[str | None] = mapped_column(String(255))
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

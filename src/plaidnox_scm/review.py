@@ -7,6 +7,8 @@ Code Scanning remains an immutable-snapshot library.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -27,6 +29,12 @@ from .policy import MergePolicyResult, evaluate_merge_policy
 from . import triage
 from .snapshots import resolve_revision
 from .verification import CandidateVerification, CandidateVerifier
+
+_LOG = logging.getLogger(__name__)
+
+# Called once per completed review stage with a small, primitive-valued metadata
+# map. Used to record a per-run timeline; it must never affect the review result.
+StageCallback = Callable[[str, dict[str, str | int | float | bool]], None]
 
 ReviewOutcome = Literal[
     "pass_fast_exit",
@@ -82,11 +90,37 @@ def review_pull_request(
     context_builder: ApplicationContextBuilder | None = None,
     l1_reviewer: ChangedFileReviewer | None = None,
     candidate_verifier: CandidateVerifier | None = None,
+    on_stage: StageCallback | None = None,
 ) -> ReviewResult:
+    def stage(name: str, **metadata: str | int | float | bool | None) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(name, {key: value for key, value in metadata.items() if value is not None})
+        except Exception:  # noqa: BLE001 - the timeline is diagnostic only
+            _LOG.warning("review stage callback failed for %s", name, exc_info=True)
+
     base_revision = resolve_revision(repo_path, base_ref)
     head_revision = resolve_revision(repo_path, head_ref)
     diff = compute_diff(repo_path, base_revision, head_revision)
     relevance = classify(diff)
+    statuses = [item.status for item in diff.files]
+    stage(
+        "changes_analyzed",
+        files_changed=len(diff.files),
+        added=statuses.count("added"),
+        modified=statuses.count("modified"),
+        deleted=statuses.count("deleted"),
+        renamed=statuses.count("renamed") + statuses.count("copied"),
+        changed_symbols=len(relevance.changed_symbols),
+        review_depth=relevance.minimum_review_depth,
+        runtime_changed=relevance.runtime_changed,
+        security_control_changed=relevance.security_control_changed,
+        config_changed=relevance.config_changed,
+        dependency_or_build_changed=relevance.dependency_or_build_changed,
+        docs_only=relevance.docs_only,
+        test_only=relevance.test_only,
+    )
 
     is_fast_exit = relevance.minimum_review_depth == "FAST" and (
         not diff.files or relevance.docs_only or relevance.generated_only
@@ -109,6 +143,8 @@ def review_pull_request(
             coverage_complete=True,
             triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
         )
+        stage("review_skipped", reason="Documentation or generated files only; AI review not required")
+        stage("policy_evaluated", decision=policy.decision, blocking=policy.blocking_count, in_triage=policy.in_triage_count)
         return ReviewResult(
             outcome="pass_fast_exit",
             relevance=relevance,
@@ -241,6 +277,19 @@ def review_pull_request(
             policy=policy,
             detail=gap,
         )
+    stage(
+        "context_ready",
+        application_type=(application_context.application_type or "")[:300] or None,
+        baseline_revision=application_context.baseline_revision[:12],
+        entry_points=len(application_context.entry_points),
+        routes=len(application_context.routes),
+        components=len(application_context.components),
+        security_controls=len(application_context.security_controls),
+        sensitive_effects=len(application_context.sensitive_effects),
+        identity_provider=application_context.identity_provider,
+        confidence=round(float(application_context.confidence), 2),
+        baseline_findings=len(baseline_findings),
+    )
     if baseline_findings:
         application_context = replace(
             application_context,
@@ -255,6 +304,14 @@ def review_pull_request(
         )
 
     batch: L1ReviewBatch = l1_reviewer.review(repo_path, diff, relevance, application_context)
+    stage(
+        "candidates_generated",
+        candidates=len(batch.candidates),
+        files_reviewed=len(batch.reviewed_paths),
+        model_calls=batch.model_calls,
+        coverage_complete=batch.coverage_complete,
+        coverage_gaps=len(batch.coverage_gaps),
+    )
     verifications = (
         candidate_verifier.verify(
             repo_path,
@@ -266,6 +323,13 @@ def review_pull_request(
         )
         if batch.candidates
         else ()
+    )
+    stage(
+        "verification_complete",
+        evaluated=len(verifications),
+        verified=sum(item.state == "verified" for item in verifications),
+        rejected=sum(item.state == "rejected" for item in verifications),
+        unresolved=sum(item.state == "unresolved" for item in verifications),
     )
     provisional_coverage_complete = batch.coverage_complete and not any(
         item.state == "unresolved" for item in verifications
@@ -285,6 +349,21 @@ def review_pull_request(
         triage_states=_triage_states(session_factory, tenant_id, baseline_classifications),
     )
     counters = _counters(batch, verifications, baseline_classifications, policy)
+    stage(
+        "baseline_compared",
+        introduced=counters.introduced,
+        regressed=counters.regressed,
+        modified_existing=counters.modified_existing,
+        existing=counters.existing,
+        resolved=counters.resolved,
+    )
+    stage(
+        "policy_evaluated",
+        decision=policy.decision,
+        blocking=policy.blocking_count,
+        in_triage=policy.in_triage_count,
+        coverage_complete=provisional_coverage_complete,
+    )
     coverage_gaps = tuple(batch.coverage_gaps) + tuple(
         gap for result in verifications if result.state == "unresolved" for gap in result.evidence_gaps
     )
