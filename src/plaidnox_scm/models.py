@@ -253,3 +253,22 @@ class FindingOccurrenceRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class PullRequestStateRecord(Base):
+    """Open/closed/merged per pull request: the fence for late finding-status writes.
+
+    Review runs and merge/close events lock this row, so a review that started before
+    the PR closed can never set the closed PR's findings back to open.
+    """
+
+    __tablename__ = "scm_pull_request_states"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    codebase_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    review_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # open | closed | merged
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

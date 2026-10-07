@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -92,6 +94,8 @@ class _LeaseHeartbeat:
             with attempts.unit_of_work(self._session_factory, self._tenant_id) as repository:
                 repository.renew(self._review_id, self._lease_owner, self._lease_seconds)
 
+
+logger = logging.getLogger(__name__)
 
 _POLICY_ACTIONS = {
     "PASS": PolicyAction.ALLOW,
@@ -364,6 +368,10 @@ class ReviewService:
                             idempotency_key=f"github:{delivery_id}:{event_type}",
                         )
                     )
+            if inserted and event_name == "pull_request" and action == "reopened" and pull_number:
+                occurrences.FindingOccurrenceRepository(session, tenant_id).reopen_pull_request(
+                    f"{provider}:repository:{repository_id}", pull_number
+                )
             if inserted and event_name == "pull_request" and action in {"merged", "closed"} and pull_number:
                 # Same transaction as the delivery record: if the lifecycle update fails, the
                 # delivery is not recorded either, so GitHub's redelivery applies it again.
@@ -758,7 +766,7 @@ def _apply_occurrences(
         if item.outcome in CARRIED_OUTCOMES and item.scope == "pr"
     }
     observed = [_stored_finding(finding) for finding in response.findings if finding.finding_id not in carried]
-    repository.record_run(
+    applied = repository.record_run(
         codebase_id,
         request.review_number,
         review_id=review_id,
@@ -767,6 +775,9 @@ def _apply_occurrences(
         outcomes=known_outcomes,
         run_started_at=run_started_at,
     )
+    if not applied:
+        # The PR closed or merged while this run was in flight; its result is history only.
+        return
     for finding in observed:
         # Reported again: a finding resolved earlier has regressed.
         fix_triage.record_regression(str(finding["finding_id"]), review_id)
@@ -795,6 +806,61 @@ def _apply_pull_request_close(
         for finding_id in outcome.resolved:
             fix_triage.confirm_claimed_fix(finding_id, f"merge:pr:{review_number}")
     return outcome
+
+
+def _carried_finding(outcome: KnownOutcome, request: ReviewRequest, tenant_id: str) -> ReviewFinding:
+    """A still-open finding from an earlier run, never silently dropped.
+
+    It still counts for merge policy, so it must also be in the response. Stored data that
+    no longer validates (an older or damaged payload) is reduced, never omitted: first
+    the invalid optional fields are dropped, then a minimal finding is rebuilt from the
+    identity and location.
+    """
+
+    payload = {**outcome.finding, "lifecycle": "carried_forward"}
+    try:
+        return ReviewFinding.model_validate(payload)
+    except ValidationError as exc:
+        logger.warning(
+            "stored finding %s failed validation; returning a reduced copy", outcome.finding_id, exc_info=True
+        )
+        invalid = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
+    required = {name for name, field in ReviewFinding.model_fields.items() if field.is_required()}
+    trimmed = {key: value for key, value in payload.items() if key not in invalid - required}
+    try:
+        return ReviewFinding.model_validate(trimmed)
+    except ValidationError:
+        pass
+    stored = outcome.finding
+
+    def text(key: str, default: str) -> str:
+        value = stored.get(key)
+        return value if isinstance(value, str) and value else default
+
+    def number(key: str, default: float) -> float:
+        value = stored.get(key)
+        return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else default
+
+    return ReviewFinding(
+        finding_id=outcome.finding_id,
+        root_cause_fingerprint=text("root_cause_fingerprint", outcome.finding_id),
+        title=text("title", "Previously verified finding"),
+        severity=text("severity", "medium"),
+        confidence=min(1.0, max(0.0, number("confidence", 0.0))),
+        description=text("description", outcome.reason or "Verified on an earlier commit of this pull request."),
+        root_cause_path=text("root_cause_path", "unknown"),
+        root_cause_symbol=text("root_cause_symbol", ""),
+        root_cause_start_line=max(1, int(number("root_cause_start_line", 1))),
+        root_cause_changed_in_pr=bool(stored.get("root_cause_changed_in_pr", True)),
+        baseline_relationship=text("baseline_relationship", "introduced"),
+        tenant_id=tenant_id,
+        repository_id=request.repository_id,
+        base_revision=request.base_sha,
+        head_revision=request.head_sha,
+        verified_at=datetime.now(UTC),
+        evidence_gaps=["Stored details of this finding could not be read; showing its identity and location only."],
+        lifecycle="carried_forward",
+    )
 
 
 def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> ReviewResponse:
@@ -921,12 +987,8 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
     for outcome in getattr(result, "known_outcomes", ()):
         if outcome.scope != "pr" or outcome.outcome not in CARRIED_OUTCOMES or outcome.finding_id in emitted:
             continue
-        try:
-            carried = ReviewFinding.model_validate({**outcome.finding, "lifecycle": "carried_forward"})
-        except ValueError:
-            continue
         emitted.add(outcome.finding_id)
-        findings.append(carried)
+        findings.append(_carried_finding(outcome, request, tenant_id))
 
     action = _POLICY_ACTIONS[result.policy.decision]
     incomplete_reason = None

@@ -9,10 +9,11 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .lifecycle import CARRIED_OUTCOMES, FIXED_OUTCOMES, KnownFinding, KnownOutcome
-from .models import FindingOccurrenceRecord
+from .models import FindingOccurrenceRecord, PullRequestStateRecord
 
 OPEN: Final = "open"
 FIXED: Final = "fixed"
@@ -68,9 +69,15 @@ class FindingOccurrenceRepository:
         observed: Iterable[dict[str, Any]],
         outcomes: Iterable[KnownOutcome],
         run_started_at: datetime | None = None,
-    ) -> None:
-        """Apply one completed run of a pull request to its finding statuses."""
+    ) -> bool:
+        """Apply one completed run of a pull request to its finding statuses.
 
+        Returns False, writing nothing, when the PR was closed or merged first: a run that
+        finishes after the PR closed must not set its findings back to open.
+        """
+
+        if self._lock_pull_request(codebase_id, review_number).state != OPEN:
+            return False
         scope = pr_scope(review_number)
 
         def current(record: FindingOccurrenceRecord) -> bool:
@@ -131,10 +138,15 @@ class FindingOccurrenceRepository:
                     record.finding = dict(outcome.finding)
                     record.last_seen_head = None
         self._session.flush()
+        return True
 
     def close_pull_request(self, codebase_id: str, review_number: int, *, merged: bool, head: str | None) -> MergeOutcome:
         """PR merged: open findings move to the branch, fixes close branch findings. Closed: retire."""
 
+        pull_request = self._lock_pull_request(codebase_id, review_number)
+        if pull_request.state == MERGED or (pull_request.state == CLOSED and not merged):
+            return MergeOutcome((), (), ())  # already applied
+        pull_request.state = MERGED if merged else CLOSED
         scope = pr_scope(review_number)
         promoted: list[str] = []
         resolved: list[str] = []
@@ -164,6 +176,47 @@ class FindingOccurrenceRepository:
                 resolved.append(row.finding_id)
         self._session.flush()
         return MergeOutcome(tuple(promoted), tuple(resolved), tuple(closed))
+
+    def reopen_pull_request(self, codebase_id: str, review_number: int) -> tuple[str, ...]:
+        """A closed (not merged) PR reopened: its closed findings are open and tracked again."""
+
+        pull_request = self._lock_pull_request(codebase_id, review_number)
+        if pull_request.state != CLOSED:
+            return ()
+        pull_request.state = OPEN
+        reopened: list[str] = []
+        for row in self._rows(codebase_id, pr_scope(review_number), (CLOSED,)):
+            row.status = OPEN
+            reopened.append(row.finding_id)
+        self._session.flush()
+        return tuple(reopened)
+
+    def pull_request_state(self, codebase_id: str, review_number: int) -> str:
+        record = self._session.get(PullRequestStateRecord, (self._tenant_id, codebase_id, review_number))
+        return record.state if record is not None else OPEN
+
+    def _lock_pull_request(self, codebase_id: str, review_number: int) -> PullRequestStateRecord:
+        """Get-or-create the PR's state row and lock it until this transaction ends.
+
+        Runs and close events for one PR serialize on this row (PostgreSQL row lock), so
+        a run that commits after a close sees the closed state and writes nothing.
+        """
+
+        key = {"tenant_id": self._tenant_id, "codebase_id": codebase_id, "review_number": review_number}
+        if self._session.get(PullRequestStateRecord, tuple(key.values())) is None:
+            try:
+                with self._session.begin_nested():
+                    self._session.add(PullRequestStateRecord(**key, state=OPEN))
+                    self._session.flush()
+            except IntegrityError:
+                pass  # created concurrently; lock the existing row below
+        record = self._session.scalars(
+            select(PullRequestStateRecord)
+            .filter_by(**key)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).one()
+        return record
 
     def _rows(self, codebase_id: str, scope: str, statuses: Iterable[str]) -> list[FindingOccurrenceRecord]:
         return list(self._session.scalars(

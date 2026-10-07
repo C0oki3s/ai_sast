@@ -117,6 +117,8 @@ survives later scans; a fixed finding that comes back is reopened.
 | `!fixed` claimed | Resolved in triage only when a later run or the merge proves the fix; otherwise the per-scope status shows "fixed". A resolved finding reported again is reopened. |
 | PR merged | Its open findings become default-branch findings; findings it fixed are fixed on the branch (and a `!fixed` claim on them is resolved). |
 | PR closed without merging | Its open findings are closed; the branch is untouched. |
+| PR reopened | Its closed findings are open and tracked again. |
+| A review finishes after the PR closed or merged | Its result is returned, but it changes no finding status or triage. |
 | Default-branch bug fixed in a later PR | That PR re-verifies it when it touches the file; RESOLVED in the PR; fixed on the branch only when the PR merges. |
 | Same bug open in two PRs | Same id; fixed status is tracked per PR, triage is shared. |
 
@@ -127,3 +129,11 @@ Durability: a review's completion, its triage changes and its finding statuses a
 committed in one transaction; if that fails the attempt is marked failed and a retry
 runs the review again. The merge/close update is part of the webhook delivery claim's
 transaction; if it fails the delivery is not recorded, so a redelivery applies it.
+Review runs and merge/close/reopen events lock the PR's row in
+`scm_pull_request_states`, so a review that started before the PR closed cannot set
+its findings back to open, whatever order the two transactions commit in.
+
+A carried-forward finding is always in the response (it still counts for merge
+policy). If its stored data no longer validates, invalid optional fields are dropped,
+or a minimal finding is rebuilt from its identity and location, with an evidence gap
+saying so.

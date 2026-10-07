@@ -493,7 +493,7 @@ def _transactional_factory():
     return factory
 
 
-def _jwt_service(tmp_path: Path):
+def _jwt_service(tmp_path: Path, *, during_verify=None, factory=None):
     """A ReviewService over a real mirror: push 1 adds a JWT bug, push 2 fixes it."""
 
     from test_scm_api import _factory as _api_factory
@@ -526,6 +526,8 @@ def _jwt_service(tmp_path: Path):
 
     class Verifier:
         def verify(self, repo_path, head_revision, repository_name, application_context, candidates, minimum_depth):
+            if during_verify is not None:
+                during_verify()
             return tuple(CandidateVerification(
                 candidate_id=candidate.candidate_id, state="verified", confidence=0.97,
                 title="JWT claims accepted without signature verification", vulnerability_class="CWE-347",
@@ -536,7 +538,7 @@ def _jwt_service(tmp_path: Path):
                 route=ROUTE,
             ) for candidate in candidates)
 
-    factory = _api_factory()
+    factory = factory or _api_factory()
     service = ReviewService(
         RepositoryMirrorBroker(tmp_path / "mirrors"),
         factory,
@@ -646,3 +648,99 @@ def test_a_complete_run_marks_a_deleted_files_finding_fixed(tmp_path: Path) -> N
 
     assert outcomes == {"A": "fixed_removed"}
     assert verifier.asked == []
+
+
+def _push(tmp_path: Path, request, delivery_id: str):
+    """A second push to the same PR (touches another file), as a new review request."""
+
+    head = _commit(tmp_path / "mirrors" / "github" / "899377752", {f"lib/{delivery_id}.js": "x\n"})
+    return request.model_copy(update={"delivery_id": delivery_id, "head_sha": head})
+
+
+def _deliver(service, action: str, delivery_id: str) -> None:
+    service.claim_webhook_delivery(
+        delivery_id=delivery_id, provider="github", installation_id=12345, repository_id=899377752,
+        event_name="pull_request", action=action, pull_number=7, head_sha="m" * 40,
+    )
+
+
+def _pr_rows(factory) -> dict[str, str]:
+    from plaidnox_scm.models import FindingOccurrenceRecord
+
+    with factory() as session:
+        return {
+            row.scope: row.status
+            for row in session.query(FindingOccurrenceRecord).filter_by(codebase_id="github:repository:899377752")
+        }
+
+
+def test_a_review_that_finishes_after_the_pr_closed_does_not_reopen_its_findings(tmp_path: Path) -> None:
+    holder: dict = {}
+    service, factory, request = _jwt_service(
+        tmp_path, during_verify=lambda: holder["close"]() if "close" in holder else None
+    )
+    first = service.run(request)  # push 1: the PR has an open finding
+    assert _pr_rows(factory) == {"pr:7": "open"}
+
+    # Push 2's review is still verifying when the PR is closed without merging.
+    holder["close"] = lambda: (_deliver(service, "closed", "close-1"), holder.pop("close"))
+    late = service.run(_push(tmp_path, request, "d2"))
+
+    assert late.findings and late.findings[0].finding_id == first.findings[0].finding_id
+    assert _pr_rows(factory) == {"pr:7": "closed"}  # the late run did not set it back to open
+
+
+def test_a_review_that_finishes_after_the_pr_merged_does_not_touch_the_pr_or_the_branch(tmp_path: Path) -> None:
+    holder: dict = {}
+    service, factory, request = _jwt_service(
+        tmp_path, during_verify=lambda: holder["merge"]() if "merge" in holder else None
+    )
+    service.run(request)
+    holder["merge"] = lambda: (_deliver(service, "merged", "merge-1"), holder.pop("merge"))
+    service.run(_push(tmp_path, request, "d2"))
+
+    assert _pr_rows(factory) == {"pr:7": "merged", "branch": "open"}
+
+
+def test_a_reopened_pr_tracks_its_findings_again(tmp_path: Path) -> None:
+    service, factory, request = _jwt_service(tmp_path)
+    service.run(request)
+    _deliver(service, "closed", "close-1")
+    assert _pr_rows(factory) == {"pr:7": "closed"}
+
+    _deliver(service, "reopened", "reopen-1")
+    assert _pr_rows(factory) == {"pr:7": "open"}
+    with occurrences.unit_of_work(factory, "test-tenant") as repository:
+        assert len(repository.known("github:repository:899377752", "pr:7")) == 1  # carried again
+    service.run(_push(tmp_path, request, "d3"))
+    assert _pr_rows(factory) == {"pr:7": "open"}
+
+
+def test_a_repeated_close_delivery_is_a_no_op() -> None:
+    factory = _occurrence_factory()
+    with occurrences.unit_of_work(factory, TENANT) as repository:
+        repository.record_run(CODEBASE, 9, review_id="r1", head="h1", observed=[_finding("A")], outcomes=())
+        assert repository.close_pull_request(CODEBASE, 9, merged=False, head=None).closed == ("A",)
+        assert repository.close_pull_request(CODEBASE, 9, merged=False, head=None).closed == ()
+        assert repository.record_run(CODEBASE, 9, review_id="r2", head="h2", observed=[_finding("B")], outcomes=()) is False
+        assert repository.known(CODEBASE, "pr:9") == ()
+
+
+def test_a_carried_finding_with_damaged_stored_data_is_still_returned() -> None:
+    from plaidnox_scm.api_models import ReviewRequest
+    from plaidnox_scm.api_service import _carried_finding
+    from plaidnox_scm.lifecycle import KnownOutcome
+
+    request = ReviewRequest(
+        provider="github", installation_id=1, repository_full_name="a/b", repository_id=5, review_number=9,
+        base_sha="a" * 40, head_sha="b" * 40, base_ref="main", head_ref="f", delivery_id="d",
+    )
+    stored = {**_known("A", "app.py", "c" * 40).finding, "evidence_trace": "not-a-trace", "unknown_key": 1}
+    reduced = _carried_finding(KnownOutcome("A", "pr", "carried_unchanged", "same code", stored), request, TENANT)
+    assert (reduced.finding_id, reduced.title, reduced.lifecycle) == ("A", "Finding A", "carried_forward")
+    assert reduced.evidence_trace is None
+
+    broken = {"finding_id": "B", "root_cause_path": "app.py", "root_cause_start_line": "ten", "title": 3}
+    minimal = _carried_finding(KnownOutcome("B", "pr", "carried_unchanged", "same code", broken), request, TENANT)
+    assert (minimal.finding_id, minimal.root_cause_path, minimal.root_cause_start_line) == ("B", "app.py", 1)
+    assert minimal.lifecycle == "carried_forward" and minimal.evidence_gaps

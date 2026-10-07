@@ -23,3 +23,14 @@ CREATE TABLE IF NOT EXISTS scm_finding_occurrences (
 CREATE INDEX IF NOT EXISTS ix_scm_finding_occurrences_scope
     ON scm_finding_occurrences (tenant_id, codebase_id, scope, status);
 ALTER TABLE scm_finding_occurrences ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ;
+
+-- Open/closed/merged per pull request. Review runs and merge/close events lock this
+-- row, so a review that started before a PR closed cannot reopen its findings.
+CREATE TABLE IF NOT EXISTS scm_pull_request_states (
+    tenant_id VARCHAR(64) NOT NULL,
+    codebase_id VARCHAR(64) NOT NULL,
+    review_number INTEGER NOT NULL,
+    state VARCHAR(16) NOT NULL DEFAULT 'open',
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, codebase_id, review_number)
+);
