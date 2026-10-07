@@ -48,9 +48,14 @@ COMMANDS: Final = (COMMAND_VALID, COMMAND_FP, COMMAND_ACCEPTED_RISK, COMMAND_FIX
 SYSTEM_ACTOR: Final = "plaidnox"
 EVENT_FIX_VALIDATED: Final = "fix_validated"
 EVENT_FIX_REJECTED: Final = "fix_rejected"
+EVENT_FIX_REGRESSED: Final = "fix_regressed"
 # A human `false_positive` verdict is not overridden by a later rejection.
 _RESOLVABLE_STATES: Final = frozenset({OPEN, CONFIRMED, ACCEPTED_RISK, FIX_PENDING, FIX_VALIDATING})
 _REOPENABLE_STATES: Final = frozenset({FIX_PENDING, FIX_VALIDATING})
+# Scanner-proven fixes only settle a human `!fixed` claim. An untouched finding's
+# fix is shown by its per-scope lifecycle status instead, so a finding fixed in
+# one PR is not marked resolved everywhere while another branch still has it.
+_CLAIMED_FIX_STATES: Final = frozenset({FIX_PENDING, FIX_VALIDATING})
 
 _REASON_REQUIRED: Final = frozenset({COMMAND_FP, COMMAND_ACCEPTED_RISK})
 
@@ -153,6 +158,30 @@ class FindingTriageRepository:
                 return None
             new_state, event = OPEN, EVENT_FIX_REJECTED
         return self._transition(record, finding_id, review_id, event, current_state, new_state, SYSTEM_ACTOR, None)
+
+    def confirm_claimed_fix(self, finding_id: str, review_id: str) -> TriageOutcome | None:
+        """A scanner-proven fix resolves the finding only if somebody claimed it with `!fixed`."""
+
+        record = self._session.get(FindingTriageRecord, (self._tenant_id, finding_id))
+        if record is None or record.state not in _CLAIMED_FIX_STATES:
+            return None
+        return self._transition(
+            record, finding_id, review_id, EVENT_FIX_VALIDATED, record.state, RESOLVED, SYSTEM_ACTOR, None
+        )
+
+    def record_regression(self, finding_id: str, review_id: str) -> TriageOutcome | None:
+        """A resolved finding reported again is reopened (SonarQube: Fixed -> Reopened).
+
+        Human verdicts (false positive, accepted risk, confirmed) are left alone.
+        """
+
+        record = self._session.get(FindingTriageRecord, (self._tenant_id, finding_id))
+        if record is None or record.state != RESOLVED:
+            return None
+        return self._transition(
+            record, finding_id, review_id, EVENT_FIX_REGRESSED, RESOLVED, OPEN, SYSTEM_ACTOR,
+            "Reported again after it was resolved",
+        )
 
     def list_events(self, finding_id: str) -> tuple[TriageEvent, ...]:
         rows = self._session.scalars(

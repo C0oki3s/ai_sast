@@ -103,6 +103,8 @@ def classify_against_baseline(
     *,
     coverage_complete: bool,
     prior_findings: tuple[PriorFinding, ...] = (),
+    forced_identities: dict[str, tuple[str, str]] | None = None,
+    baseline_signatures: tuple[PriorFinding, ...] = (),
 ) -> tuple[FindingBaselineClassification, ...]:
     """Compare head verification results to findings from the exact base.
 
@@ -141,8 +143,19 @@ def classify_against_baseline(
             current.source_hash if verification.state == "verified" else None,
         )
         reused_finding: str | None = None
+        forced = (forced_identities or {}).get(verification.candidate_id)
+        if forced is not None:
+            # A tracked finding seen again (re-check, or identical code) keeps its identity.
+            root_fingerprint, reused_finding = forced
         baseline = baseline_by_root.get(root_fingerprint)
-        if baseline is None:
+        if baseline is None and forced is None and baseline_signatures and verification.state == "verified":
+            # The same bug as an open default-branch finding, reworded or moved: existing debt.
+            branch = next((item for item in baseline_signatures if same_issue(item.signature, current)), None)
+            if branch is not None and branch.root_cause_fingerprint in baseline_by_root:
+                baseline = baseline_by_root[branch.root_cause_fingerprint]
+                root_fingerprint = baseline.root_cause_fingerprint
+                reused_finding = branch.finding_fingerprint
+        if baseline is None and forced is None:
             location_matches = baseline_by_location.get(
                 (_normalise_path(candidate.changed_path), _normalise_text(candidate.changed_symbol)),
                 [],
@@ -151,7 +164,7 @@ def classify_against_baseline(
                 (), location_matches[0].vulnerability_class, location_matches[0].title
             ) == issue_class:
                 baseline = location_matches[0]
-        if verification.state == "verified" and prior_findings:
+        if forced is None and reused_finding is None and verification.state == "verified" and prior_findings:
             prior = next((item for item in prior_findings
                           if item.finding_fingerprint not in claimed_prior
                           and item.signature.source_hash is not None
@@ -161,7 +174,7 @@ def classify_against_baseline(
                 claimed_prior.add(prior.finding_fingerprint)
                 root_fingerprint = prior.root_cause_fingerprint
                 reused_finding = prior.finding_fingerprint
-        elif baseline is not None and not root_changed:
+        elif baseline is not None and not root_changed and reused_finding is None:
             # The unchanged baseline identity is safe to retain. A changed path
             # needs matching source evidence from a prior run before triage follows.
             root_fingerprint = baseline.root_cause_fingerprint

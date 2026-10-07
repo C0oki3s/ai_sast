@@ -220,3 +220,36 @@ class ReviewAttemptRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class FindingOccurrenceRecord(Base):
+    """Where a finding currently stands, per pull request and on the default branch.
+
+    ``scope`` is ``pr:<number>`` for one pull request or ``branch`` for the default
+    branch. Status is per scope, as in GitHub code scanning ("fixed in one branch
+    but not another"); human triage stays global in ``scm_finding_triage``.
+    """
+
+    __tablename__ = "scm_finding_occurrences"
+    __table_args__ = (Index("ix_scm_finding_occurrences_scope", "tenant_id", "codebase_id", "scope", "status"),)
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    codebase_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
+    finding_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # open | fixed | closed (PR closed unmerged) | merged (PR merged; tracked on branch)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    finding: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    first_seen_review_id: Mapped[str | None] = mapped_column(String(64))
+    last_seen_review_id: Mapped[str | None] = mapped_column(String(64))
+    last_seen_head: Mapped[str | None] = mapped_column(String(64))
+    fixed_review_id: Mapped[str | None] = mapped_column(String(64))
+    fixed_head: Mapped[str | None] = mapped_column(String(64))
+    fixed_reason: Mapped[str | None] = mapped_column(String)
+    reopened_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Start time of the run that last changed this row; older runs never overwrite newer ones.
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

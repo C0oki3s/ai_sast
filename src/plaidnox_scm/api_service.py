@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from plaidnox_sast.redaction import redact
 from plaidnox_sast.llm import tenant_cache_namespace
 
-from . import attempts, context_store, triage
+from . import attempts, context_store, occurrences, triage
 from .api_models import (
     ClassificationReference,
     FindingEvidence,
@@ -37,6 +37,7 @@ from .api_models import (
 )
 from .assets import load_json
 from .baseline import FindingBaselineClassification, prior_findings_from_stored
+from .lifecycle import CARRIED_OUTCOMES, FIXED_OUTCOMES, KnownFinding, KnownOutcome, known_from_stored
 from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
 from .models import ActivityEventRecord, InstallationTenantRecord, WebhookDeliveryRecord
@@ -155,6 +156,7 @@ class ReviewService:
             prior_findings = prior_findings_from_stored(
                 repository.previous_findings(codebase_id, request.review_number, exclude_review_id=review_id)
             )
+        known_findings = self._known_findings(tenant_id, codebase_id, request.review_number, review_id)
 
         _record_review_activity(
             self.session_factory,
@@ -206,6 +208,7 @@ class ReviewService:
                         self.session_factory,
                         on_stage=on_stage,
                         prior_findings=prior_findings,
+                        known_findings=known_findings,
                     )
                     if result.outcome == "configuration_required":
                         dependencies = self.dependencies_factory()
@@ -221,6 +224,7 @@ class ReviewService:
                             candidate_verifier=dependencies.candidate_verifier,
                             on_stage=on_stage,
                             prior_findings=prior_findings,
+                        known_findings=known_findings,
                         )
             except Exception as exc:
                 with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
@@ -256,19 +260,19 @@ class ReviewService:
                     f"{application_context.source_tree_hash}"
                 ),
             )
-        with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
-            completed = repository.complete(
-                review_id,
-                lease_owner,
-                outcome=result.outcome,
-                action=response.action.value,
-                summary=response.summary,
-                incomplete_reason=response.incomplete_reason,
-                counters=_counters_dict(result.counters),
-                findings=[_stored_finding(finding) for finding in response.findings],
+        try:
+            completed = self._complete_review(
+                tenant_id, codebase_id, request, review_id, lease_owner, response, result, attempt.started_at
             )
+        except Exception as exc:
+            # Nothing was committed: neither the completion nor the finding statuses. Fail the
+            # attempt so a retry runs the review again and writes both together.
+            with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
+                repository.fail(
+                    review_id, lease_owner, error_type=type(exc).__name__, error_message=redact(str(exc))
+                )
+            raise
         if completed:
-            self._record_fix_validations(tenant_id, review_id, result)
             event_type = "review_incomplete" if response.action is PolicyAction.INCOMPLETE else "review_completed"
             _record_review_activity(
                 self.session_factory,
@@ -360,6 +364,17 @@ class ReviewService:
                             idempotency_key=f"github:{delivery_id}:{event_type}",
                         )
                     )
+            if inserted and event_name == "pull_request" and action in {"merged", "closed"} and pull_number:
+                # Same transaction as the delivery record: if the lifecycle update fails, the
+                # delivery is not recorded either, so GitHub's redelivery applies it again.
+                _apply_pull_request_close(
+                    session,
+                    tenant_id,
+                    f"{provider}:repository:{repository_id}",
+                    pull_number,
+                    merged=action == "merged",
+                    head_sha=head_sha,
+                )
             accepted = inserted or existing.state != "queued"
         return accepted, tenant_id
 
@@ -568,21 +583,97 @@ class ReviewService:
             )
         return action, summary
 
+    def _known_findings(
+        self, tenant_id: str, codebase_id: str, review_number: int, review_id: str
+    ) -> tuple[KnownFinding, ...]:
+        """Open findings of this PR (from earlier runs) and of the default branch."""
+
+        scope = occurrences.pr_scope(review_number)
+        with occurrences.unit_of_work(self.session_factory, tenant_id) as repository:
+            pr_known = repository.known(codebase_id, scope)
+            tracked = repository.has_scope(codebase_id, scope)
+            branch_known = repository.known(codebase_id, occurrences.BRANCH)
+        if not tracked:
+            # PR reviewed before lifecycle tracking existed: seed from its earlier runs.
+            with attempts.unit_of_work(self.session_factory, tenant_id) as repository:
+                pr_known = known_from_stored(
+                    "pr", list(repository.previous_runs(codebase_id, review_number, exclude_review_id=review_id))
+                )
+        return (*pr_known, *branch_known)
+
+    def _complete_review(
+        self,
+        tenant_id: str,
+        codebase_id: str,
+        request: ReviewRequest,
+        review_id: str,
+        lease_owner: str,
+        response: ReviewResponse,
+        result: ReviewResult,
+        run_started_at: datetime | None,
+    ) -> bool:
+        """Completion, triage changes and finding statuses commit together or not at all.
+
+        A completed attempt is replayed as-is on retry, so anything written after the
+        completion commit could be lost for good if it failed.
+        """
+
+        with self.session_factory.begin() as session:
+            completed = attempts.ReviewAttemptRepository(session, tenant_id).complete(
+                review_id,
+                lease_owner,
+                outcome=result.outcome,
+                action=response.action.value,
+                summary=response.summary,
+                incomplete_reason=response.incomplete_reason,
+                counters=_counters_dict(result.counters),
+                findings=[_stored_finding(finding) for finding in response.findings],
+            )
+            if completed:
+                fix_triage = triage.FindingTriageRepository(session, tenant_id)
+                _apply_fix_validations(fix_triage, review_id, result)
+                _apply_occurrences(
+                    occurrences.FindingOccurrenceRepository(session, tenant_id),
+                    fix_triage,
+                    codebase_id,
+                    request,
+                    review_id,
+                    response,
+                    result,
+                    run_started_at,
+                )
+        return completed
+
     def _record_fix_validations(self, tenant_id: str, review_id: str, result: ReviewResult) -> None:
-        with triage.unit_of_work(self.session_factory, tenant_id) as repository:
-            for item in result.baseline_classifications:
-                if item.relationship == "RESOLVED":
-                    repository.record_fix_validation(
-                        item.finding_fingerprint,
-                        review_id,
-                        resolved=True,
-                    )
-                elif item.verification_state == "verified":
-                    repository.record_fix_validation(
-                        item.finding_fingerprint,
-                        review_id,
-                        resolved=False,
-                    )
+        with self.session_factory.begin() as session:
+            _apply_fix_validations(triage.FindingTriageRepository(session, tenant_id), review_id, result)
+
+    def _record_occurrences(
+        self,
+        tenant_id: str,
+        codebase_id: str,
+        request: ReviewRequest,
+        review_id: str,
+        response: ReviewResponse,
+        result: ReviewResult,
+        run_started_at: datetime | None = None,
+    ) -> None:
+        with self.session_factory.begin() as session:
+            _apply_occurrences(
+                occurrences.FindingOccurrenceRepository(session, tenant_id),
+                triage.FindingTriageRepository(session, tenant_id),
+                codebase_id, request, review_id, response, result, run_started_at,
+            )
+
+    def close_pull_request(
+        self, tenant_id: str, codebase_id: str, review_number: int, *, merged: bool, head_sha: str | None
+    ) -> occurrences.MergeOutcome:
+        """PR merged: its open findings become default-branch findings and its fixes close them."""
+
+        with self.session_factory.begin() as session:
+            return _apply_pull_request_close(
+                session, tenant_id, codebase_id, review_number, merged=merged, head_sha=head_sha
+            )
 
     def get_triage(self, review_id: str, finding_id: str) -> TriageStatus | None:
         with attempts.unit_of_work(self.session_factory, tenant_id="") as repository:
@@ -618,6 +709,92 @@ def _replay_response(attempt: attempts.ReviewAttempt) -> ReviewResponse:
         incomplete_reason=attempt.incomplete_reason,
         counters=attempt.counters,
     )
+
+
+def _apply_fix_validations(
+    repository: triage.FindingTriageRepository, review_id: str, result: ReviewResult
+) -> None:
+    for item in result.baseline_classifications:
+        if item.relationship == "RESOLVED":
+            # A default-branch finding fixed in a PR is only fixed on the branch once the PR
+            # merges (see _apply_pull_request_close); nothing changes at review time.
+            continue
+        if item.verification_state == "verified":
+            repository.record_fix_validation(item.finding_fingerprint, review_id, resolved=False)
+
+
+def _apply_occurrences(
+    repository: occurrences.FindingOccurrenceRepository,
+    fix_triage: triage.FindingTriageRepository,
+    codebase_id: str,
+    request: ReviewRequest,
+    review_id: str,
+    response: ReviewResponse,
+    result: ReviewResult,
+    run_started_at: datetime | None,
+) -> None:
+    known_outcomes = tuple(getattr(result, "known_outcomes", ()))
+    accounted = {item.finding_id for item in known_outcomes}
+    # A default-branch finding resolved through the classic baseline path (a matching
+    # candidate verified as gone) is recorded the same way, so the merge closes it.
+    known_outcomes += tuple(
+        KnownOutcome(
+            item.finding_fingerprint, "branch", "fixed_verified", item.reason,
+            {
+                "finding_id": item.finding_fingerprint,
+                "root_cause_fingerprint": item.root_cause_fingerprint,
+                "root_cause_path": item.root_cause_path,
+                "root_cause_symbol": item.root_cause_symbol,
+                "title": item.title,
+                "severity": item.severity,
+                "category": item.vulnerability_class,
+            },
+        )
+        for item in result.baseline_classifications
+        if item.relationship == "RESOLVED" and item.finding_fingerprint not in accounted
+    )
+    carried = {
+        item.finding_id for item in known_outcomes
+        if item.outcome in CARRIED_OUTCOMES and item.scope == "pr"
+    }
+    observed = [_stored_finding(finding) for finding in response.findings if finding.finding_id not in carried]
+    repository.record_run(
+        codebase_id,
+        request.review_number,
+        review_id=review_id,
+        head=request.head_sha,
+        observed=observed,
+        outcomes=known_outcomes,
+        run_started_at=run_started_at,
+    )
+    for finding in observed:
+        # Reported again: a finding resolved earlier has regressed.
+        fix_triage.record_regression(str(finding["finding_id"]), review_id)
+    for item in known_outcomes:
+        # A finding introduced and fixed inside the same PR never reached the default
+        # branch, so the PR's own fix settles a `!fixed` claim on it. Otherwise the
+        # lifecycle status ("fixed in PR #n") carries the fix.
+        if item.scope == "pr" and item.outcome in FIXED_OUTCOMES:
+            fix_triage.confirm_claimed_fix(item.finding_id, review_id)
+
+
+def _apply_pull_request_close(
+    session: Session,
+    tenant_id: str,
+    codebase_id: str,
+    review_number: int,
+    *,
+    merged: bool,
+    head_sha: str | None,
+) -> occurrences.MergeOutcome:
+    outcome = occurrences.FindingOccurrenceRepository(session, tenant_id).close_pull_request(
+        codebase_id, review_number, merged=merged, head=head_sha
+    )
+    if merged:
+        fix_triage = triage.FindingTriageRepository(session, tenant_id)
+        for finding_id in outcome.resolved:
+            fix_triage.confirm_claimed_fix(finding_id, f"merge:pr:{review_number}")
+    return outcome
 
 
 def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> ReviewResponse:
@@ -739,6 +916,18 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
             )
         )
 
+    # Still-open findings from earlier commits of this PR whose code is unchanged (or could
+    # not be re-verified) stay in the result: absence from one LLM run is not a fix.
+    for outcome in getattr(result, "known_outcomes", ()):
+        if outcome.scope != "pr" or outcome.outcome not in CARRIED_OUTCOMES or outcome.finding_id in emitted:
+            continue
+        try:
+            carried = ReviewFinding.model_validate({**outcome.finding, "lifecycle": "carried_forward"})
+        except ValueError:
+            continue
+        emitted.add(outcome.finding_id)
+        findings.append(carried)
+
     action = _POLICY_ACTIONS[result.policy.decision]
     incomplete_reason = None
     if action is PolicyAction.INCOMPLETE:
@@ -835,6 +1024,7 @@ _STAGE_LABELS = {
     "context_ready": "Application context ready",
     "candidates_generated": "Changed-code review complete",
     "verification_complete": "Independent verification complete",
+    "known_findings_checked": "Earlier findings re-checked",
     "baseline_compared": "Compared against the default branch",
     "policy_evaluated": "Merge policy evaluated",
 }

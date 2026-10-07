@@ -45,5 +45,6 @@
     "severity": "high",
     "confidence": 0.5,
     "validator": "plaidnox-deep-hunt"
-  }
+  },
+  "known_finding_recheck_limit": 10
 }

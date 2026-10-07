@@ -8,6 +8,7 @@
     "0005_scm_finding_triage.sql",
     "0006_scm_application_context_type_text.sql",
     "0007_scm_tenants_activity_deliveries.sql",
-    "0008_scm_review_attempt_pr_metadata.sql"
+    "0008_scm_review_attempt_pr_metadata.sql",
+    "0009_scm_finding_occurrences.sql"
   ]
 }

@@ -98,3 +98,32 @@ These are optional and backwards compatible; a bot that ignores them keeps worki
   `verification_complete`, `baseline_compared`, `policy_evaluated`) in
   `scm_activity_events` with the run's `review_id` and stage details in
   `metadata`.
+
+## Finding lifecycle across pushes and pull requests
+
+Modelled on GitHub code scanning, SonarQube and Semgrep: one stable identity per
+finding; *fixed* is per scope (a PR, or the default branch); a human dismissal
+survives later scans; a fixed finding that comes back is reopened.
+
+| Situation | Result |
+| --- | --- |
+| Same bug reported again (reworded, lines moved) | Same `finding_id`; listed once; one PR comment. |
+| Earlier push found it, this push did not, file unchanged | Still open, returned with `lifecycle: "carried_forward"`, still counts for merge policy. An LLM not repeating itself is not a fix. |
+| File changed since it was last verified | Re-verified at the new commit. Verified: still open. Rejected: **fixed in this PR**. Inconclusive: stays open. |
+| Root-cause file deleted (complete run) | Fixed in this PR. |
+| Run incomplete / re-check budget used | Stays open, unchanged. An incomplete run never records a fix, not even for a deleted file. |
+| Fixed, then reintroduced | Reopened (same id, `reopened_count` + 1). |
+| Marked false positive / accepted risk | Stays that way; policy honours it. |
+| `!fixed` claimed | Resolved in triage only when a later run or the merge proves the fix; otherwise the per-scope status shows "fixed". A resolved finding reported again is reopened. |
+| PR merged | Its open findings become default-branch findings; findings it fixed are fixed on the branch (and a `!fixed` claim on them is resolved). |
+| PR closed without merging | Its open findings are closed; the branch is untouched. |
+| Default-branch bug fixed in a later PR | That PR re-verifies it when it touches the file; RESOLVED in the PR; fixed on the branch only when the PR merges. |
+| Same bug open in two PRs | Same id; fixed status is tracked per PR, triage is shared. |
+
+State lives in `scm_finding_occurrences` (scope `pr:<number>` or `branch`).
+Merge/close arrives through the existing `pull_request` `closed` webhook claim.
+
+Durability: a review's completion, its triage changes and its finding statuses are
+committed in one transaction; if that fails the attempt is marked failed and a retry
+runs the review again. The merge/close update is part of the webhook delivery claim's
+transaction; if it fails the delivery is not recorded, so a redelivery applies it.

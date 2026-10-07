@@ -242,6 +242,9 @@ class ReviewFinding(BaseModel):
     context_facts: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)
     classification_references: list[ClassificationReference] = Field(default_factory=list)
+    # "carried_forward": verified on an earlier commit of this PR and its code is unchanged
+    # (or could not be re-verified), so it is still reported. Absent for fresh results.
+    lifecycle: str | None = None
     verified_at: datetime
 
     @model_serializer(mode="wrap")
@@ -257,6 +260,7 @@ class ReviewFinding(BaseModel):
             "security_invariant",
             "gained_capability",
             "reproduction",
+            "lifecycle",
         ):
             if getattr(self, field_name) is None:
                 data.pop(field_name, None)

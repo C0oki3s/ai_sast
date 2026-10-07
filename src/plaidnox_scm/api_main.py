@@ -55,13 +55,21 @@ def main() -> None:
     )
 
 
+# Idempotent SCM migrations applied by the one-off deployment task, in order.
+DEPLOYMENT_MIGRATIONS = (
+    "0008_scm_review_attempt_pr_metadata",
+    "0009_scm_finding_occurrences",
+)
+
+
 def _apply_deployment_migrations() -> None:
-    """Apply the pending idempotent SCM schema migration in a one-off ECS task."""
+    """Apply the pending idempotent SCM schema migrations in a one-off ECS task."""
     engine = DatabaseSettings.from_environment().create_engine()
-    migration = load_text("migrations/postgresql/0008_scm_review_attempt_pr_metadata.sql")
-    with engine.begin() as connection:
-        connection.exec_driver_sql(migration)
-    print("Applied SCM migration 0008_scm_review_attempt_pr_metadata", flush=True)
+    for name in DEPLOYMENT_MIGRATIONS:
+        migration = load_text(f"migrations/postgresql/{name}.sql")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(migration)
+        print(f"Applied SCM migration {name}", flush=True)
 
 
 def _required_environment(name: str) -> str:
