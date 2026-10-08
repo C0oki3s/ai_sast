@@ -95,6 +95,24 @@ These are optional and backwards compatible; a bot that ignores them keeps worki
   proof plan (steps only when the verifier returned no script).
 - `evidence_trace.nodes[].step`: 1-based position in the attack path, source
   first. Order nodes by `step` when present (older traces have no `step`).
+- Taint path (prompt contract 2026-10-08.2): node `kind` is `SOURCE` (untrusted
+  data enters), `PROPAGATION` (the tainted value moves on), `SANITIZER` (a check
+  that should make it safe is missing or bypassed) or `SINK` (the dangerous
+  operation reached). Sources come first and sinks last. `tainted_value` names
+  the variable or expression carrying the attacker's data at that line (kept only
+  when it is visible in the code). `root_cause: true` marks the step whose lines
+  the pull request changed; if no step covers the change, a "Changed code (root
+  cause)" step is inserted after the source. `evidence_trace.sanitizer_status` is
+  `missing` or `bypassed`. Older traces use the previous kinds.
+- English only: every prompt carries an English-only rule. The harness checks
+  every field people read (and PoC script lines) for non-English scripts,
+  garbled encodings, emoji and invisible characters; a violation gets one
+  corrective round, and a second violation fails the verification instead of
+  storing it.
+- No vulnerability: a rejected or unresolved candidate never produces reader text.
+  The verifier is told to leave description, impact, remediation and PoC empty
+  when `supported` is false, and the harness blanks them regardless. Only the
+  verdict and `rejection_reason` are kept (for counters and baseline resolution).
 - Proof of concept format (prompt contract 2026-10-08.1): `### Steps to
   Reproduce`, numbered steps, one fenced script (`bash`, `http`, `python` or
   `javascript`) and an `**Expected result:**` line. The verifier returns the

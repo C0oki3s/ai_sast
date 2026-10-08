@@ -32,6 +32,8 @@ class ReviewEvidence:
     # The verifier's own role for this location (origin, propagation, boundary,
     # defense, effect); its position in the attack path is the order it was listed.
     step_role: str = ""
+    # The variable or expression carrying the attacker's data at this line, per the verifier.
+    tainted_value: str = ""
 
 
 def build_review_evidence(
@@ -78,6 +80,7 @@ def build_review_evidence(
                 summary=str(location.get("summary") or "").strip()[:240]
                 or f"Deep Hunt {location.get('role', 'evidence')!s} evidence",
                 step_role=str(location.get("role", "")),
+                tainted_value=str(location.get("tainted_value") or "").strip()[:160],
             )
         )
     return tuple(values)

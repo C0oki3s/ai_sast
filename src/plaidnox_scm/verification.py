@@ -181,6 +181,9 @@ class SastDeepHuntVerifier:
                     review.evidence_locations,
                 )
                 evidence_gaps = (*(review.evidence_gaps or ()), *expansion.unresolved_gaps)
+                # Only a verified finding is shown to people. A rejected or unresolved
+                # candidate keeps its verdict and reason, never reader-facing text.
+                shown = state == "verified"
                 results.append(
                     CandidateVerification(
                         candidate_id=hypothesis.candidate_id,
@@ -189,9 +192,9 @@ class SastDeepHuntVerifier:
                         title=review.title,
                         vulnerability_class=review.vulnerability_class,
                         severity=review.severity,
-                        message=review.message,
-                        business_impact=review.business_impact,
-                        remediation=review.remediation_note,
+                        message=review.message if shown else "",
+                        business_impact=review.business_impact if shown else "",
+                        remediation=review.remediation_note if shown else "",
                         reasoning=review.reasoning,
                         attack_path=review.attack_path,
                         security_invariant=review.security_invariant,
@@ -205,12 +208,12 @@ class SastDeepHuntVerifier:
                         route=route,
                         evidence=review_evidence,
                         context_expansion=expansion,
-                        proof_plan=review.proof_plan,
-                        proof_of_concept=review.proof_of_concept,
-                        proof_steps=tuple(getattr(review, "proof_steps", None) or ()),
-                        poc_language=str(getattr(review, "poc_language", "") or ""),
-                        poc_script_lines=tuple(getattr(review, "poc_script_lines", None) or ()),
-                        poc_expected_result=str(getattr(review, "poc_expected_result", "") or ""),
+                        proof_plan=review.proof_plan if shown else "",
+                        proof_of_concept=review.proof_of_concept if shown else "",
+                        proof_steps=tuple(getattr(review, "proof_steps", None) or ()) if shown else (),
+                        poc_language=str(getattr(review, "poc_language", "") or "") if shown else "none",
+                        poc_script_lines=tuple(getattr(review, "poc_script_lines", None) or ()) if shown else (),
+                        poc_expected_result=str(getattr(review, "poc_expected_result", "") or "") if shown else "",
                         regression_test=review.regression_test,
                         vulnerable_snippet=build_vulnerable_snippet(root, hypothesis),
                         evidence_trace=build_evidence_trace(

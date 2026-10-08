@@ -135,18 +135,14 @@ def test_evidence_trace_is_machine_supported_and_branches_by_route(tmp_path: Pat
 
     assert trace is not None
     assert trace.trace_type == "taint_and_trust"
-    assert trace.step_count == 6
+    assert trace.step_count == 5  # the header read is both the source and the changed root cause
     assert trace.file_count == 2
     assert trace.complete is True
     assert trace.evidence_gaps == ()
     assert len(trace.entry_nodes) == 1
     assert len(trace.terminal_nodes) == 2
-    assert {node.kind for node in trace.nodes} >= {
-        "SOURCE",
-        "PROPAGATION",
-        "AUTHORIZATION_DECISION",
-        "SENSITIVE_EFFECT",
-    }
+    assert [node.kind for node in trace.nodes] == ["SOURCE", "PROPAGATION", "PROPAGATION", "SINK", "SINK"]
+    assert trace.sanitizer_status == "missing"
     assert all(node.expression for node in trace.nodes)
     assert all(node.symbol for node in trace.nodes)
     assert all(node.provenance for node in trace.nodes)
@@ -223,7 +219,7 @@ def test_trace_node_code_window_is_bounded(tmp_path: Path):
     assert code.splitlines()[0] == f"line {start}"
 
 
-def test_trace_steps_follow_the_attack_order_and_branches_keep_their_own_links(tmp_path: Path):
+def test_trace_is_a_taint_path_from_source_to_sinks_with_the_root_cause_marked(tmp_path: Path):
     _write_fixture(tmp_path)
     trace = build_evidence_trace(
         tmp_path,
@@ -235,45 +231,84 @@ def test_trace_steps_follow_the_attack_order_and_branches_keep_their_own_links(t
     )
 
     assert trace is not None
-    steps = [(node.step, node.label, node.path, node.start_line) for node in trace.nodes]
+    steps = [(node.step, node.label, node.path, node.start_line, node.root_cause) for node in trace.nodes]
     assert steps == [
-        (1, "Attacker origin", "middleware/ValidateToken.js", 3),
-        (2, "Changed root cause", "middleware/ValidateToken.js", 3),
-        (3, "Downstream trust", "app.js", 2),
-        (4, "Downstream trust", "app.js", 8),
-        (5, "Sensitive effect", "app.js", 3),
-        (6, "Sensitive effect", "app.js", 9),
+        (1, "Source", "middleware/ValidateToken.js", 3, True),
+        (2, "Propagation", "app.js", 2, False),
+        (3, "Propagation", "app.js", 8, False),
+        (4, "Sink", "app.js", 3, False),
+        (5, "Sink", "app.js", 9, False),
     ]
     step_of = {node.node_id: node.step for node in trace.nodes}
     links = {(step_of[edge.source], step_of[edge.target]): edge.via for edge in trace.edges}
     assert links == {
-        (1, 2): "same function `authCheck`",
-        (2, 3): "`authCheck` runs before route `GET /dashboard`",
-        (2, 4): "`authCheck` runs before route `GET /api/pdfs`",
-        (3, 5): "`email` flows on within `GET /dashboard`",
-        (4, 6): "`userEmail` flows on within `GET /api/pdfs`",
+        (1, 2): "`authCheck` runs before route `GET /dashboard`",
+        (1, 3): "`authCheck` runs before route `GET /api/pdfs`",
+        (2, 4): "`email` flows on within `GET /dashboard`",
+        (3, 5): "`userEmail` flows on within `GET /api/pdfs`",
     }
-    assert [step_of[item] for item in trace.terminal_nodes] == [5, 6]
+    assert [step_of[item] for item in trace.terminal_nodes] == [4, 5]
     assert trace.complete is True
 
 
-def test_a_verifier_location_on_the_changed_lines_becomes_the_root_cause_step(tmp_path: Path):
+def test_sinks_come_last_and_sources_first_whatever_order_the_verifier_used(tmp_path: Path):
     _write_fixture(tmp_path)
-    evidence = (
-        ReviewEvidence(EvidenceRole.DOWNSTREAM_TRUST, "deep_hunt", "middleware/ValidateToken.js", 4, 4,
-                       "`payload` takes the header value", step_role="propagation"),
-        ReviewEvidence(EvidenceRole.SENSITIVE_EFFECT, "deep_hunt", "app.js", 3, 3, "Lookup by forged email"),
+    reordered = (
+        ReviewEvidence(EvidenceRole.SENSITIVE_EFFECT, "deep_hunt", "app.js", 3, 4, "lookup", step_role="sink",
+                       tainted_value="email"),
+        ReviewEvidence(EvidenceRole.DOWNSTREAM_TRUST, "deep_hunt", "app.js", 2, 2, "claim read",
+                       step_role="propagation", tainted_value='req.user["custom:email_db"]'),
+        ReviewEvidence(EvidenceRole.ATTACKER_ORIGIN, "deep_hunt", "middleware/ValidateToken.js", 3, 3, "header",
+                       step_role="source", tainted_value='req.headers["x-user-email"]'),
     )
     trace = build_evidence_trace(
-        tmp_path, build_structural_graph(tmp_path), _candidate(), evidence,
-        attack_path="a", gained_capability="b",
+        tmp_path, build_structural_graph(tmp_path), _candidate(), reordered, attack_path="a", gained_capability="b"
     )
 
     assert trace is not None
-    first = trace.nodes[0]
-    assert (first.label, first.start_line, first.end_line) == ("Changed root cause", 3, 4)
-    assert first.summary == "`payload` takes the header value"
-    assert len(trace.nodes) == 2
+    assert [(node.kind, node.tainted_value) for node in trace.nodes] == [
+        ("SOURCE", 'req.headers["x-user-email"]'),
+        ("PROPAGATION", 'req.user["custom:email_db"]'),
+        ("SINK", "email"),
+    ]
+
+
+def test_a_tainted_value_that_is_not_in_the_code_is_dropped_and_reported(tmp_path: Path):
+    _write_fixture(tmp_path)
+    evidence = (
+        ReviewEvidence(EvidenceRole.ATTACKER_ORIGIN, "deep_hunt", "middleware/ValidateToken.js", 3, 3, "header",
+                       step_role="source", tainted_value="req.body.password"),
+        ReviewEvidence(EvidenceRole.SENSITIVE_EFFECT, "deep_hunt", "app.js", 3, 4, "lookup", step_role="sink",
+                       tainted_value="email"),
+    )
+    trace = build_evidence_trace(
+        tmp_path, build_structural_graph(tmp_path), _candidate(), evidence, attack_path="a", gained_capability="b"
+    )
+
+    assert trace is not None
+    assert trace.nodes[0].tainted_value == ""
+    assert any("'req.body.password' is not visible" in gap for gap in trace.evidence_gaps)
+    assert trace.complete is False
+
+
+def test_the_changed_code_is_its_own_step_only_when_no_step_covers_it(tmp_path: Path):
+    _write_fixture(tmp_path)
+    evidence = (
+        ReviewEvidence(EvidenceRole.ATTACKER_ORIGIN, "deep_hunt", "middleware/ValidateToken.js", 2, 2, "token",
+                       step_role="source"),
+        ReviewEvidence(EvidenceRole.SENSITIVE_EFFECT, "deep_hunt", "app.js", 3, 3, "lookup", step_role="sink"),
+    )
+    trace = build_evidence_trace(
+        tmp_path, build_structural_graph(tmp_path), _candidate(), evidence, attack_path="a", gained_capability="b"
+    )
+
+    assert trace is not None
+    assert [(node.label, node.root_cause) for node in trace.nodes] == [
+        ("Source", False),
+        ("Changed code (root cause)", True),
+        ("Sink", False),
+    ]
+    assert trace.nodes[1].summary == "Changed in this pull request: request header overwrites a verified identity claim"
 
 
 def test_trace_code_keeps_expressions_that_mention_tokens_and_hides_only_literal_secrets(tmp_path: Path):

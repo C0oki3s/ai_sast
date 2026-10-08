@@ -1301,6 +1301,8 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
                 code_start_line=getattr(item, "code_start_line", None) or None,
                 code_end_line=getattr(item, "code_end_line", None) or None,
                 step=getattr(item, "step", None) or None,
+                tainted_value=redact_code(str(getattr(item, "tainted_value", "") or "")) or None,
+                root_cause=True if getattr(item, "root_cause", False) else None,
             )
             for item in value.nodes
         ]
@@ -1329,6 +1331,7 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
                 for item in getattr(value, "evidence_gaps", ())
                 if str(item).strip()
             ],
+            sanitizer_status=str(getattr(value, "sanitizer_status", "") or "") or None,
         )
     except (AttributeError, TypeError, ValueError):
         return None

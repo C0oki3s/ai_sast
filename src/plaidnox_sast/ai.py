@@ -64,6 +64,7 @@ from .llm import (
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
 from .model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from .prompts import render_operation
+from .language import LanguageProblem, check_fields
 from .textlines import split_model_lines
 from .redaction import redact as _redact
 from .redaction import redact_payload
@@ -563,24 +564,48 @@ class PlaidNoxDeepHuntAgent:
             ),
             "metadata_only": metadata_only,
         }
-        response = self._structured_response(
-            "plaidnox_security_review",
-            load_json("schemas/deep_hunt_review.json"),
-            "metadata_exposure_review" if metadata_only else "security_review",
-            evidence,
-            model_tier=model_tier,
-            reasoning_effort_override=reasoning_effort_override,
-        )
-        review = _deep_hunt_result_from_response(response)
-        _validate_deep_hunt_result(
-            root,
-            candidate,
-            review,
-            metadata_only=metadata_only,
-            evidence_paths=_evidence_paths(
-                candidate, context_expansions, evidence["protected_security_context"]
-            ),
-        )
+        def ask() -> DeepHuntResult:
+            response = self._structured_response(
+                "plaidnox_security_review",
+                load_json("schemas/deep_hunt_review.json"),
+                "metadata_exposure_review" if metadata_only else "security_review",
+                evidence,
+                model_tier=model_tier,
+                reasoning_effort_override=reasoning_effort_override,
+            )
+            result = _deep_hunt_result_from_response(response)
+            _validate_deep_hunt_result(
+                root,
+                candidate,
+                result,
+                metadata_only=metadata_only,
+                evidence_paths=_evidence_paths(
+                    candidate, context_expansions, evidence["protected_security_context"]
+                ),
+            )
+            return result
+
+        review = ask()
+        problems = deep_hunt_language_problems(review)
+        if problems:
+            # One corrective round: the same evidence plus the exact fields to rewrite.
+            self._emit(
+                "candidate_language_retry",
+                rule_id=candidate.rule_id,
+                fields=[problem.field for problem in problems][:8],
+            )
+            evidence["output_language_correction"] = (
+                "Your previous answer contained text that is not English: "
+                + "; ".join(problem.describe() for problem in problems[:6])
+                + ". Return the complete answer again with every natural-language value written in English only."
+            )
+            review = ask()
+            problems = deep_hunt_language_problems(review)
+            if problems:
+                raise AIResponseError(
+                    "AI review returned non-English text after a correction: "
+                    + "; ".join(problem.describe() for problem in problems[:4])
+                )
         return review
 
     def _apply_retry_route(
@@ -2901,6 +2926,31 @@ def _reproduction_fields(proof_plan: Any, proof_of_concept: Any) -> dict[str, An
         "poc_expected_result": expected,
         "proof_of_concept": "\n".join(lines),
     }
+
+
+def deep_hunt_language_problems(review: DeepHuntResult) -> list[LanguageProblem]:
+    """Every natural-language field a person may read must be English (see plaidnox_sast.language)."""
+
+    fields: dict[str, object] = {
+        "title": review.title,
+        "message": review.message,
+        "business_impact": review.business_impact,
+        "remediation_note": review.remediation_note,
+        "reasoning": review.reasoning,
+        "attack_path": review.attack_path,
+        "security_invariant": review.security_invariant,
+        "rejection_reason": review.rejection_reason,
+        "regression_test": review.regression_test,
+        "proof_plan": review.proof_steps,
+        "proof_of_concept.expected_result": review.poc_expected_result,
+        "proof_of_concept.script_lines": review.poc_script_lines,
+        "falsification_attempts": list(review.falsification_attempts or []),
+        "required_preconditions": list(review.required_preconditions or []),
+        "evidence_gaps": list(review.evidence_gaps or []),
+        "evidence_locations.summary": [str(item.get("summary") or "") for item in review.evidence_locations],
+        "gate_results.explanation": [str(item.get("explanation") or "") for item in review.gate_results],
+    }
+    return check_fields(fields, code_fields={"proof_of_concept.script_lines"})
 
 
 def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:

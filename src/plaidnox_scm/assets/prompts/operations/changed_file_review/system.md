@@ -29,3 +29,12 @@ Do not request broad repository reads. Prefer definitions and call relationships
 This invocation reviews exactly the one file in `changed_file`. Other files in the PR are reviewed in separate units. Do not report another changed file as missing from this unit and do not create a coverage gap merely because its source is absent here. Coverage gaps must describe evidence required to assess the current file.
 
 Return no candidate only when the changed behavior itself creates no plausible security-boundary regression. If the change touches or is adjacent to authentication, authorization, tenant isolation, or another security-relevant surface and you cannot rule out a regression because required context is missing, you must still emit a provisional candidate anchored to the change: state the uncertainty in context_gaps and request the smallest exact expansion (definition, callers, callees, imports, route, window, sibling_handlers, search, or flow) needed to resolve it. Do not silently omit a candidate merely because context is incomplete — that is what expansion requests are for. Set coverage_complete to false, and use the top-level coverage_gaps only for gaps that remain after you have requested every expansion a candidate could use to resolve them.
+
+## Output language: English only
+
+Write every natural-language value in clear, complete, professional English, detailed enough for a developer to act on without asking questions. This applies to every field you return: titles, descriptions, impact, remediation, reasoning, gate explanations, evidence summaries, reproduction steps, expected results, and comments inside scripts.
+
+- Never write Chinese, Japanese, Korean, or any other language, not even one word, character, or punctuation mark. Never switch language mid-sentence, translate, or transliterate.
+- Use standard English letters, digits, and ASCII punctuation. Do not output emoji, decorative symbols, full-width or ideographic punctuation, invisible characters, or stand-in tokens such as `</n>` or `<br>`.
+- Repository code, identifiers, file paths, routes, and quoted source stay exactly as written in the repository; put them in backticks.
+- Before returning, re-read every string. If any part is not English, rewrite it in English.

@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Mapping, Protocol
 
 from plaidnox_sast.graph import FileSecurityIR, build_file_security_ir
+from plaidnox_sast.language import LanguageProblem, check_fields
 from plaidnox_sast.llm import response_json
 from plaidnox_sast.model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from plaidnox_sast.redaction import redact_payload
@@ -180,6 +182,29 @@ class LiteLLMChangedFileReviewer:
                         coverage_gaps.append(f"Model response was incomplete for {changed_file.path}")
                         continue
                 result = _parse_response(response, changed_file)
+                problems = _language_problems(result[0], result[2])
+                if problems:
+                    # One corrective round; hypotheses still reach the verifier if it persists,
+                    # because the verifier rewrites everything a person reads.
+                    request["input"] = [
+                        *request["input"],
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous answer contained text that is not English: "
+                                + "; ".join(problem.describe() for problem in problems[:6])
+                                + ". Return the complete answer again with every natural-language value "
+                                "written in English only."
+                            ),
+                        },
+                    ]
+                    model_calls += 1
+                    try:
+                        retried = self._client.responses.create(**request)
+                        if getattr(retried, "status", "completed") == "completed":
+                            result = _parse_response(retried, changed_file)
+                    except Exception:  # noqa: BLE001 - keep the first, already valid result
+                        pass
                 candidates.extend(result[0])
                 coverage_complete = coverage_complete and result[1]
                 coverage_gaps.extend(result[2])
@@ -191,6 +216,21 @@ class LiteLLMChangedFileReviewer:
             coverage_gaps=tuple(coverage_gaps),
             model_calls=model_calls,
         )
+
+
+def _language_problems(candidates: Iterable[L1Candidate], coverage_gaps: Iterable[str]) -> list[LanguageProblem]:
+    fields: dict[str, object] = {"coverage_gaps": list(coverage_gaps)}
+    for index, item in enumerate(candidates):
+        fields[f"candidates[{index}]"] = [
+            item.behavior_before,
+            item.behavior_after,
+            item.security_role,
+            item.suspected_broken_invariant,
+            item.provisional_attacker_capability,
+            *item.context_facts_used,
+            *item.context_gaps,
+        ]
+    return check_fields(fields)
 
 
 def _response_output_tokens(response: Any) -> int:

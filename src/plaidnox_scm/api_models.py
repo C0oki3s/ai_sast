@@ -135,11 +135,15 @@ class FindingTraceNode(BaseModel):
     code_end_line: int | None = Field(default=None, gt=0)
     # 1-based position in the attack path; absent on traces built before it existed.
     step: int | None = Field(default=None, gt=0)
+    # The variable or expression carrying the attacker's data at this line.
+    tainted_value: str | None = None
+    # This step's lines were changed by the pull request.
+    root_cause: bool | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        for field_name in ("code", "code_start_line", "code_end_line", "step"):
+        for field_name in ("code", "code_start_line", "code_end_line", "step", "tainted_value", "root_cause"):
             if getattr(self, field_name) is None:
                 data.pop(field_name, None)
         return data
@@ -172,6 +176,8 @@ class FindingTrace(BaseModel):
     gained_capability: str
     complete: bool = True
     evidence_gaps: list[str] = Field(default_factory=list)
+    # "missing": nothing on the path makes the value safe; "bypassed": a check exists but fails.
+    sanitizer_status: str | None = None
 
 
 class FindingReproduction(BaseModel):

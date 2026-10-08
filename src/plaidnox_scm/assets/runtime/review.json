@@ -35,7 +35,10 @@
       "propagation": "DOWNSTREAM_TRUST",
       "boundary": "SECURITY_BOUNDARY",
       "defense": "DEFENSE_REMOVED_OR_BYPASSED",
-      "effect": "SENSITIVE_EFFECT"
+      "effect": "SENSITIVE_EFFECT",
+      "source": "ATTACKER_ORIGIN",
+      "sanitizer": "DEFENSE_REMOVED_OR_BYPASSED",
+      "sink": "SENSITIVE_EFFECT"
     }
   },
   "provisional_adapter": {
