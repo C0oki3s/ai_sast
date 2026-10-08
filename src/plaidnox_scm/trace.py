@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from plaidnox_sast.graph import StructuralGraph, Symbol
-from plaidnox_sast.redaction import redact
+from plaidnox_sast.redaction import redact, redact_code
 
 from .evidence import EvidenceRole, ReviewEvidence
 from .l1_review import L1Candidate
@@ -41,6 +41,8 @@ class EvidenceTraceNode:
     code: str = ""
     code_start_line: int | None = None
     code_end_line: int | None = None
+    # 1-based position in the attack path (source first, sensitive effect last).
+    step: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +78,7 @@ _ROLE_LAYER = {
 }
 
 # Context lines kept around each trace node, and the hard cap on a stored window.
-_CODE_CONTEXT_LINES = 3
+_CODE_CONTEXT_LINES = 4
 _CODE_WINDOW_MAX_LINES = 40
 _CODE_WINDOW_MAX_CHARS = 4000
 
@@ -105,7 +107,7 @@ def build_vulnerable_snippet(root: Path, candidate: L1Candidate) -> VulnerableSn
     end = min(len(lines), max(start, candidate.changed_lines.end))
     if start > len(lines):
         return None
-    content = redact("\n".join(lines[start - 1 : end])[:4000])
+    content = redact_code("\n".join(lines[start - 1 : end])[:4000])
     return VulnerableSnippet(candidate.changed_path, start, end, content)
 
 
@@ -119,108 +121,80 @@ def build_evidence_trace(
     gained_capability: str,
     evidence_gaps: tuple[str, ...] = (),
 ) -> EvidenceTrace | None:
-    """Build a branching trace from verified evidence and machine-supported relationships.
+    """Build the attack path, source to sink, from verified evidence and supported links.
 
-    The LLM may identify useful evidence locations, but it never gets to invent
-    graph edges. Every node is checked against the immutable head snapshot and
-    every edge must be supported by the structural graph, a shared structural
-    anchor, or a route that explicitly references the upstream middleware/control.
-    Unsupported hops remain visible as evidence gaps and make the trace incomplete.
+    The verifier lists its locations in attack order; that order is kept and each
+    node gets its ``step``. The changed root-cause lines are always a step: merged
+    into the verifier's location when it cites them, otherwise placed after the
+    attacker origin. Overlapping locations collapse into one step.
+
+    The LLM never gets to invent a link. Every node is checked against the
+    immutable head snapshot, and every link between consecutive steps must be
+    supported by the structural graph, a shared function, a variable assigned in
+    one step and used in the next, or a route that names the upstream control.
+    Unsupported hops stay visible as evidence gaps and mark the trace incomplete.
     """
 
-    nodes: list[EvidenceTraceNode] = []
     gaps: list[str] = [redact(value.strip()) for value in evidence_gaps if value.strip()]
-    seen: set[tuple[str, str, int | None, int | None, str]] = set()
+    root_item = ReviewEvidence(
+        role=EvidenceRole.ROOT_CAUSE_CHANGED_CODE,
+        source="changed_code",
+        path=candidate.changed_path,
+        start_line=candidate.changed_lines.start,
+        end_line=candidate.changed_lines.end,
+        summary=_root_cause_summary(candidate),
+    )
+    located = [item for item in evidence if item.source == "deep_hunt" and item.role in _ROLE_LAYER]
+    if located:
+        ordered = _attack_order(located, root_item)
+    else:
+        # No verifier locations: fall back to the role order.
+        ordered = sorted(
+            [item for item in evidence if item.role in _ROLE_LAYER and item.source != "changed_code"] + [root_item],
+            key=lambda item: _ROLE_LAYER[item.role],
+        )
 
-    for item in evidence:
-        if item.role not in _ROLE_LAYER:
-            continue
+    nodes: list[EvidenceTraceNode] = []
+    for item in ordered:
         validated = _validated_node(root, graph, item)
         if validated is None:
             gaps.append(
                 f"Evidence location could not be machine-validated: {item.path}:{item.start_line or '?'}"
             )
             continue
-        key = (
-            item.role.value,
-            validated.path,
-            validated.start_line,
-            validated.end_line,
-            validated.summary,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
         nodes.append(validated)
-
     if not nodes:
         return None
+    nodes = [replace(node, step=index) for index, node in enumerate(nodes, 1)]
 
-    if not any(node.role == EvidenceRole.ROOT_CAUSE_CHANGED_CODE for node in nodes):
-        root_evidence = ReviewEvidence(
-            role=EvidenceRole.ROOT_CAUSE_CHANGED_CODE,
-            source="changed_code",
-            path=candidate.changed_path,
-            start_line=candidate.changed_lines.start,
-            end_line=candidate.changed_lines.end,
-            summary=f"{candidate.behavior_before} -> {candidate.behavior_after}",
-        )
-        validated_root = _validated_node(root, graph, root_evidence)
-        if validated_root is not None:
-            nodes.append(validated_root)
-        else:
-            gaps.append("Changed root-cause range could not be machine-validated")
-
-    by_layer: dict[int, list[EvidenceTraceNode]] = {}
-    for node in nodes:
-        by_layer.setdefault(_ROLE_LAYER[node.role], []).append(node)
-    populated_layers = sorted(by_layer)
-
+    # Each step links to the nearest earlier step that supports it, so a bug that
+    # reaches two routes stays two branches instead of an invented route-to-route hop.
     edges: list[EvidenceTraceEdge] = []
     incoming: set[str] = set()
-    for index in range(len(populated_layers) - 1):
-        sources = by_layer[populated_layers[index]]
-        targets = by_layer[populated_layers[index + 1]]
-        for target in targets:
-            target_supported = False
-            for source in sources:
-                support = _transition_support(root, graph, source, target)
-                if support is None:
-                    continue
-                relation, via = support
-                edges.append(
-                    EvidenceTraceEdge(
-                        source=source.node_id,
-                        target=target.node_id,
-                        relation=relation,
-                        via=via,
-                    )
-                )
-                incoming.add(target.node_id)
-                target_supported = True
-                if len(edges) >= 64:
-                    break
-            if not target_supported:
-                gaps.append(
-                    "No machine-supported transition into "
-                    f"{target.path}:{target.start_line or '?'} ({target.label})"
-                )
-            if len(edges) >= 64:
-                break
-        if len(edges) >= 64:
-            gaps.append("Trace edge limit reached before every transition could be represented")
+    outgoing: set[str] = set()
+    for index, target in enumerate(nodes[1:], 1):
+        for source in reversed(nodes[:index]):
+            support = _transition_support(root, graph, source, target)
+            if support is None:
+                continue
+            relation, via = support
+            edges.append(EvidenceTraceEdge(source=source.node_id, target=target.node_id, relation=relation, via=via))
+            incoming.add(target.node_id)
+            outgoing.add(source.node_id)
             break
+        else:
+            gaps.append(
+                f"No machine-supported transition into step {target.step} "
+                f"({target.path}:{target.start_line or '?'}, {target.label}) from an earlier step"
+            )
 
-    first_layer = by_layer[populated_layers[0]]
-    last_layer = by_layer[populated_layers[-1]]
     unique_gaps = tuple(dict.fromkeys(redact(value.strip()) for value in gaps if value.strip()))
     represented_roles = {node.role for node in nodes}
-    non_entry_ids = {node.node_id for node in nodes} - {node.node_id for node in first_layer}
     complete = (
         not unique_gaps
         and EvidenceRole.ROOT_CAUSE_CHANGED_CODE in represented_roles
         and bool(represented_roles & {EvidenceRole.DOWNSTREAM_TRUST, EvidenceRole.SENSITIVE_EFFECT})
-        and non_entry_ids.issubset(incoming)
+        and all(node.node_id in incoming for node in nodes[1:])
     )
 
     return EvidenceTrace(
@@ -229,13 +203,51 @@ def build_evidence_trace(
         file_count=len({node.path for node in nodes}),
         nodes=tuple(nodes),
         edges=tuple(edges),
-        entry_nodes=tuple(item.node_id for item in first_layer),
-        terminal_nodes=tuple(item.node_id for item in last_layer),
+        entry_nodes=tuple(node.node_id for node in nodes if node.node_id not in incoming),
+        terminal_nodes=tuple(node.node_id for node in nodes if node.node_id not in outgoing),
         attack_path=redact(attack_path.strip()),
         gained_capability=redact(gained_capability.strip()),
         complete=complete,
         evidence_gaps=unique_gaps,
     )
+
+
+def _root_cause_summary(candidate: L1Candidate) -> str:
+    after = candidate.behavior_after.strip()
+    return f"Changed in this pull request: {after}" if after else "Code changed in this pull request."
+
+
+def _overlaps(first: ReviewEvidence, second: ReviewEvidence) -> bool:
+    if first.path != second.path or first.start_line is None or second.start_line is None:
+        return False
+    first_end = first.end_line or first.start_line
+    second_end = second.end_line or second.start_line
+    return first.start_line <= second_end and second.start_line <= first_end
+
+
+def _attack_order(located: list[ReviewEvidence], root_item: ReviewEvidence) -> list[ReviewEvidence]:
+    """The verifier's order, one step per place, with the changed root cause always present."""
+
+    steps: list[ReviewEvidence] = []
+    root_placed = False
+    for item in located:
+        if any(_overlaps(item, kept) and item.role == kept.role for kept in steps):
+            continue  # the same lines cited twice for the same role: keep the first mention
+        middle = item.role not in {EvidenceRole.ATTACKER_ORIGIN, EvidenceRole.SENSITIVE_EFFECT}
+        if not root_placed and middle and _overlaps(item, root_item):
+            # The verifier cites the changed lines: that location is the root-cause step,
+            # with the verifier's own explanation and the full changed range.
+            start = min(item.start_line or 1, root_item.start_line or 1)
+            end = max(item.end_line or item.start_line or 1, root_item.end_line or root_item.start_line or 1)
+            steps.append(replace(root_item, start_line=start, end_line=end, summary=item.summary or root_item.summary))
+            root_placed = True
+            continue
+        steps.append(item)
+    if not root_placed:
+        origins = [index for index, item in enumerate(steps) if item.role == EvidenceRole.ATTACKER_ORIGIN]
+        at = origins[-1] + 1 if origins else 0
+        steps.insert(at, root_item)
+    return steps
 
 
 def _validated_node(
@@ -259,22 +271,23 @@ def _validated_node(
     if start < 1 or end < start or end > len(lines):
         return None
 
-    expression = redact("\n".join(lines[start - 1 : end])[:1200])
+    expression = redact_code("\n".join(lines[start - 1 : end])[:1200])
     code_start, code_end, code = _code_window(lines, start, end)
     anchor = _anchor_at(graph, path, start, end)
     symbol = anchor.qualified_name or anchor.name if anchor is not None else path
+    propagation = item.step_role == "propagation"
     key = (item.role.value, path, start, end, item.summary, symbol, expression)
     digest = hashlib.sha256("|".join(str(value) for value in key).encode("utf-8")).hexdigest()[:16]
     return EvidenceTraceNode(
         node_id=f"trace_{digest}",
         role=item.role,
-        kind=_NODE_KIND[item.role],
+        kind="PROPAGATION" if propagation else _NODE_KIND[item.role],
         path=path,
         start_line=start,
         end_line=end,
         symbol=redact(symbol),
         expression=expression,
-        label=_label(item.role),
+        label="Propagation" if propagation else _label(item.role),
         summary=redact(item.summary.strip()),
         provenance=redact(item.source.strip()),
         code=code,
@@ -288,6 +301,11 @@ def _code_window(lines: list[str], start: int, end: int) -> tuple[int, int, str]
 
     first = max(1, start - _CODE_CONTEXT_LINES)
     last = min(len(lines), end + _CODE_CONTEXT_LINES)
+    # Blank lines at the edges of the context add nothing; never trim the node itself.
+    while first < start and not lines[first - 1].strip():
+        first += 1
+    while last > end and not lines[last - 1].strip():
+        last -= 1
     if last - first + 1 > _CODE_WINDOW_MAX_LINES:
         # Keep the node itself; trim context first, then the tail of a very long node.
         first = max(1, start - 1)
@@ -303,7 +321,7 @@ def _code_window(lines: list[str], start: int, end: int) -> tuple[int, int, str]
             size += len(line) + 1
         last = first + max(0, len(kept) - 1)
         window = "\n".join(kept)
-    return first, last, redact(window)
+    return first, last, redact_code(window)
 
 
 def _anchor_at(
@@ -332,9 +350,20 @@ def _transition_support(
 ) -> tuple[str, str] | None:
     source_aliases = _symbol_aliases(source.symbol)
     target_aliases = _symbol_aliases(target.symbol)
+    # A node outside any function or route (its symbol is just the file) only links by
+    # a value it shares with the step before it in the same file.
+    source_anchored = source.symbol != source.path
+    target_anchored = target.symbol != target.path
 
     if source.path == target.path and source.symbol == target.symbol:
-        return "propagates_to", f"within structural anchor {source.symbol}"
+        flowing = _flowing_names(source.expression, target.expression)
+        if flowing:
+            return "propagates_to", f"`{flowing[0]}` flows on within `{_short(source.symbol)}`"
+        if source_anchored:
+            return "propagates_to", f"same function `{_short(source.symbol)}`"
+        return None
+    if not (source_anchored and target_anchored):
+        return None
 
     target_anchor = _anchor_at(
         graph,
@@ -346,31 +375,53 @@ def _transition_support(
         route_source = _source_range(root, target_anchor.path, target_anchor.line, target_anchor.end_line)
         for alias in sorted(source_aliases, key=len, reverse=True):
             if alias and re.search(rf"\b{re.escape(alias)}\b", route_source):
-                return "propagates_to", f"{alias} is explicitly attached to {target_anchor.name}"
+                return "propagates_to", f"`{alias}` runs before route `{_short(target_anchor.name)}`"
 
     for call in graph.calls:
         caller_aliases = _symbol_aliases(call.caller)
         callee_aliases = _symbol_aliases(call.callee)
-        if source_aliases & caller_aliases and target_aliases & callee_aliases:
-            return "propagates_to", f"call {call.caller} -> {call.callee} at {call.path}:{call.line}"
-        if target_aliases & caller_aliases and source_aliases & callee_aliases:
-            return "propagates_to", f"call {call.caller} -> {call.callee} at {call.path}:{call.line}"
+        if (source_aliases & caller_aliases and target_aliases & callee_aliases) or (
+            target_aliases & caller_aliases and source_aliases & callee_aliases
+        ):
+            return "propagates_to", f"`{_short(call.caller)}` calls `{_short(call.callee)}` ({call.path}:{call.line})"
 
     for reference in graph.references:
         source_names = _symbol_aliases(reference.source)
         target_names = _symbol_aliases(reference.target)
-        if source_aliases & source_names and target_aliases & target_names:
+        if (source_aliases & source_names and target_aliases & target_names) or (
+            target_aliases & source_names and source_aliases & target_names
+        ):
             return "propagates_to", (
-                f"reference {reference.source} -> {reference.target} at "
-                f"{reference.path}:{reference.line}"
-            )
-        if target_aliases & source_names and source_aliases & target_names:
-            return "propagates_to", (
-                f"reference {reference.source} -> {reference.target} at "
-                f"{reference.path}:{reference.line}"
+                f"`{_short(reference.source)}` uses `{_short(reference.target)}` ({reference.path}:{reference.line})"
             )
 
     return None
+
+
+_ASSIGNED = re.compile(
+    r"(?:\b(?:const|let|var|final|val|my)\s+|^|[;{(,]\s*)"
+    r"(?:\{\s*([\w\s,:]+)\}|\[\s*([\w\s,]+)\]|([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*))\s*(?::\s*[\w<>\[\]|]+\s*)?=(?!=)",
+    re.MULTILINE,
+)
+_COMMON_NAMES = frozenset({"i", "j", "k", "e", "err", "error", "res", "result", "self", "this", "_"})
+
+
+def _flowing_names(source_code: str, target_code: str) -> list[str]:
+    """Names assigned in the source step that the target step uses."""
+
+    names: list[str] = []
+    for match in _ASSIGNED.finditer(source_code):
+        group = match.group(1) or match.group(2) or match.group(3) or ""
+        for raw in re.split(r"[,\s]+", group):
+            name = raw.split(":")[-1].strip()
+            if name and name not in _COMMON_NAMES and name not in names:
+                names.append(name)
+    return [name for name in names if re.search(rf"(?<![\w$.]){re.escape(name)}(?![\w$])", target_code)]
+
+
+def _short(symbol: str) -> str:
+    value = symbol.removeprefix("route:").strip()
+    return value.rsplit("/", 1)[-1] if "/" in value and " " not in value and not value.startswith("/") else value
 
 
 def _source_range(root: Path, path: str, start_line: int, end_line: int) -> str:

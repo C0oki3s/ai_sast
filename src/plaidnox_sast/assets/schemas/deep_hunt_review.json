@@ -30,11 +30,13 @@
     },
     "message": {
       "type": "string",
-      "maxLength": 600
+      "maxLength": 900,
+      "description": "Reader-facing description: 2-4 plain sentences on what is wrong, where (name the function, route or file in backticks) and why the code allows it. No headings, no bullet lists, no line-break tokens."
     },
     "business_impact": {
       "type": "string",
-      "maxLength": 600
+      "maxLength": 700,
+      "description": "Reader-facing impact: 1-3 sentences on what an attacker concretely gains, which users or data are affected, and any precondition such as required privileges."
     },
     "reasoning": {
       "type": "string",
@@ -46,7 +48,8 @@
     },
     "remediation_note": {
       "type": "string",
-      "maxLength": 600
+      "maxLength": 900,
+      "description": "Reader-facing remediation: 1-3 sentences naming the exact function or check to change and the safe pattern to use. A short inline code example in backticks is allowed; no full patches."
     },
     "falsification_attempts": {
       "type": "array",
@@ -156,12 +159,13 @@
               "boundary",
               "defense",
               "effect"
-            ]
+            ],
+            "description": "origin: attacker-controlled input enters; propagation: the value is passed, transformed or stored; boundary: the check that should constrain it; defense: a control that is missing, removed or bypassed; effect: the sensitive operation reached."
           },
           "summary": {
             "type": "string",
             "maxLength": 240,
-            "description": "One sentence explaining what happens at this location in the attack path."
+            "description": "One sentence for a reader: what happens to the attacker's value at this exact location, naming the variable or call in backticks."
           }
         },
         "required": [
@@ -172,15 +176,54 @@
           "summary"
         ]
       },
-      "maxItems": 8
+      "maxItems": 8,
+      "description": "The taint path in attack order, from where attacker input enters (origin) to the sensitive effect: typically 3-6 locations. Include the changed root-cause lines, each propagation hop that moves the value across a function or file, and the effect. Each location is the smallest line range that shows that step."
     },
     "proof_plan": {
-      "type": "string",
-      "maxLength": 800
+      "type": "array",
+      "maxItems": 6,
+      "description": "Reproduction steps in order, one action or observation per item, without numbering. Empty for an unsupported finding.",
+      "items": {
+        "type": "string",
+        "maxLength": 300
+      }
     },
     "proof_of_concept": {
-      "type": "string",
-      "maxLength": 4000
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Runnable, non-destructive proof of concept for a supported finding. For an unsupported finding use language \"none\", no script lines and an empty expected result.",
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": [
+            "bash",
+            "http",
+            "python",
+            "javascript",
+            "none"
+          ],
+          "description": "bash for a curl-based script (preferred), http for one raw HTTP request, python or javascript only when a shell request cannot show it."
+        },
+        "script_lines": {
+          "type": "array",
+          "maxItems": 60,
+          "description": "The script, one source line per item, in order. Never put several lines in one item and never use \\n, </n> or <br> as separators. Use placeholders such as TARGET_URL and AUTH_TOKEN; never real credentials.",
+          "items": {
+            "type": "string",
+            "maxLength": 400
+          }
+        },
+        "expected_result": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "One sentence: what the output shows when the code is vulnerable, and what a fixed build returns instead."
+        }
+      },
+      "required": [
+        "language",
+        "script_lines",
+        "expected_result"
+      ]
     },
     "regression_test": {
       "type": "string",

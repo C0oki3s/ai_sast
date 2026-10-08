@@ -133,11 +133,13 @@ class FindingTraceNode(BaseModel):
     code: str | None = None
     code_start_line: int | None = Field(default=None, gt=0)
     code_end_line: int | None = Field(default=None, gt=0)
+    # 1-based position in the attack path; absent on traces built before it existed.
+    step: int | None = Field(default=None, gt=0)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        for field_name in ("code", "code_start_line", "code_end_line"):
+        for field_name in ("code", "code_start_line", "code_end_line", "step"):
             if getattr(self, field_name) is None:
                 data.pop(field_name, None)
         return data

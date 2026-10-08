@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-07.2",
+  "version": "2026-10-08.1",
   "operations": {
     "recon_search_plan": {
       "system": "operations/recon_search_plan/system.md",
@@ -35,7 +35,7 @@
     "security_review": {
       "system": "operations/security_review/system.md",
       "user": "operations/security_review/user.md",
-      "contract_version": "2026-10-07.1"
+      "contract_version": "2026-10-08.1"
     },
     "metadata_exposure_review": {
       "system": "operations/metadata_exposure_review/system.md",

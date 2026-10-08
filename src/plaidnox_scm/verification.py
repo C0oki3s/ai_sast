@@ -59,6 +59,11 @@ class CandidateVerification:
     vulnerable_snippet: VulnerableSnippet | None = None
     evidence_trace: EvidenceTrace | None = None
     proof_of_concept: str = ""
+    # Structured reproduction from the verifier (see plaidnox_scm.poc).
+    proof_steps: tuple[str, ...] = ()
+    poc_language: str = ""
+    poc_script_lines: tuple[str, ...] = ()
+    poc_expected_result: str = ""
 
 
 class CandidateVerifier(Protocol):
@@ -202,6 +207,10 @@ class SastDeepHuntVerifier:
                         context_expansion=expansion,
                         proof_plan=review.proof_plan,
                         proof_of_concept=review.proof_of_concept,
+                        proof_steps=tuple(getattr(review, "proof_steps", None) or ()),
+                        poc_language=str(getattr(review, "poc_language", "") or ""),
+                        poc_script_lines=tuple(getattr(review, "poc_script_lines", None) or ()),
+                        poc_expected_result=str(getattr(review, "poc_expected_result", "") or ""),
                         regression_test=review.regression_test,
                         vulnerable_snippet=build_vulnerable_snippet(root, hypothesis),
                         evidence_trace=build_evidence_trace(

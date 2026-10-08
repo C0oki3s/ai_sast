@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from plaidnox_sast.redaction import redact
+from plaidnox_sast.redaction import redact, redact_code
 from plaidnox_sast.llm import tenant_cache_namespace
 
 from . import attempts, context_store, occurrences, triage
@@ -45,6 +45,7 @@ from .baseline_models import BaselineFinding
 from .evidence import EvidenceRole
 from .models import ActivityEventRecord, InstallationTenantRecord, WebhookDeliveryRecord
 from .policy import evaluate_merge_policy
+from .poc import build_proof_of_concept
 from .production import ReviewDependencies
 from .review import ReviewResult, review_pull_request
 from .source_broker import SourceBroker
@@ -884,7 +885,15 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
             continue
         emitted.add(classification.finding_fingerprint)
 
-        proof_plan = _optional_verification_text(verification, "proof_plan")
+        poc = build_proof_of_concept(
+            steps=getattr(verification, "proof_steps", ()) or (),
+            language=str(getattr(verification, "poc_language", "") or ""),
+            script_lines=getattr(verification, "poc_script_lines", ()) or (),
+            expected_result=str(getattr(verification, "poc_expected_result", "") or ""),
+            proof_plan=str(getattr(verification, "proof_plan", "") or ""),
+            proof_of_concept=str(getattr(verification, "proof_of_concept", "") or ""),
+        )
+        proof_plan = "\n".join(f"{index}. {step}" for index, step in enumerate(poc.steps, 1)) or None
         regression_test = _optional_verification_text(verification, "regression_test")
         security_invariant = _optional_verification_text(verification, "security_invariant")
         gained_capability = _optional_verification_text(verification, "gained_capability")
@@ -902,8 +911,8 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                 title=redact(classification.title),
                 severity=classification.severity.lower(),
                 confidence=classification.confidence,
-                description=redact(verification.message.strip()),
-                impact=redact(verification.business_impact.strip()) or None,
+                description=_reader_text(verification.message) or redact(classification.title),
+                impact=_reader_text(verification.business_impact) or None,
                 root_cause_path=classification.root_cause_path,
                 root_cause_symbol=classification.root_cause_symbol,
                 root_cause_start_line=candidate.changed_lines.start,
@@ -933,11 +942,8 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                     if rich_evidence and (proof_plan or regression_test)
                     else None
                 ),
-                proof_of_concept=_client_proof_of_concept(
-                    proof_plan,
-                    redact(_repair_line_breaks(str(getattr(verification, "proof_of_concept", "") or ""))) or None,
-                ),
-                remediation=redact(verification.remediation.strip()) or None,
+                proof_of_concept=poc.markdown(),
+                remediation=_reader_text(verification.remediation) or None,
                 remediation_invariant=security_invariant,
                 proof_plan=proof_plan,
                 regression_test_expectation=regression_test,
@@ -981,7 +987,10 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                     for item in verification.evidence
                 ],
                 context_facts=[redact(fact) for fact in candidate.context_facts_used],
-                evidence_gaps=[redact(gap) for gap in verification.evidence_gaps],
+                evidence_gaps=[
+                    redact(gap)
+                    for gap in (*verification.evidence_gaps, *((poc.withheld_reason,) if poc.withheld_reason else ()))
+                ],
                 classification_references=_classification_references(verification),
                 verified_at=datetime.now(UTC),
             )
@@ -1143,6 +1152,20 @@ def _optional_verification_text(verification: object, attribute: str) -> str | N
 
 
 _LINE_BREAK_TOKENS = re.compile(r"</n>|<br\s*/?>|</br>", re.IGNORECASE)
+_SECTION_LABEL = re.compile(
+    r"^\s*(?:#+\s*)?\**\s*(?:description|impact|business impact|remediation|recommendation|fix)\s*:?\s*\**\s*:?\s*",
+    re.IGNORECASE,
+)
+
+
+def _reader_text(value: str | None) -> str:
+    """A reader-facing section: real line breaks, no repeated section label, tidy spacing, redacted."""
+
+    text = _repair_line_breaks(str(value or ""))
+    text = _SECTION_LABEL.sub("", text, count=1)
+    paragraphs = [" ".join(part.split()) for part in re.split(r"\n\s*\n", text)]
+    lines = "\n\n".join(part for part in paragraphs if part)
+    return redact(lines).strip()
 
 
 def _repair_line_breaks(text: str) -> str:
@@ -1164,23 +1187,9 @@ def _repair_line_breaks(text: str) -> str:
 
 
 def _client_proof_of_concept(proof_plan: str | None, script: str | None) -> str | None:
-    """Build one display-ready PoC without asking the model to repeat itself.
+    """Display-ready PoC from legacy strings (kept for callers that only have those)."""
 
-    A verified finding always carries a proof plan, so it always gets a PoC: the
-    numbered steps, plus the runnable script when the verifier produced one. The
-    stored finding drops the separate ``proof_plan`` key, so returning ``None``
-    here would lose the reproduction from the database entirely.
-    """
-
-    steps_text = proof_plan.strip() if proof_plan and proof_plan.strip() else ""
-    if not script or not script.strip():
-        return f"### Steps to Reproduce\n\n{steps_text}" if steps_text else None
-    lines = script.strip().splitlines()
-    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
-        lines = lines[1:-1]
-    fenced = "\n".join(lines).strip()
-    steps = f"{proof_plan.strip()}\n\n" if proof_plan and proof_plan.strip() else ""
-    return f"### Steps to Reproduce\n\n{steps}```bash\n{fenced}\n```"
+    return build_proof_of_concept(proof_plan=proof_plan or "", proof_of_concept=script or "").markdown()
 
 
 _REDUNDANT_STORED_FINDING_KEYS = frozenset({
@@ -1259,7 +1268,7 @@ def _api_vulnerable_snippet(value: object) -> VulnerableSnippet | None:
     if value is None:
         return None
     try:
-        code = redact(str(value.content))
+        code = redact_code(str(value.content))
         return VulnerableSnippet(
             path=str(value.path),
             start_line=int(value.start_line),
@@ -1284,13 +1293,14 @@ def _api_evidence_trace(value: object) -> FindingTrace | None:
                 start_line=item.start_line,
                 end_line=item.end_line,
                 symbol=redact(str(item.symbol)),
-                expression=redact(str(item.expression)),
+                expression=redact_code(str(item.expression)),
                 label=redact(str(item.label)),
                 summary=redact(str(item.summary)),
                 provenance=redact(str(item.provenance)),
-                code=redact(str(getattr(item, "code", "") or "")) or None,
+                code=redact_code(str(getattr(item, "code", "") or "")) or None,
                 code_start_line=getattr(item, "code_start_line", None) or None,
                 code_end_line=getattr(item, "code_end_line", None) or None,
+                step=getattr(item, "step", None) or None,
             )
             for item in value.nodes
         ]

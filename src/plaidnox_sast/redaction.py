@@ -44,6 +44,81 @@ def redact(value: str) -> str:
     return value
 
 
+# In a script, a credential value ends at whitespace, a quote or a shell separator,
+# and a placeholder (``$AUTH_TOKEN``, ``${TOKEN}``, ``<token>``, ``AUTH_TOKEN``) is not a secret.
+_SCRIPT_CREDENTIAL = re.compile(
+    r"(?i)(\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|"
+    r"client[_-]?secret|access[_-]?key|credential)[\w.-]*\b[\"']?\s*[:=]\s*)"
+    r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"'&;|)]+)"
+)
+_PLACEHOLDER = re.compile(
+    r"^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*(?::[^}]*)?\}?|<[^<>]{1,80}>|\{\{[^{}]{1,80}\}\}|[A-Z][A-Z0-9_]{2,})$"
+)
+
+
+def redact_script(value: str) -> str:
+    """Redact secrets in a script without destroying it.
+
+    ``redact`` treats everything after ``token=`` to the end of the line as the
+    secret, which is right for logs but cuts a script line in half. Here only the
+    value itself is replaced, and placeholders the script reads from the
+    environment are kept, so the script still runs once the reader fills them in.
+    """
+
+    value = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", value)
+
+    def credential(match: re.Match[str]) -> str:
+        raw = match.group(2)
+        quote = raw[0] if raw[:1] in {"'", '"'} else ""
+        secret = raw[1:-1] if quote and len(raw) >= 2 else raw
+        if not secret or _PLACEHOLDER.match(secret.strip()):
+            return match.group(0)
+        return f"{match.group(1)}{quote}<redacted-credential>{quote}"
+
+    value = _SCRIPT_CREDENTIAL.sub(credential, value)
+    value = _JWT.sub("<redacted-jwt>", value)
+    value = _PROVIDER_TOKEN.sub("<redacted-provider-token>", value)
+    value = _MONGO_URI.sub("<redacted-mongodb-uri>", value)
+    value = _API_KEY.sub("<redacted-api-key>", value)
+    value = _AWS_ACCESS_KEY.sub("<redacted-aws-access-key>", value)
+    value = _BEARER_TOKEN.sub("Bearer <redacted-bearer-token>", value)
+    return value
+
+
+_CODE_SECRET_MIN_CHARS = 6
+
+
+def redact_code(value: str) -> str:
+    """Redact secrets in source code shown to people, keeping every line intact.
+
+    In code, a credential is a hard-coded string literal (``token = "abc..."``).
+    An expression such as ``token = req.headers.authorization`` is the code under
+    review and is kept, unlike ``redact``, which would remove the rest of the line.
+    Known token formats (JWTs, provider tokens, keys) are redacted wherever they appear.
+    """
+
+    value = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", value)
+
+    def credential(match: re.Match[str]) -> str:
+        raw = match.group(2)
+        quote = raw[0] if raw[:1] in {"'", '"'} else ""
+        secret = raw[1:-1] if quote and len(raw) >= 2 else ""
+        if not quote or len(secret.strip()) < _CODE_SECRET_MIN_CHARS or _PLACEHOLDER.match(secret.strip()):
+            return match.group(0)
+        if re.fullmatch(r"[\w.-]*(?:\$\{[^}]*\}|%s|\{\})[\w./-]*", secret):
+            return match.group(0)  # a template or format string, not a value
+        return f"{match.group(1)}{quote}<redacted-credential>{quote}"
+
+    value = _SCRIPT_CREDENTIAL.sub(credential, value)
+    value = _JWT.sub("<redacted-jwt>", value)
+    value = _PROVIDER_TOKEN.sub("<redacted-provider-token>", value)
+    value = _MONGO_URI.sub("<redacted-mongodb-uri>", value)
+    value = _API_KEY.sub("<redacted-api-key>", value)
+    value = _AWS_ACCESS_KEY.sub("<redacted-aws-access-key>", value)
+    value = _BEARER_TOKEN.sub("Bearer <redacted-bearer-token>", value)
+    return value
+
+
 def redact_payload(value: Any) -> Any:
     """Recursively redact every string leaf in a JSON-shaped payload."""
 
