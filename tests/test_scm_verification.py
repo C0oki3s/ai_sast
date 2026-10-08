@@ -195,3 +195,38 @@ def test_missing_candidate_specific_context_keeps_supported_review_unresolved(tm
     assert results[0].context_expansion is not None
     assert results[0].context_expansion.complete is False
     assert any("missingOwnershipCheck" in gap for gap in results[0].evidence_gaps)
+
+
+def test_a_rejected_candidate_keeps_its_reason_but_no_reader_facing_text(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "tests@plaidnox.local")
+    _git(repo, "config", "user.name", "PlaidNox Tests")
+    (repo / "middleware.js").write_text("function validate(token) {\n  return verifier.verify(token);\n}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+    hypothesis = L1Candidate(
+        candidate_id="jwt-ok", changed_path="middleware.js", changed_symbol="validate",
+        changed_lines=ChangedLines(2, 2), behavior_before="Verified.", behavior_after="Still verified.",
+        security_role="Authentication boundary.", suspected_broken_invariant="Only authentic claims.",
+        provisional_attacker_capability="Forge identity.", context_facts_used=(), context_gaps=(),
+        requested_expansion=(),
+    )
+
+    class _RejectingAgent(_Agent):
+        def hunt(self, *args, **kwargs):
+            result = super().hunt(*args, **kwargs)
+            return replace(result, supported=False, rejection_reason="`verifier.verify` checks the signature.")
+
+    [result] = SastDeepHuntVerifier(_RejectingAgent(), router=_Router()).verify(
+        repo, head, "codebase-1", _context(head), (hypothesis,), "DEEP"
+    )
+
+    assert result.state == "rejected"
+    assert result.rejection_reason == "`verifier.verify` checks the signature."
+    assert (result.message, result.business_impact, result.remediation) == ("", "", "")
+    assert (result.proof_plan, result.proof_of_concept, result.proof_steps, result.poc_script_lines) == ("", "", (), ())

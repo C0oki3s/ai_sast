@@ -31,12 +31,12 @@
     "message": {
       "type": "string",
       "maxLength": 900,
-      "description": "Reader-facing description: 2-4 plain sentences on what is wrong, where (name the function, route or file in backticks) and why the code allows it. No headings, no bullet lists, no line-break tokens."
+      "description": "Reader-facing description: 2-4 plain sentences on what is wrong, where (name the function, route or file in backticks) and why the code allows it. No headings, no bullet lists, no line-break tokens. Empty string when supported is false. English only."
     },
     "business_impact": {
       "type": "string",
       "maxLength": 700,
-      "description": "Reader-facing impact: 1-3 sentences on what an attacker concretely gains, which users or data are affected, and any precondition such as required privileges."
+      "description": "Reader-facing impact: 1-3 sentences on what an attacker concretely gains, which users or data are affected, and any precondition such as required privileges. Empty string when supported is false. English only."
     },
     "reasoning": {
       "type": "string",
@@ -49,7 +49,7 @@
     "remediation_note": {
       "type": "string",
       "maxLength": 900,
-      "description": "Reader-facing remediation: 1-3 sentences naming the exact function or check to change and the safe pattern to use. A short inline code example in backticks is allowed; no full patches."
+      "description": "Reader-facing remediation: 1-3 sentences naming the exact function or check to change and the safe pattern to use. A short inline code example in backticks is allowed; no full patches. Empty string when supported is false. English only."
     },
     "falsification_attempts": {
       "type": "array",
@@ -81,7 +81,8 @@
     },
     "rejection_reason": {
       "type": "string",
-      "maxLength": 600
+      "maxLength": 600,
+      "description": "When supported is false: one or two English sentences naming the control, check or failed assumption that makes the candidate safe, with its location. Empty when supported is true."
     },
     "gate_results": {
       "type": "array",
@@ -154,18 +155,22 @@
           "role": {
             "type": "string",
             "enum": [
-              "origin",
+              "source",
               "propagation",
-              "boundary",
-              "defense",
-              "effect"
+              "sanitizer",
+              "sink"
             ],
-            "description": "origin: attacker-controlled input enters; propagation: the value is passed, transformed or stored; boundary: the check that should constrain it; defense: a control that is missing, removed or bypassed; effect: the sensitive operation reached."
+            "description": "source: untrusted data enters the program; propagation: the tainted value is assigned, passed, returned, stored or transformed; sanitizer: the check, validation, encoding or authorization that should make it safe here and why it does not (missing, removed, bypassed or wrong context); sink: the dangerous operation it reaches."
           },
           "summary": {
             "type": "string",
             "maxLength": 240,
-            "description": "One sentence for a reader: what happens to the attacker's value at this exact location, naming the variable or call in backticks."
+            "description": "One English sentence: what happens to the tainted value at this exact line."
+          },
+          "tainted_value": {
+            "type": "string",
+            "maxLength": 160,
+            "description": "The variable, parameter, field or expression carrying the attacker-controlled data at this line, exactly as written in the code, for example `req.query.host`. For a sanitizer, the value it should have neutralized."
           }
         },
         "required": [
@@ -173,11 +178,12 @@
           "start_line",
           "end_line",
           "role",
+          "tainted_value",
           "summary"
         ]
       },
       "maxItems": 8,
-      "description": "The taint path in attack order, from where attacker input enters (origin) to the sensitive effect: typically 3-6 locations. Include the changed root-cause lines, each propagation hop that moves the value across a function or file, and the effect. Each location is the smallest line range that shows that step."
+      "description": "The taint path in order: source first, then each propagation step (including the changed root-cause lines and every hop into another function or file), any sanitizer that fails, and the sink last. 3-6 locations for a supported finding; each is the smallest line range showing that step."
     },
     "proof_plan": {
       "type": "array",

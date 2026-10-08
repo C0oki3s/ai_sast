@@ -56,12 +56,13 @@ jobs:
             src/plaidnox_scm/dedupe.py \
             src/plaidnox_scm/poc.py \
             src/plaidnox_sast/textlines.py \
+            src/plaidnox_sast/language.py \
             tests/test_optimized_discovery.py \
             tests/test_root_cause_semantics.py \
             tests/test_scm_trace.py \
             tests/test_scm_trace_api.py \
             tests/test_scm_lifecycle.py
-          ruff check tests/test_scm_backfill.py tests/test_scm_dedupe.py tests/test_scm_poc.py
+          ruff check tests/test_scm_backfill.py tests/test_scm_dedupe.py tests/test_scm_poc.py tests/test_language.py
       - name: Run focused regression tests
         run: |
           pytest -q \
@@ -75,6 +76,7 @@ jobs:
             tests/test_scm_backfill.py \
             tests/test_scm_dedupe.py \
             tests/test_scm_poc.py \
+            tests/test_language.py \
             tests/test_scm_attempts.py \
             tests/test_scm_lifecycle.py \
             tests/test_scm_triage_policy.py
