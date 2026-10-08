@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -934,7 +935,7 @@ def _response(request: ReviewRequest, result: ReviewResult, tenant_id: str) -> R
                 ),
                 proof_of_concept=_client_proof_of_concept(
                     proof_plan,
-                    redact(str(getattr(verification, "proof_of_concept", "")).strip()) or None,
+                    redact(_repair_line_breaks(str(getattr(verification, "proof_of_concept", "") or ""))) or None,
                 ),
                 remediation=redact(verification.remediation.strip()) or None,
                 remediation_invariant=security_invariant,
@@ -1137,8 +1138,29 @@ def _optional_verification_text(verification: object, attribute: str) -> str | N
     value = getattr(verification, attribute, "")
     if value is None:
         return None
-    text = str(value).strip()
+    text = _repair_line_breaks(str(value))
     return redact(text) or None if text else None
+
+
+_LINE_BREAK_TOKENS = re.compile(r"</n>|<br\s*/?>|</br>", re.IGNORECASE)
+
+
+def _repair_line_breaks(text: str) -> str:
+    """Restore real newlines the model wrote as ``</n>``/``<br>`` (or escaped ``\\n``).
+
+    This must run before redaction: a credential pattern redacts to the end of the
+    line, so a whole script on one "line" would lose everything after the first
+    credential-looking assignment. A script wrapped in single backticks is unwrapped.
+    """
+
+    value = _LINE_BREAK_TOKENS.sub("\n", text.replace("\r\n", "\n").replace("\r", "\n"))
+    if "\n" not in value and "\\n" in value and "#!/" in value:
+        # A whole script with escaped newlines; a one-line command keeps its literal "\n".
+        value = value.replace("\\n", "\n")
+    value = value.strip()
+    if value.startswith("`") and value.endswith("`") and not value.startswith("```") and "\n" in value:
+        value = value.strip("`").strip()
+    return value
 
 
 def _client_proof_of_concept(proof_plan: str | None, script: str | None) -> str | None:
