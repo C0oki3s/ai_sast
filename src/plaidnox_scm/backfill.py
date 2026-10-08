@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from plaidnox_sast.redaction import redact
+from plaidnox_sast.redaction import redact, redact_code
 
 from .api_models import ReviewFinding
 from .evidence import EvidenceRole
@@ -283,7 +283,7 @@ def _snippet(finding: dict[str, Any], lines_of: Callable[[str], list[str] | None
         return None
     end = min(len(lines), max(start, int(finding.get("root_cause_end_line") or start)))
     return {"path": path, "start_line": start, "end_line": end,
-            "code": redact("\n".join(lines[start - 1:end])[:4000])}
+            "code": redact_code("\n".join(lines[start - 1:end])[:4000])}
 
 
 def _trace_from_evidence(
@@ -318,7 +318,7 @@ def _trace_from_evidence(
             "node_id": f"trace_{digest}", "role": role.value, "kind": _NODE_KIND[role],
             "path": path, "start_line": start, "end_line": end,
             "symbol": str(finding.get("root_cause_symbol") or path) if role == EvidenceRole.ROOT_CAUSE_CHANGED_CODE else path,
-            "expression": redact("\n".join(lines[start - 1:end])[:1200]),
+            "expression": redact_code("\n".join(lines[start - 1:end])[:1200]),
             "label": _label(role), "summary": summary,
             "provenance": redact(str(item.get("source") or "stored_evidence")),
             "code": code, "code_start_line": first, "code_end_line": last,

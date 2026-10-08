@@ -29,6 +29,9 @@ class ReviewEvidence:
     start_line: int | None
     end_line: int | None
     summary: str
+    # The verifier's own role for this location (origin, propagation, boundary,
+    # defense, effect); its position in the attack path is the order it was listed.
+    step_role: str = ""
 
 
 def build_review_evidence(
@@ -74,6 +77,7 @@ def build_review_evidence(
                 end_line=_optional_line(location.get("end_line")),
                 summary=str(location.get("summary") or "").strip()[:240]
                 or f"Deep Hunt {location.get('role', 'evidence')!s} evidence",
+                step_role=str(location.get("role", "")),
             )
         )
     return tuple(values)

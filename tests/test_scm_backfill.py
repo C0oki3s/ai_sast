@@ -68,8 +68,8 @@ def test_backfill_is_dry_run_then_writes_exact_commit_code(tmp_path: Path) -> No
     assert applied.snippets_filled == 1
     assert finding["vulnerable_snippet"]["code"] == "line 20"
     trace = finding["evidence_trace"]
-    assert trace["nodes"][0]["code_start_line"] == 17
-    assert trace["nodes"][0]["code_end_line"] == 23
+    assert trace["nodes"][0]["code_start_line"] == 16  # four lines of context either side
+    assert trace["nodes"][0]["code_end_line"] == 24
     assert trace["complete"] is False and trace["evidence_gaps"] == [REBUILT_GAP]
     ReviewFinding.model_validate(finding)
     assert backfill_trace_code(factory, tmp_path, apply=True).findings_updated == 0

@@ -241,6 +241,8 @@ def test_review_endpoint_returns_verified_changed_root_finding(monkeypatch, tmp_
             "1. Send a request with an unsigned JWT.\n"
             "2. Observe that the protected route accepts it.\n\n"
             "```bash\n"
+            "#!/usr/bin/env bash\n"
+            ": \"${TARGET_URL:?set TARGET_URL to the application origin}\"\n"
             "curl -fsS -H 'Authorization: Bearer $AUTH_TOKEN' \"$TARGET_URL/protected\"\n"
             "```"
         ),

@@ -64,6 +64,7 @@ from .llm import (
 from .models import Candidate, Evidence, Finding, ModelTier, RouteDecision, Severity
 from .model_capabilities import supports_reasoning_effort, supports_text_verbosity
 from .prompts import render_operation
+from .textlines import split_model_lines
 from .redaction import redact as _redact
 from .redaction import redact_payload
 from .worksets import security_worksets_from_graph, security_worksets_from_regions
@@ -111,6 +112,11 @@ class DeepHuntResult:
     proof_of_concept: str = ""
     regression_test: str = ""
     context_requests: list[dict[str, Any]] = field(default_factory=list)
+    # Structured reproduction (the joined strings above stay for existing consumers).
+    proof_steps: list[str] = field(default_factory=list)
+    poc_language: str = ""
+    poc_script_lines: list[str] = field(default_factory=list)
+    poc_expected_result: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -2856,6 +2862,47 @@ def _security_ir_context(
     }
 
 
+_STEP_NUMBER = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+")
+
+
+def _reproduction_fields(proof_plan: Any, proof_of_concept: Any) -> dict[str, Any]:
+    """Structured reproduction from the current contract (step list + script lines) or the legacy strings."""
+
+    if isinstance(proof_plan, list):
+        raw_steps = [str(item) for item in proof_plan]
+    else:
+        raw_steps = split_model_lines(str(proof_plan or ""))
+    steps = [_STEP_NUMBER.sub("", line).strip() for line in raw_steps]
+    steps = [step for step in steps if step]
+
+    if isinstance(proof_of_concept, dict):
+        language = str(proof_of_concept.get("language") or "").strip().lower()
+        lines: list[str] = []
+        for item in proof_of_concept.get("script_lines") or []:
+            lines.extend(split_model_lines(str(item)))
+        expected = str(proof_of_concept.get("expected_result") or "").strip()
+    else:
+        text = str(proof_of_concept or "").strip()
+        language = "bash" if text else "none"
+        lines = split_model_lines(text) if text else []
+        expected = ""
+    lines = [line.rstrip() for line in lines]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if language == "none":
+        lines = []
+    return {
+        "proof_steps": steps,
+        "proof_plan": "\n".join(f"{index}. {step}" for index, step in enumerate(steps, 1)),
+        "poc_language": language if lines else "none",
+        "poc_script_lines": lines,
+        "poc_expected_result": expected,
+        "proof_of_concept": "\n".join(lines),
+    }
+
+
 def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
     try:
         payload = response_json(response)
@@ -2882,10 +2929,9 @@ def _deep_hunt_result_from_response(response: Any) -> DeepHuntResult:
             rejection_reason=str(payload["rejection_reason"]),
             gate_results=[dict(item) for item in payload["gate_results"]],
             evidence_locations=[dict(item) for item in payload["evidence_locations"]],
-            proof_plan=str(payload["proof_plan"]),
-            proof_of_concept=str(payload["proof_of_concept"]),
             regression_test=str(payload["regression_test"]),
             context_requests=[dict(item) for item in payload["context_requests"]],
+            **_reproduction_fields(payload["proof_plan"], payload["proof_of_concept"]),
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise AIResponseError(f"AI review did not match the required schema: {_schema_failure(exc)}") from exc

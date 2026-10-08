@@ -93,6 +93,22 @@ These are optional and backwards compatible; a bot that ignores them keeps worki
   must accept these keys.
 - `proof_of_concept` is now always present on a verified finding that has a
   proof plan (steps only when the verifier returned no script).
+- `evidence_trace.nodes[].step`: 1-based position in the attack path, source
+  first. Order nodes by `step` when present (older traces have no `step`).
+- Proof of concept format (prompt contract 2026-10-08.1): `### Steps to
+  Reproduce`, numbered steps, one fenced script (`bash`, `http`, `python` or
+  `javascript`) and an `**Expected result:**` line. The verifier returns the
+  script as one item per line, so `</n>`/escaped `\n` no longer appear. Before
+  storage the script is redacted value-by-value (placeholders such as
+  `$AUTH_TOKEN` are kept), checked for destructive commands and syntax-checked
+  (bash `-n`, Python `compile`); a script that fails is withheld, the steps are
+  kept, and the reason is added to `evidence_gaps`.
+- Reader-facing sections: `description`, `impact`, `proof_of_concept`,
+  `remediation`. Other text fields stay in the response for tooling.
+- Code shown to people (`vulnerable_snippet.code`, trace `code`/`expression`)
+  is redacted with `redact_code`: only hard-coded string secrets and known
+  token formats are replaced, so a line such as
+  `const token = req.headers.authorization` is kept intact.
 - Per-run timeline: each review records stage events (`snapshot_ready`,
   `changes_analyzed`, `context_ready`, `candidates_generated`,
   `verification_complete`, `baseline_compared`, `policy_evaluated`) in
